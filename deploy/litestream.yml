@@ -1,0 +1,16 @@
+# Litestream continuous SQLite -> S3 backup. Install at /etc/litestream.yml.
+# Litestream's own systemd service (installed by the .deb) reads this file:
+#   sudo systemctl enable --now litestream
+#
+# AWS creds come from the environment / IAM. For Lightsail/EC2 prefer an instance
+# role; otherwise put AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY in
+# /etc/default/litestream (NOT in this file).
+
+dbs:
+  - path: /home/ubuntu/btc-accumulation-notifier/btc.db
+    replicas:
+      - type: s3
+        bucket: YOUR_BUCKET_NAME
+        path: btc-accumulation-notifier/btc.db
+        region: us-east-1
+        # retention/snapshot defaults are fine for a small DB

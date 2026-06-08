@@ -1,175 +1,109 @@
-# BTC Long-Term Accumulation-Zone Notifier
+# BTC Signal System — long-term accumulation + short-term swings
 
-Monitors Bitcoin for a **long-term cyclical accumulation zone** and sends tiered push
-notifications when conditions historically associated with cycle bottoms align. You place
-spot buys manually on alert.
+Monitors Bitcoin on two horizons and pushes **email alerts** (via Resend), with a
+**Next.js dashboard** for live state and alert history:
 
-**Alert-only. No order execution. Not financial advice.** It surfaces a detection signal; you
-decide whether, how much, and where to buy.
+- **Long-term (buy-only accumulation):** a 0–100 confidence score from on-chain /
+  price-structure / macro / sentiment / derivatives. Tiered alerts (Watch →
+  Accumulate → Deep Value) on a tier change, plus an acute-capitulation flash.
+- **Short-term (two-sided swing, 4h/1d):** RSI / MACD / EMA-cross / Bollinger / ATR
+  plus funding/OI signals, producing a signed bias and discrete BUY/SELL triggers.
 
-> The goal is **zone detection and clear tiered alerts**, not predicting an exact bottom — the
-> design deliberately makes precise bottom-calling unnecessary. *Approximately-right beats a
-> precise call you cannot make.*
+**Alert-only. No order execution. Not financial advice.** It surfaces signals; you decide.
 
----
+> Long-term answers *"is this a zone to accumulate?"* (don't need to nail the bottom).
+> Short-term answers *"is now a decent moment to enter/exit a swing?"* They're kept
+> visually and structurally distinct — a short-term SELL never means the long-term
+> accumulation thesis is broken.
 
-## What it does
+## Architecture
 
-Every run computes a composite **Accumulation Confidence** score (0–100) from orthogonal
-indicator categories, maps it to a tier, and notifies you **only when the tier changes** (no
-spam). An independent **acute-capitulation flash** can fire on a sharp sell-off regardless of
-tier. Every run is persisted to a SQLite ledger for later calibration.
+A short, idempotent **collector** runs every 10 min (short-term) and the existing
+**run** every 6 h (long-term), both writing to SQLite (WAL). A localhost **read-only
+API** serves a co-hosted **Next.js dashboard**, exposed privately via a **Cloudflare
+Tunnel + Access** (no open ports). A **watchdog** emails if the pipeline goes stale.
+See [DEPLOY.md](DEPLOY.md) and [the plan](../../). 
 
-### Categories & weights
+```
+collector(10m) ─┐
+run_once(6h) ───┼─→ SQLite (WAL) ──→ read-only API (:8000) ──→ Next.js dashboard (:3000)
+watchdog(8h) ───┘                                                   └─ Cloudflare Access (you only)
+        └────────────────→ Resend email (primary) + optional ntfy/Telegram
+```
 
-| Category | Weight | Indicators | Data tier |
-|---|---|---|---|
-| On-chain valuation | 0.35 | MVRV Z-Score, Realized-price ratio, NUPL, SOPR (7d), Puell Multiple | **Paid** (Glassnode / CryptoQuant) |
-| Price structure | 0.20 | Price / 200-week MA, Mayer Multiple | **Free** |
-| Macro / liquidity | 0.20 | M2 YoY, HY credit spread, 10Y real yield, ETF net flows | **Free** (FRED; ETF best-effort) |
-| Sentiment | 0.10 | Fear & Greed Index | **Free** |
-| Derivatives | 0.15 | Funding rate (7d), OI deleveraging, Liquidation cascade | Free funding proxy / **Paid** Coinglass |
+## Data sources (free, no keys)
 
-**Graceful degradation is mandatory.** Every source is optional except free price data. If a
-source/key is missing, its indicators are skipped, the remaining **category weights are
-renormalized to sum to 1.0**, and the alert says so. The bot never crashes because a paid key
-is absent.
+- **Price / klines / funding / OI:** **OKX** primary, **Kraken** fallback (Binance is
+  HTTP-451 from US/AWS), **CoinGecko** last-resort price. See [app/sources/exchange.py](app/sources/exchange.py).
+- **Sentiment:** alternative.me Fear & Greed.
+- **Macro:** FRED (free key) — `M2`, real yields, HY spread.
+- **Paid drop-ins (optional, auto-activate when a key is set):** Glassnode (on-chain — biggest
+  long-term lever), Coinglass (real liquidations/OI), CryptoQuant.
 
-### Tiers
+> **Free-tier ceiling:** true liquidation-cascade + real-time order-flow are paid. The free tier
+> uses a funding/OI/volatility *proxy*; the dashboard health bar states this honestly.
 
-- **Neutral** `< 40` — log only, no alert.
-- **Watch** `40–60` — indicators starting to align.
-- **Accumulate** `60–80` — meaningful confluence; begin laddering.
-- **Deep Value** `≥ 80` **and price ≤ 200-week MA** — strongest confluence; heaviest tranches.
+## Notifications
 
-### Acute-capitulation flash (independent of tier)
+Email (Resend) is primary; ntfy/Telegram optional. You receive:
+- **Long-term:** tier-change alerts (Watch/Accumulate/Deep Value) + acute-capitulation flash.
+- **Short-term:** BUY and SELL/exit triggers on closed 4h/1d candles (EMA cross, RSI bounce/rollover,
+  MACD cross, Bollinger reclaim/reject, funding spike, volume flush), cooldown-debounced.
+- **Health:** a dead-man's-switch heartbeat if collection goes stale.
 
-Fires a one-off "consider a tranche" alert when **all** hold: a capitulation signal (large 24h
-liquidations on the paid tier, or the free funding/OI-flush proxy), **and** Fear & Greed ≤ 10,
-**and** price down more than the configured % over 24–48h. Debounced separately (default once
-per 3 days).
+Counter-trend triggers (e.g. a BUY in a bearish regime) are flagged as lower-confidence in the alert.
 
----
+## Quick start (local, free tier)
 
-## Quick start (free tier — zero paid keys)
-
+Backend:
 ```bash
-python3 -m venv .venv
-. .venv/bin/activate          # Windows: .venv\Scripts\Activate.ps1
+python3 -m venv .venv && . .venv/bin/activate     # Windows: .venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-cp .env.example .env          # set NTFY_TOPIC and (free) FRED_API_KEY; leave paid keys blank
-
-# one run, printing the decision without sending or persisting:
-python -m app.run_once --dry-run
-
-# a real run (sends on tier change, writes the ledger):
-python -m app.run_once
+cp .env.example .env                              # set EXCHANGE=okx; RESEND/keys optional
+python -m app.collect_once --dry-run              # short-term, prints signals
+python -m app.run_once --dry-run                  # long-term
+uvicorn app.api:app --port 8000                   # read-only API
+```
+Dashboard (separate `btc-dashboard/` folder):
+```bash
+cd ../btc-dashboard && npm install
+cp .env.local.example .env.local                  # API_BASE_URL=http://127.0.0.1:8000
+npm run dev                                        # http://localhost:3000
 ```
 
-It runs end-to-end with an empty `.env`. With no `FRED_API_KEY` the macro layer is skipped;
-with no notification transport configured, the alert is logged instead of sent.
-
-> **Honesty note:** on the free tier the MVRV / realized-price / NUPL / SOPR layer is inactive —
-> the *highest-signal* layer for bottoms. Free-tier confidence leans on price-structure + macro
-> + sentiment. **A Glassnode key is the single biggest accuracy upgrade.**
-
----
-
-## Configuration (`.env`)
-
-See [.env.example](.env.example) for the full list. Highlights:
-
-- **Notifications:** `NTFY_TOPIC` (default transport; subscribe to it in the ntfy app), or
-  `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID`. Both optional — unconfigured = log only.
-- **Free data:** `FRED_API_KEY` (free from fredaccount.stlouisfed.org) turns on the macro layer.
-- **Paid drop-ins:** `GLASSNODE_API_KEY` (on-chain layer — biggest lever), `COINGLASS_API_KEY`
-  (richer derivatives), `SOSOVALUE_API_KEY` (ETF flows). Presence of a key is what activates
-  its layer — there is no separate enable flag.
-- **Signal config:** category weights, tier thresholds, flash parameters, and cycle context
-  (`ATH_DATE`, `PEAK_TO_TROUGH_DAYS`).
-
-Per-indicator thresholds (the `(neutral, extreme)` bands) live in
-[`app/scoring.py`](app/scoring.py) `THRESHOLDS` — one place to tune, and what the backtest reads.
-
-> ETF flows via Farside scraping need an HTML parser (`lxml` or `html5lib`) for
-> `pandas.read_html`. Without one, the ETF indicator silently degrades to "unavailable" rather
-> than failing — install `lxml` if you want it, or set `SOSOVALUE_API_KEY`.
-
----
-
-## Calibration / backtest
+## Calibration / backtests
 
 ```bash
-python -m scripts.backtest        # from the project root
+python -m scripts.backtest             # long-term thresholds at 2015/2018/2022 bottoms
+python -m scripts.backtest_shortterm   # short-term trigger hit-rates over OKX history
 ```
-
-Prints what each indicator read at the **2015 / 2018 / 2022** bottoms, reports each free
-indicator's false-positive rate (how often it entered its "bottom zone" away from a real
-bottom), and suggests a threshold floor — **clearly flagged as n=3 and overfit-prone**. The
-live `runs` ledger also accumulates real data, so thresholds can be revisited as the zone
-develops.
-
----
+Both print honest, small-sample caveats — favor economic logic over fitted numbers.
 
 ## Tests
 
 ```bash
-pip install pytest
-python -m pytest -q
+pip install pytest && python -m pytest -q
 ```
-
-Covers the scoring math, the weight-renormalization graceful-degradation path, tier logic
-(including the Deep-Value 200-WMA gate), the flash conditions, and alert debouncing.
-
----
-
-## Deploy (AWS Lightsail, ~$5/mo)
-
-1. Create a Lightsail instance: Ubuntu, nano.
-2. SSH in; install Python 3.11+; `git clone` into `/home/ubuntu/btc-accumulation-notifier`.
-3. `python3 -m venv .venv && . .venv/bin/activate && pip install -r requirements.txt`.
-4. `cp .env.example .env`; set `NTFY_TOPIC` and (free) `FRED_API_KEY`. Leave paid keys blank to start.
-5. `mkdir -p logs`; add cron (every 6h, UTC):
-   ```cron
-   0 */6 * * * cd /home/ubuntu/btc-accumulation-notifier && /home/ubuntu/btc-accumulation-notifier/.venv/bin/python -m app.run_once >> logs/run.log 2>&1
-   ```
-6. Subscribe to the ntfy topic on your phone. Watch `btc.db` and `logs/run.log` accumulate.
-7. To upgrade accuracy later: add `GLASSNODE_API_KEY` (biggest lever) and/or `COINGLASS_API_KEY`,
-   then redeploy — the on-chain / derivatives categories activate automatically and reweight.
-
-Crypto trades 24/7, so there is **no market-hours/clock logic** — the job is a short, idempotent
-run on a schedule, not a long-running process.
-
----
-
-## Honesty & guardrails
-
-- **n=3 cycles.** Any threshold tuned to three bottoms is fragile. Indicators are chosen by
-  economic logic, not curve-fit to three lows.
-- **Regime shift.** ETFs and macro liquidity now drive timing more than the halving; this
-  drawdown is shallower than past cycles so far. **Do not assume** on-chain metrics must reach
-  their 2018 depths before a bottom — calibrate, don't dogmatically wait.
-- **Overshoot risk.** BTC can fall below every indicator's "bottom zone," or the cycle may not
-  rhyme. No single indicator is a trigger; the signal is the **confluence** of independent ones.
-- **Zone, not point.** The bot flags a *zone* of elevated probability, not a precise low.
-- **Not financial advice; alert-only; manual execution.** The build's job ends at the alert.
-  Treat the tiers as a ladder: buy a bit more as confidence deepens and price sinks further
-  below the 200-week MA and realized price, and keep dry powder for the capitulation flushes —
-  that discipline is for you, not logic in the system.
-
----
+Covers scoring, short-term indicators/triggers/composite, alert cooldown, the store, the API, and
+config parsing (incl. the `.env` inline-comment fix).
 
 ## Project layout
 
 ```
 app/
-  config.py        load + validate env; presence of optional keys toggles paid sources
-  sources/         price, funding, sentiment, macro, etf_flows, onchain, derivatives
-  scoring.py       linear_score, per-indicator sub-scores, category + composite, tiers
-  alerting.py      tier-transition + acute-flash decision, debounce, message builder
-  notify.py        ntfy / Telegram (no-op if unconfigured)
-  store.py         SQLite: init, last_tier, last_flash_at, record_run
-  run_once.py      entrypoint: fetch -> score -> decide -> notify -> persist
-scripts/backtest.py  one-off historical calibration
-tests/test_scoring.py
+  config.py        env -> Config (presence of a key toggles its layer)
+  sources/         exchange (OKX/Kraken), price, funding, sentiment, macro, onchain, derivatives
+  scoring.py       long-term accumulation score (0-100, tiers)
+  shortterm.py     short-term indicators + two-sided triggers + signed bias composite
+  alerting.py      tier/flash decisions + short-term cooldown + message builders
+  notify.py        email (Resend) primary; ntfy/Telegram secondary
+  store.py         SQLite (WAL): runs, candles, derivs, st_signals, st_alerts
+  run_once.py      long-term entrypoint (cron 6h)
+  collect_once.py  short-term collector (cron 10m)
+  watchdog.py      dead-man's-switch (cron 8h)
+  api.py           read-only JSON API for the dashboard
+scripts/           backtest.py, backtest_shortterm.py
+deploy/            systemd units, cloudflared + litestream configs
+tests/             pytest suite
 ```
+See [DEPLOY.md](DEPLOY.md) for the Lightsail 2GB deployment (~$12–14/mo all-in on free data).

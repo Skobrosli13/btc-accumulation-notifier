@@ -1,0 +1,19 @@
+# Cloudflare Tunnel config. Place at /home/ubuntu/.cloudflared/config.yml.
+# The tunnel makes an OUTBOUND connection to Cloudflare — NO inbound ports are
+# opened on the box (close 80/443 in the Lightsail firewall).
+#
+# Setup (one-time, see DEPLOY.md):
+#   cloudflared tunnel login
+#   cloudflared tunnel create btc-dashboard          # prints a TUNNEL_ID + creds json
+#   cloudflared tunnel route dns btc-dashboard <YOUR_HOST>
+# Then fill in the values below and run via the btc-tunnel.service unit.
+
+tunnel: <TUNNEL_ID>
+credentials-file: /home/ubuntu/.cloudflared/<TUNNEL_ID>.json
+
+ingress:
+  # The only thing exposed: the dashboard. Cloudflare Access (configured in the
+  # dashboard) gates this hostname with Google sign-in to your Gmail.
+  - hostname: <YOUR_HOST>            # e.g. btc.example.com
+    service: http://127.0.0.1:3000
+  - service: http_status:404

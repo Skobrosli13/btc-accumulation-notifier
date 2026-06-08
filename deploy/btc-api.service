@@ -1,0 +1,20 @@
+[Unit]
+# Read-only dashboard API. Bound to localhost; reached only via the co-hosted
+# Next.js server (and externally only through the Cloudflare tunnel + Access).
+Description=BTC Signal read-only API (FastAPI/uvicorn)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/btc-accumulation-notifier
+# The app loads .env from WorkingDirectory via python-dotenv.
+ExecStart=/home/ubuntu/btc-accumulation-notifier/.venv/bin/uvicorn app.api:app --host 127.0.0.1 --port 8000
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

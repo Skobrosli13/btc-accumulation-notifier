@@ -1,0 +1,21 @@
+[Unit]
+# Next.js dashboard (co-hosted). Bound to localhost; exposed only via the
+# Cloudflare tunnel, gated by Cloudflare Access. Reads the API over 127.0.0.1.
+Description=BTC Signal dashboard (Next.js)
+After=network-online.target btc-api.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/btc-dashboard
+# Next.js loads /home/ubuntu/btc-dashboard/.env.local (API_BASE_URL, API_TOKEN).
+Environment=NODE_ENV=production
+ExecStart=/usr/bin/npm run start
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

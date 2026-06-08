@@ -1,0 +1,18 @@
+[Unit]
+# Cloudflare tunnel: outbound-only connection exposing the dashboard via
+# https://<YOUR_HOST>. No inbound ports opened on the box.
+Description=BTC dashboard Cloudflare tunnel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+ExecStart=/usr/bin/cloudflared --config /home/ubuntu/.cloudflared/config.yml tunnel run
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

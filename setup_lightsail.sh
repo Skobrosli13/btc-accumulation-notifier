@@ -1,40 +1,80 @@
 #!/usr/bin/env bash
-# One-shot setup for an Ubuntu host (AWS Lightsail nano or any Ubuntu box).
-# Run from inside the project directory after un-tarring:  bash setup_lightsail.sh
+# One-shot setup for the always-on BTC signal stack on Ubuntu (Lightsail 2GB).
+# Layout expected (siblings):
+#   /home/ubuntu/btc-accumulation-notifier   (this repo)
+#   /home/ubuntu/btc-dashboard               (the Next.js dashboard)
+# Run from inside the notifier directory:  bash setup_lightsail.sh
+#
+# Automates: Python venv + deps, Node 20, dashboard build, systemd services
+# (api + dashboard), and the three crons. Cloudflare tunnel/Access, Litestream,
+# and S3 are guided steps in DEPLOY.md (they need your accounts).
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DASH="$(cd "$HERE/../btc-dashboard" 2>/dev/null && pwd || true)"
 cd "$HERE"
 
-echo "==> Installing system Python venv/pip (sudo)"
+echo "==> System packages (sudo)"
 sudo apt-get update -y
-sudo apt-get install -y python3-venv python3-pip
+sudo apt-get install -y python3-venv python3-pip curl
 
-echo "==> Creating virtualenv + installing dependencies"
+echo "==> Node 20 LTS"
+if ! command -v node >/dev/null || [ "$(node -v | cut -d. -f1 | tr -d v)" -lt 20 ]; then
+  curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+  sudo apt-get install -y nodejs
+fi
+node -v
+
+echo "==> Python venv + deps"
 python3 -m venv .venv
 # shellcheck disable=SC1091
 . .venv/bin/activate
 pip install --upgrade pip
 pip install -r requirements.txt
-# Optional: lets the free ETF-flow scraper work via pandas.read_html
-pip install lxml || echo "(lxml optional; ETF flows will degrade gracefully without it)"
+pip install lxml || echo "(lxml optional; ETF flows degrade gracefully without it)"
 
-echo "==> Ensuring .env exists"
-if [ ! -f .env ]; then cp .env.example .env; echo "  copied .env.example -> .env (edit it!)"; fi
+echo "==> .env"
+[ -f .env ] || { cp .env.example .env; echo "  copied .env.example -> .env (EDIT IT: RESEND_API_KEY, EMAIL_TO, API_TOKEN)"; }
+
+echo "==> Sanity dry-runs"
+python -m app.collect_once --dry-run || echo "(collect dry-run issue; check above)"
+python -m app.run_once --dry-run || echo "(run dry-run issue; check above)"
 
 mkdir -p logs
 
-echo "==> Sanity dry-run (no notify, no DB write)"
-python -m app.run_once --dry-run || echo "(dry-run reported an issue; check output above)"
+echo "==> Build the dashboard"
+if [ -n "$DASH" ] && [ -f "$DASH/package.json" ]; then
+  ( cd "$DASH" && npm ci && npm run build )
+  [ -f "$DASH/.env.local" ] || { cp "$DASH/.env.local.example" "$DASH/.env.local"; \
+    echo "  created $DASH/.env.local (SET API_TOKEN to match this app's .env)"; }
+else
+  echo "  !! btc-dashboard not found next to this repo; clone/copy it then re-run."
+fi
 
-echo "==> Installing cron (every 6h UTC, idempotent)"
-CRON_LINE="0 */6 * * * cd $HERE && $HERE/.venv/bin/python -m app.run_once >> $HERE/logs/run.log 2>&1"
-( crontab -l 2>/dev/null | grep -v 'app.run_once' ; echo "$CRON_LINE" ) | crontab -
-echo "  cron now contains:"
-crontab -l | grep 'app.run_once' | sed 's/^/    /'
+echo "==> Install systemd services (api + dashboard)"
+for svc in btc-api btc-dashboard; do
+  sudo cp "deploy/$svc.service" "/etc/systemd/system/$svc.service"
+done
+sudo systemctl daemon-reload
+sudo systemctl enable --now btc-api
+[ -n "$DASH" ] && sudo systemctl enable --now btc-dashboard || true
+sleep 2
+curl -fsS http://127.0.0.1:8000/api/health >/dev/null && echo "  api /health OK" || echo "  !! api not responding yet"
+
+echo "==> Install crons (idempotent)"
+PY="$HERE/.venv/bin/python"
+CRONS=$(cat <<EOF
+*/10 * * * * cd $HERE && $PY -m app.collect_once >> $HERE/logs/collect.log 2>&1
+0 */6 * * * cd $HERE && $PY -m app.run_once >> $HERE/logs/run.log 2>&1
+0 */8 * * * cd $HERE && $PY -m app.watchdog >> $HERE/logs/watchdog.log 2>&1
+EOF
+)
+( crontab -l 2>/dev/null | grep -vE 'app\.(collect_once|run_once|watchdog)' ; echo "$CRONS" ) | crontab -
+echo "  crons:"; crontab -l | grep -E 'app\.' | sed 's/^/    /'
 
 echo ""
-echo "==> Done. Next:"
-echo "    1. Subscribe to your ntfy topic on your phone (see DEPLOY.md)."
-echo "    2. (Optional) add FRED_API_KEY / GLASSNODE_API_KEY to .env, then no restart needed."
-echo "    3. Watch it work:  tail -f $HERE/logs/run.log"
+echo "==> Done with the automated parts. Remaining (see DEPLOY.md):"
+echo "    1. Cloudflare Tunnel + Access (Google login) -> exposes the dashboard privately."
+echo "    2. Litestream -> S3 backups (deploy/litestream.yml)."
+echo "    3. Close inbound 80/443 in the Lightsail firewall (tunnel is outbound-only)."
+echo "    4. Set RESEND_API_KEY + EMAIL_TO in .env; verify your Gmail in Resend; restart: sudo systemctl restart btc-api"

@@ -1,3 +1,6 @@
 pandas>=2.0
 requests>=2.31
 python-dotenv>=1.0
+fastapi>=0.110
+uvicorn[standard]>=0.29
+resend>=2.0
