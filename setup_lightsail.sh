@@ -16,7 +16,8 @@ cd "$HERE"
 
 echo "==> System packages (sudo)"
 sudo apt-get update -y
-sudo apt-get install -y python3-venv python3-pip curl
+sudo apt-get install -y python3-venv python3-pip curl cron
+sudo systemctl enable --now cron || true
 
 echo "==> Node 20 LTS"
 if ! command -v node >/dev/null || [ "$(node -v | cut -d. -f1 | tr -d v)" -lt 20 ]; then
@@ -69,7 +70,9 @@ CRONS=$(cat <<EOF
 0 */8 * * * cd $HERE && $PY -m app.watchdog >> $HERE/logs/watchdog.log 2>&1
 EOF
 )
-( crontab -l 2>/dev/null | grep -vE 'app\.(collect_once|run_once|watchdog)' ; echo "$CRONS" ) | crontab -
+# Pipefail-safe: an empty/absent crontab makes grep -v exit 1, which would abort
+# under `set -euo pipefail` — guard both the read and the filter with `|| true`.
+{ (crontab -l 2>/dev/null || true) | grep -vE 'app\.(collect_once|run_once|watchdog)' || true; echo "$CRONS"; } | crontab -
 echo "  crons:"; crontab -l | grep -E 'app\.' | sed 's/^/    /'
 
 echo ""
