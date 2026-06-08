@@ -92,13 +92,13 @@ def run(cfg: Config, *, dry_run: bool = False) -> dict:
         if dry_run:
             log.info("[dry-run] TIER ALERT\n%s\n%s", title, body)
         else:
-            notify.send(cfg, title, body)
+            notify.send(cfg, title, body, conn=conn)
     if decisions["flash_alert"]:
         title, body = alerting.build_flash_message(**msg_kwargs)
         if dry_run:
             log.info("[dry-run] FLASH ALERT\n%s\n%s", title, body)
         else:
-            notify.send(cfg, title, body)
+            notify.send(cfg, title, body, conn=conn)
 
     # Persist (full readings + sub-scores + category scores for later calibration).
     record = {

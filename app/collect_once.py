@@ -85,7 +85,7 @@ def run(cfg: Config, *, dry_run: bool = False) -> dict:
             if dry_run:
                 log.info("[dry-run] ST ALERT %s/%s\n%s\n%s", tf, trig.key, title, body)
             else:
-                notify.send(cfg, title, body)
+                notify.send(cfg, title, body, conn=conn)
                 store.record_st_alert(conn, ts=ev_ts, created_at=now.isoformat(),
                                       trigger_key=trig.key, timeframe=tf,
                                       direction=trig.direction, price=ev["price"],

@@ -131,6 +131,9 @@ class Config:
     api_token: str | None
     api_cors_origin: str | None
 
+    # Public origin used to build links in outgoing email (the unsubscribe URL).
+    public_base_url: str
+
     # Watchdog (dead-man's-switch)
     watchdog_stale_hours: float
 
@@ -213,5 +216,6 @@ def load_config() -> Config:
         st_strong_sell_threshold=_get_float("ST_STRONG_SELL_THRESHOLD", -60),
         api_token=_opt("API_TOKEN"),
         api_cors_origin=_opt("API_CORS_ORIGIN"),
+        public_base_url=_get("PUBLIC_BASE_URL", "https://btc.riverviewweb.com").rstrip("/"),
         watchdog_stale_hours=_get_float("WATCHDOG_STALE_HOURS", 3),
     )

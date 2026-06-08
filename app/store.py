@@ -65,6 +65,13 @@ CREATE TABLE IF NOT EXISTS st_alerts (
   sent        INTEGER DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS ix_st_alerts_key ON st_alerts(trigger_key, timeframe, ts DESC);
+
+CREATE TABLE IF NOT EXISTS subscribers (
+  email      TEXT PRIMARY KEY,        -- lowercased
+  token      TEXT UNIQUE NOT NULL,    -- unguessable unsubscribe capability (secrets.token_urlsafe)
+  active     INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL            -- ISO timestamp (UTC)
+);
 """
 
 
@@ -320,6 +327,52 @@ def last_collect_ts(conn: sqlite3.Connection) -> datetime | None:
     if not row or row["ts"] is None:
         return None
     return datetime.fromtimestamp(row["ts"] / 1000, tz=timezone.utc)
+
+
+# --- Email subscribers (alert broadcast list + unsubscribe memory) -----------
+
+def upsert_subscriber(conn: sqlite3.Connection, *, email: str, token: str,
+                      created_at: str) -> tuple[str, bool]:
+    """Subscribe an email. Returns (token, is_new).
+
+    Idempotent: re-subscribing an existing address re-activates it and keeps its
+    original unsubscribe token (so old unsubscribe links stay valid).
+    """
+    email = email.strip().lower()
+    row = conn.execute(
+        "SELECT token FROM subscribers WHERE email = ?", (email,)
+    ).fetchone()
+    if row:
+        conn.execute("UPDATE subscribers SET active = 1 WHERE email = ?", (email,))
+        conn.commit()
+        return row["token"], False
+    conn.execute(
+        "INSERT INTO subscribers (email, token, active, created_at) VALUES (?, ?, 1, ?)",
+        (email, token, created_at),
+    )
+    conn.commit()
+    return token, True
+
+
+def deactivate_subscriber(conn: sqlite3.Connection, token: str) -> str | None:
+    """Mark a subscriber inactive by their unsubscribe token. Returns the email
+    if the token matched (active or not), else None. Idempotent."""
+    row = conn.execute(
+        "SELECT email FROM subscribers WHERE token = ?", (token,)
+    ).fetchone()
+    if not row:
+        return None
+    conn.execute("UPDATE subscribers SET active = 0 WHERE token = ?", (token,))
+    conn.commit()
+    return row["email"]
+
+
+def list_active_subscribers(conn: sqlite3.Connection) -> list[tuple[str, str]]:
+    """All active subscribers as [(email, token), ...], oldest first."""
+    rows = conn.execute(
+        "SELECT email, token FROM subscribers WHERE active = 1 ORDER BY created_at"
+    ).fetchall()
+    return [(r["email"], r["token"]) for r in rows]
 
 
 # --- Retention ---------------------------------------------------------------

@@ -190,6 +190,33 @@ def open_interest(symbol: str = "BTC-USDT") -> float | None:
         return None
 
 
+def spot_price(symbol: str = "BTC-USDT", prefer: str = "okx") -> float | None:
+    """Latest spot price (last trade) from a lightweight ticker — OKX then Kraken.
+
+    Cheap enough to call on every dashboard request (one ticker row, not 300
+    klines). Returns None if both venues fail; the caller falls back to the
+    stored long-term price so the headline never blanks.
+    """
+    order = ["kraken", "okx"] if prefer == "kraken" else ["okx", "kraken"]
+    for venue in order:
+        try:
+            if venue == "okx":
+                data = get_json(f"{OKX_BASE}/api/v5/market/ticker",
+                                params={"instId": symbol})
+                if data and data.get("code") == "0" and data.get("data"):
+                    return float(data["data"][0]["last"])
+            else:
+                data = get_json(f"{KRAKEN_BASE}/0/public/Ticker",
+                                params={"pair": _kraken_pair(symbol)})
+                if data and not data.get("error") and data.get("result"):
+                    row = next(iter(data["result"].values()), None)
+                    if row:
+                        return float(row["c"][0])  # c = [last_price, lot_volume]
+        except Exception as exc:  # noqa: BLE001
+            log.warning("%s spot_price failed: %s", venue, exc)
+    return None
+
+
 def closed_only(df: pd.DataFrame) -> pd.DataFrame:
     """Drop the trailing still-forming candle so signals evaluate closed bars only."""
     if df.empty:

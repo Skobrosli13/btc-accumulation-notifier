@@ -105,3 +105,57 @@ def test_alerts_feed(client):
     assert lt["reason"]["type"] == "tier"
     assert "Fear & Greed" in lt["reason"]["in_zone"]
     assert "readings" not in lt          # bulky readings stripped from payload
+
+
+def test_subscribe_unsubscribe_flow(tmp_path):
+    db = str(tmp_path / "sub.db")
+    conn = store.connect(db)
+    store.init_db(conn)
+    conn.close()
+    # resend_api_key stays None -> no welcome email is scheduled (no network in tests)
+    cfg = make_config(db_path=db, api_token="secret")
+    api.app.dependency_overrides[api.get_config] = lambda: cfg
+    try:
+        c = TestClient(api.app)
+        assert c.post("/api/subscribe", json={"email": "nope"}, headers=_auth()).status_code == 400
+        assert c.post("/api/subscribe", json={"email": "a@b.com"}).status_code == 401  # token gate
+        r = c.post("/api/subscribe", json={"email": "Friend@Example.com"}, headers=_auth())
+        assert r.status_code == 200
+        assert r.json()["new"] is True and r.json()["email"] == "friend@example.com"  # lowercased
+        # idempotent re-subscribe
+        assert c.post("/api/subscribe", json={"email": "friend@example.com"},
+                      headers=_auth()).json()["new"] is False
+
+        ro = store.connect_readonly(db)
+        subs = store.list_active_subscribers(ro)
+        ro.close()
+        assert len(subs) == 1 and subs[0][0] == "friend@example.com"
+        token = subs[0][1]
+
+        # unsubscribe is public (no bearer) and returns a self-contained HTML page
+        u = c.get(f"/api/unsubscribe?token={token}")
+        assert u.status_code == 200 and "unsubscribed" in u.text.lower()
+        ro = store.connect_readonly(db)
+        assert store.list_active_subscribers(ro) == []
+        ro.close()
+
+        bad = c.get("/api/unsubscribe?token=bogus")
+        assert bad.status_code == 200 and "invalid" in bad.text.lower()
+    finally:
+        api.app.dependency_overrides.clear()
+
+
+def test_email_recipients_dedupe(tmp_path):
+    from app import notify
+    db = str(tmp_path / "r.db")
+    conn = store.connect(db)
+    store.init_db(conn)
+    store.upsert_subscriber(conn, email="owner@x.com", token="t-owner",
+                            created_at="2026-01-01T00:00:00+00:00")
+    store.upsert_subscriber(conn, email="friend@x.com", token="t-friend",
+                            created_at="2026-01-02T00:00:00+00:00")
+    cfg = make_config(email_to="Owner@X.com")
+    rec = notify._email_recipients(cfg, conn)
+    conn.close()
+    # owner is deduped onto the subscriber entry (so they get an unsubscribe token too)
+    assert rec == {"owner@x.com": "t-owner", "friend@x.com": "t-friend"}

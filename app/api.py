@@ -12,16 +12,24 @@ Run:  uvicorn app.api:app --host 127.0.0.1 --port 8000
 """
 from __future__ import annotations
 
+import re
+import secrets
 import sqlite3
 from datetime import datetime, timezone
 from functools import lru_cache
 
 import pandas as pd
-from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi import (BackgroundTasks, Depends, FastAPI, Header, HTTPException,
+                     Query)
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
+from pydantic import BaseModel
 
-from . import alerting, scoring, shortterm, store
+from . import alerting, notify_email, scoring, shortterm, store
 from .config import Config, load_config
+from .sources import exchange
+
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 app = FastAPI(title="BTC Signal API", version="1.0.0")
 
@@ -64,6 +72,22 @@ def require_token(authorization: str | None = Header(None),
 def _conn(cfg: Config) -> sqlite3.Connection:
     try:
         return store.connect_readonly(cfg.db_path)
+    except sqlite3.OperationalError as exc:
+        raise HTTPException(status_code=503, detail=f"database unavailable: {exc}")
+
+
+def _conn_rw(cfg: Config) -> sqlite3.Connection:
+    """A short-lived read-WRITE connection for the subscribe/unsubscribe writes.
+
+    The API is read-only by design; this is the one narrow exception. The
+    subscribers table is separate from the collector's tables and WAL +
+    busy_timeout handle the rare writer overlap. ``init_db`` is idempotent and
+    guarantees the table exists even before the first collector run.
+    """
+    try:
+        conn = store.connect(cfg.db_path)
+        store.init_db(conn)
+        return conn
     except sqlite3.OperationalError as exc:
         raise HTTPException(status_code=503, detail=f"database unavailable: {exc}")
 
@@ -172,6 +196,15 @@ def longterm_latest(cfg: Config = Depends(get_config), _=Depends(require_token))
     if latest:
         latest["breakdown"] = _lt_breakdown(latest, cfg)
     return {"latest": latest}
+
+
+@app.get("/api/price")
+def spot_price(cfg: Config = Depends(get_config), _=Depends(require_token)) -> dict:
+    """Live spot price (exchange ticker; no DB) so the dashboard headline can
+    refresh on its own 60s cadence instead of waiting for the 6h long-term run.
+    ``price`` is None if every venue is unreachable — the dashboard then falls
+    back to the stored long-term price."""
+    return {"price": exchange.spot_price(cfg.symbol, prefer=cfg.exchange)}
 
 
 def _enrich_st(conn, cfg: Config, sig: dict | None, tf: str,
@@ -292,3 +325,86 @@ def alerts(limit: int = Query(50, le=500),
             r["reason"] = None
         r.pop("readings", None)  # keep payload lean
     return {"short_term": st_rows, "long_term": lt_rows}
+
+
+# --- Email subscriptions -----------------------------------------------------
+
+class SubscribeIn(BaseModel):
+    email: str
+
+
+def _send_welcome(cfg: Config, email: str, unsubscribe_url: str) -> None:
+    """Confirmation email (also carries the unsubscribe link). Best-effort."""
+    subject = "You're subscribed to BTC signal alerts"
+    body = (
+        "You'll now receive Bitcoin signal alerts at this address.\n\n"
+        "Two alert types:\n"
+        "  • Long-term accumulation — tier changes (WATCH → ACCUMULATE → DEEP_VALUE)\n"
+        "  • Short-term swing — BUY/SELL triggers on closed candles\n\n"
+        "Not financial advice. Long-term is buy-only accumulation; short-term is "
+        "two-sided swing timing."
+    )
+    notify_email.send_email(cfg, subject, body, to=email, unsubscribe_url=unsubscribe_url)
+
+
+@app.post("/api/subscribe")
+def subscribe(body: SubscribeIn, background: BackgroundTasks,
+              cfg: Config = Depends(get_config), _=Depends(require_token)) -> dict:
+    """Add an email to the alert broadcast list (token-gated; called by the
+    dashboard's server-side proxy). Sends a confirmation/welcome email."""
+    email = (body.email or "").strip().lower()
+    if len(email) > 254 or not _EMAIL_RE.match(email):
+        raise HTTPException(status_code=400, detail="invalid email")
+    token = secrets.token_urlsafe(32)
+    conn = _conn_rw(cfg)
+    try:
+        token, is_new = store.upsert_subscriber(
+            conn, email=email, token=token,
+            created_at=datetime.now(timezone.utc).isoformat())
+    finally:
+        conn.close()
+    if cfg.resend_api_key:
+        unsub = f"{cfg.public_base_url}/api/unsubscribe?token={token}"
+        background.add_task(_send_welcome, cfg, email, unsub)
+    return {"ok": True, "email": email, "new": is_new}
+
+
+def _unsub_page(message: str) -> HTMLResponse:
+    safe = message  # message is one of our own fixed strings (no user input)
+    html_doc = f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>BTC alerts</title>
+<style>
+  html,body{{margin:0;height:100%;background:#0b0d12;color:#e8eaf0;
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}}
+  .box{{max-width:440px;margin:14vh auto 0;padding:32px;background:#14181f;
+    border:1px solid rgba(255,255,255,.06);border-radius:16px;text-align:center;
+    box-shadow:0 8px 24px rgba(0,0,0,.22)}}
+  h1{{font-size:18px;margin:0 0 10px}}
+  p{{color:#98a1b2;font-size:14px;line-height:1.5;margin:0}}
+</style></head>
+<body><div class="box"><h1>BTC signal alerts</h1><p>{safe}</p></div></body></html>"""
+    return HTMLResponse(content=html_doc)
+
+
+@app.get("/api/unsubscribe", response_class=HTMLResponse)
+def unsubscribe(token: str = Query(""),
+                cfg: Config = Depends(get_config)) -> HTMLResponse:
+    """Public (no bearer token) — the unguessable ``token`` from the email link
+    is the capability. Returns a self-contained confirmation page so it works as
+    a direct email-link target without any dashboard assets."""
+    email = None
+    if token:
+        conn = _conn_rw(cfg)
+        try:
+            email = store.deactivate_subscriber(conn, token)
+        finally:
+            conn.close()
+    if email:
+        return _unsub_page(
+            f"You’ve been unsubscribed. {email} will no longer receive alerts.")
+    return _unsub_page(
+        "This unsubscribe link is invalid or has already been used. "
+        "If you keep receiving alerts, reply to one of them.")

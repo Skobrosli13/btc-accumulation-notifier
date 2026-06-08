@@ -73,6 +73,24 @@ def test_latest_run_roundtrip(conn):
     assert latest["readings"] == {"x": 1}
 
 
+def test_subscriber_lifecycle(conn):
+    assert store.list_active_subscribers(conn) == []
+    tok, is_new = store.upsert_subscriber(
+        conn, email="A@B.com", token="tok1", created_at="2026-01-01T00:00:00+00:00")
+    assert is_new is True and tok == "tok1"
+    assert store.list_active_subscribers(conn) == [("a@b.com", "tok1")]  # lowercased
+    # re-subscribe is idempotent: keeps the original token, reports not-new
+    tok2, is_new2 = store.upsert_subscriber(
+        conn, email="a@b.com", token="tok2", created_at="2026-01-03T00:00:00+00:00")
+    assert is_new2 is False and tok2 == "tok1"
+    # unsubscribe by token, then it drops from the active list
+    assert store.deactivate_subscriber(conn, "tok1") == "a@b.com"
+    assert store.list_active_subscribers(conn) == []
+    # idempotent; unknown token -> None
+    assert store.deactivate_subscriber(conn, "tok1") == "a@b.com"
+    assert store.deactivate_subscriber(conn, "nope") is None
+
+
 def test_prune_drops_only_old_rows(conn):
     now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
     old = now_ms - 500 * 86400 * 1000
