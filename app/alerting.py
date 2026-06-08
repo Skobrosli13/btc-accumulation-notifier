@@ -138,3 +138,62 @@ def build_flash_message(*, composite: float, tier: str, subscores: dict,
                                 price_struct=price_struct, readings=readings,
                                 active_cats=active_cats, onchain_active=onchain_active)
     return title, "\n".join(body_lines)
+
+
+# --- Short-term swing alerts -------------------------------------------------
+
+def decide_st_alert(*, candle_ts: int, last_alert: dict | None,
+                    now: datetime, cooldown_hours: float) -> bool:
+    """Whether a fired short-term trigger should actually alert.
+
+    Pure function (mirrors decide_alerts). Suppresses if (a) we already alerted on
+    THIS candle for this trigger, or (b) we are still inside the cooldown window.
+    ``last_alert`` is ``store.last_st_alert(key, tf)`` -> {'ts', 'created_at'} or None.
+    """
+    if last_alert is None:
+        return True
+    if last_alert.get("ts") == candle_ts:          # same closed candle -> no repeat
+        return False
+    created = last_alert.get("created_at")
+    if created:
+        try:
+            elapsed_h = (now - datetime.fromisoformat(created)).total_seconds() / 3600.0
+            if elapsed_h < cooldown_hours:
+                return False
+        except ValueError:
+            pass
+    return True
+
+
+def build_st_message(*, trigger, timeframe: str, score: float, state: str,
+                     price: float | None, indicators: dict) -> tuple[str, str]:
+    """Return (title, body) for a short-term swing alert. ``trigger`` is a
+    shortterm.Trigger."""
+    arrow = "[BUY]" if trigger.direction == "BUY" else "[SELL]"
+    counter = ((trigger.direction == "BUY" and state in ("SELL", "STRONG_SELL"))
+               or (trigger.direction == "SELL" and state in ("BUY", "STRONG_BUY")))
+    title = f"BTC swing {timeframe}: {trigger.label} ({trigger.direction})"
+    lines = [f"{arrow} Short-term {trigger.direction} signal on the {timeframe} timeframe.",
+             f"Trigger: {trigger.label}." + (f" {trigger.detail}" if trigger.detail else ""),
+             ""]
+    if price is not None:
+        lines.append(f"Price (last closed {timeframe}): ${price:,.0f}")
+    # The score is the regime/momentum BIAS (context), not the signal itself —
+    # the trigger above is the actionable event.
+    lines.append(f"Regime bias (context): {score:+.0f}/100 ({state})")
+    if counter:
+        lines.append(f"[!] Counter-trend: this {trigger.direction} fires against a "
+                     f"{'bearish' if trigger.direction == 'BUY' else 'bullish'} regime "
+                     "- treat as lower-confidence / fade risk.")
+
+    rsi = indicators.get("rsi")
+    if isinstance(rsi, (list, tuple)) and rsi and rsi[0] is not None:
+        lines.append(f"RSI(14): {rsi[0]:.0f}")
+    atr_pct = indicators.get("atr_pct")
+    if atr_pct is not None:
+        lines.append(f"ATR: {atr_pct:.1f}% (volatility)")
+
+    lines.append("")
+    lines.append("Short-term swing timing - separate from the long-term accumulation thesis.")
+    lines.append("Not financial advice - alert only. You decide whether, how much, and where to trade.")
+    return title, "\n".join(lines)

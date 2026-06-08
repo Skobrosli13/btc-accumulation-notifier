@@ -289,8 +289,12 @@ def recent_st_alerts(conn: sqlite3.Connection, limit: int = 50) -> list[dict]:
 
 
 def last_collect_ts(conn: sqlite3.Connection) -> datetime | None:
-    """Wall-clock time of the most recent short-term signal (for the watchdog)."""
-    row = conn.execute("SELECT ts FROM st_signals ORDER BY ts DESC LIMIT 1").fetchone()
+    """Wall-clock time of the most recent collection (for the watchdog).
+
+    Uses the `derivs` table, which is stamped with the collection wall-clock time
+    on every run — NOT `st_signals.ts`, which is the (hours-old) candle open time.
+    """
+    row = conn.execute("SELECT MAX(ts) AS ts FROM derivs").fetchone()
     if not row or row["ts"] is None:
         return None
     return datetime.fromtimestamp(row["ts"] / 1000, tz=timezone.utc)

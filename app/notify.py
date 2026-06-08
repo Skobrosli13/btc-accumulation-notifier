@@ -47,8 +47,16 @@ def _send_telegram(cfg: Config, title: str, body: str) -> bool:
 
 
 def send(cfg: Config, title: str, body: str) -> bool:
-    """Send via whatever transports are configured. Returns True if any succeeded."""
+    """Send via whatever transports are configured. Returns True if any succeeded.
+
+    Email (Resend) is the primary channel after the pivot; ntfy/Telegram are
+    optional secondaries. All are no-ops when unconfigured.
+    """
+    from . import notify_email
+
     sent = False
+    if cfg.email_active:
+        sent = notify_email.send_email(cfg, title, body) or sent
     if cfg.ntfy_topic:
         sent = _send_ntfy(cfg, title, body) or sent
     if cfg.telegram_bot_token and cfg.telegram_chat_id:
