@@ -16,8 +16,18 @@ def client(tmp_path):
     conn = store.connect(db)
     store.init_db(conn)
     # populate a little of everything
+    readings = {
+        "raw": {"fng": 8, "mvrv_z": 0.1, "realized_ratio": 0.95},
+        "price_struct": {"price": 63000, "wma200": 62000, "dma200": 78000,
+                         "price_to_wma200": 1.016, "mayer_multiple": 0.81,
+                         "drop_24_48h_pct": -4.2, "source": "exchange"},
+        "subscores": {"fng": 0.84, "price_to_wma200": 0.3, "mayer": 0.7},
+        "category_scores": {"price": 0.5, "sentiment": 0.84, "onchain": None,
+                            "macro": None, "derivs": None},
+        "cycle_multiplier": 0.975,
+    }
     store.record_run(conn, run_ts="2026-06-08T00:00:00+00:00", price=63000, composite=58.0,
-                     tier="WATCH", active_cats=["price", "sentiment"], readings={"x": 1},
+                     tier="WATCH", active_cats=["price", "sentiment"], readings=readings,
                      tier_alerted=True, flash_alerted=False)
     base = int(datetime(2026, 6, 1, tzinfo=timezone.utc).timestamp() * 1000)
     step = 4 * 3600_000
@@ -58,12 +68,23 @@ def test_health_ok(client):
 def test_longterm_latest(client):
     j = client.get("/api/longterm/latest", headers=_auth()).json()
     assert j["latest"]["tier"] == "WATCH"
-    assert j["latest"]["readings"] == {"x": 1}
+    bd = j["latest"]["breakdown"]
+    assert {c["key"] for c in bd["categories"]} == {"onchain", "price", "macro", "sentiment", "derivs"}
+    price_cat = next(c for c in bd["categories"] if c["key"] == "price")
+    assert price_cat["active"] is True and price_cat["weight"] == 0.20
+    assert "Fear & Greed" in bd["in_zone"]              # fng subscore 0.84 >= 0.6
+    assert bd["levels"]["wma200_rel"] == "above"        # price 63000 > wma200 62000
+    assert bd["cycle"]["multiplier"] == 0.975 and "days_since_ath" in bd["cycle"]
+    assert bd["tiers"]["accumulate"] == 60
 
 
 def test_shortterm_latest(client):
     j = client.get("/api/shortterm/latest", headers=_auth()).json()
-    assert j["timeframes"]["4h"]["st_state"] == "BUY"
+    sig = j["timeframes"]["4h"]
+    assert sig["st_state"] == "BUY"
+    assert isinstance(sig["triggers"], list)            # present (may be empty)
+    assert any(c["key"] == "funding" for c in sig["components"])  # funding present in derivs
+    assert sig["funding"] == -0.0003
 
 
 def test_candles_and_indicators(client):
@@ -79,4 +100,8 @@ def test_candles_and_indicators(client):
 def test_alerts_feed(client):
     j = client.get("/api/alerts", headers=_auth()).json()
     assert any(a["trigger_key"] == "ema_cross_bull" for a in j["short_term"])
-    assert any(a["tier"] == "WATCH" for a in j["long_term"])
+    lt = next(a for a in j["long_term"] if a["tier"] == "WATCH")
+    assert lt["reason"]["tier_label"] == "Watch"
+    assert lt["reason"]["type"] == "tier"
+    assert "Fear & Greed" in lt["reason"]["in_zone"]
+    assert "readings" not in lt          # bulky readings stripped from payload

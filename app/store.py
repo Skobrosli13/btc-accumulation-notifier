@@ -289,16 +289,25 @@ def recent_st_alerts(conn: sqlite3.Connection, limit: int = 50) -> list[dict]:
 
 
 def recent_run_alerts(conn: sqlite3.Connection, limit: int = 20) -> list[dict]:
-    """Recent long-term runs that fired a tier or flash alert (for the merged feed)."""
+    """Recent long-term runs that fired a tier or flash alert (for the merged feed).
+    Includes parsed `readings` so the API can reconstruct the alert's reasoning."""
     rows = conn.execute(
         """
-        SELECT run_ts, price, composite, tier, tier_alerted, flash_alerted
+        SELECT run_ts, price, composite, tier, tier_alerted, flash_alerted, readings_json
         FROM runs WHERE tier_alerted = 1 OR flash_alerted = 1
         ORDER BY run_ts DESC LIMIT ?
         """,
         (limit,),
     ).fetchall()
-    return [dict(r) for r in rows]
+    out = []
+    for r in rows:
+        d = dict(r)
+        try:
+            d["readings"] = json.loads(d.pop("readings_json") or "{}")
+        except (json.JSONDecodeError, TypeError):
+            d["readings"] = {}
+        out.append(d)
+    return out
 
 
 def last_collect_ts(conn: sqlite3.Connection) -> datetime | None:

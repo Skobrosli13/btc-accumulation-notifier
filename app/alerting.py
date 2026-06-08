@@ -22,6 +22,11 @@ TIER_LABELS = {
     "ACCUMULATE": "Accumulate",
     "DEEP_VALUE": "Deep Value",
 }
+TIER_HEADLINES = {
+    "WATCH": "indicators starting to align",
+    "ACCUMULATE": "meaningful confluence - begin laddering",
+    "DEEP_VALUE": "strongest confluence - heaviest tranches",
+}
 ALERT_TIERS = ("WATCH", "ACCUMULATE", "DEEP_VALUE")
 
 
@@ -105,11 +110,7 @@ def build_tier_message(*, composite: float, tier: str, subscores: dict,
                        onchain_active: bool) -> tuple[str, str]:
     """Return (title, body) for a tier-transition alert."""
     label = TIER_LABELS.get(tier, tier)
-    headline = {
-        "WATCH": "indicators starting to align",
-        "ACCUMULATE": "meaningful confluence - begin laddering",
-        "DEEP_VALUE": "strongest confluence - heaviest tranches",
-    }.get(tier, "")
+    headline = TIER_HEADLINES.get(tier, "")
     title = f"BTC accumulation: {label} ({composite:.0f}/100)"
     body_lines = [f"Tier changed to {label.upper()} - {headline}.", ""]
     body_lines += _common_lines(composite=composite, tier=tier, subscores=subscores,
@@ -142,6 +143,14 @@ def build_flash_message(*, composite: float, tier: str, subscores: dict,
 
 # --- Short-term swing alerts -------------------------------------------------
 
+def is_counter_trend(direction: str, state: str) -> bool:
+    """A trigger is counter-trend when it points against the regime bias — a BUY in
+    a bearish state, or a SELL in a bullish state. Single source of truth, reused by
+    the alert message builder and the dashboard API."""
+    return ((direction == "BUY" and state in ("SELL", "STRONG_SELL"))
+            or (direction == "SELL" and state in ("BUY", "STRONG_BUY")))
+
+
 def decide_st_alert(*, candle_ts: int, last_alert: dict | None,
                     now: datetime, cooldown_hours: float) -> bool:
     """Whether a fired short-term trigger should actually alert.
@@ -170,8 +179,7 @@ def build_st_message(*, trigger, timeframe: str, score: float, state: str,
     """Return (title, body) for a short-term swing alert. ``trigger`` is a
     shortterm.Trigger."""
     arrow = "[BUY]" if trigger.direction == "BUY" else "[SELL]"
-    counter = ((trigger.direction == "BUY" and state in ("SELL", "STRONG_SELL"))
-               or (trigger.direction == "SELL" and state in ("BUY", "STRONG_BUY")))
+    counter = is_counter_trend(trigger.direction, state)
     title = f"BTC swing {timeframe}: {trigger.label} ({trigger.direction})"
     lines = [f"{arrow} Short-term {trigger.direction} signal on the {timeframe} timeframe.",
              f"Trigger: {trigger.label}." + (f" {trigger.detail}" if trigger.detail else ""),

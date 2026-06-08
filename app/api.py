@@ -20,10 +20,20 @@ import pandas as pd
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
-from . import shortterm, store
+from . import alerting, scoring, shortterm, store
 from .config import Config, load_config
 
 app = FastAPI(title="BTC Signal API", version="1.0.0")
+
+# Display labels (server-side single source of truth; the dashboard never re-derives).
+_CATEGORY_LABELS = {
+    "onchain": "On-chain valuation", "price": "Price structure",
+    "macro": "Macro / liquidity", "sentiment": "Sentiment", "derivs": "Derivatives",
+}
+_COMPONENT_LABELS = {
+    "trend": "Trend (EMA 9/21 spread)", "macd": "MACD histogram",
+    "funding": "Funding positioning",
+}
 
 
 @lru_cache(maxsize=1)
@@ -95,6 +105,63 @@ def health(cfg: Config = Depends(get_config), _=Depends(require_token)) -> dict:
     return out
 
 
+def _lt_breakdown(latest: dict, cfg: Config) -> dict:
+    """Display-ready decomposition of the latest long-term run (reuses scoring labels)."""
+    readings = latest.get("readings") or {}
+    raw = readings.get("raw") or {}
+    ps = readings.get("price_struct") or {}
+    subs = readings.get("subscores") or {}
+    cats = readings.get("category_scores") or {}
+    active = {c for c in (latest.get("active_cats") or "").split(",") if c}
+
+    categories = []
+    for cat, inds in scoring.CATEGORY_INDICATORS.items():
+        categories.append({
+            "key": cat,
+            "label": _CATEGORY_LABELS.get(cat, cat),
+            "score": cats.get(cat),
+            "weight": cfg.weights.get(cat),
+            "active": cat in active,
+            "indicators": [{
+                "key": k,
+                "label": scoring.INDICATOR_LABELS.get(k, k),
+                "subscore": subs.get(k),
+                "raw": raw.get(k),
+                "in_zone": (subs.get(k) is not None and subs.get(k) >= scoring.IN_ZONE_THRESHOLD),
+            } for k in inds],
+        })
+
+    p2w = ps.get("price_to_wma200")
+    rr = raw.get("realized_ratio")
+    levels = {
+        "price": ps.get("price"), "wma200": ps.get("wma200"), "dma200": ps.get("dma200"),
+        "price_to_wma200": p2w, "wma200_rel": (None if p2w is None else ("below" if p2w <= 1 else "above")),
+        "mayer": ps.get("mayer_multiple"),
+        "realized_ratio": rr, "realized_rel": (None if rr is None else ("below" if rr <= 1 else "above")),
+        "drop_24_48h_pct": ps.get("drop_24_48h_pct"), "source": ps.get("source"),
+    }
+
+    days_since_ath = (datetime.now(timezone.utc).date() - cfg.ath_date).days
+    cycle = {
+        "ath_date": cfg.ath_date.isoformat(),
+        "days_since_ath": days_since_ath,
+        "typical_days": cfg.peak_to_trough_days,
+        "window_lo": cfg.peak_to_trough_days - scoring.CYCLE_WINDOW_HALFWIDTH_DAYS,
+        "window_hi": cfg.peak_to_trough_days + scoring.CYCLE_WINDOW_HALFWIDTH_DAYS,
+        "in_window": abs(days_since_ath - cfg.peak_to_trough_days) <= scoring.CYCLE_WINDOW_HALFWIDTH_DAYS,
+        "multiplier": readings.get("cycle_multiplier"),
+    }
+
+    return {
+        "categories": categories,
+        "in_zone": scoring.indicators_in_zone(subs),
+        "levels": levels,
+        "cycle": cycle,
+        "tiers": {"watch": cfg.tier_watch, "accumulate": cfg.tier_accumulate,
+                  "deep_value": cfg.tier_deepvalue},
+    }
+
+
 @app.get("/api/longterm/latest")
 def longterm_latest(cfg: Config = Depends(get_config), _=Depends(require_token)) -> dict:
     conn = _conn(cfg)
@@ -102,14 +169,49 @@ def longterm_latest(cfg: Config = Depends(get_config), _=Depends(require_token))
         latest = store.latest_run(conn)
     finally:
         conn.close()
+    if latest:
+        latest["breakdown"] = _lt_breakdown(latest, cfg)
     return {"latest": latest}
+
+
+def _enrich_st(conn, cfg: Config, sig: dict | None, tf: str,
+               funding: float | None, oi_chg_pct: float | None) -> dict | None:
+    """Add live bias components + currently-active triggers to a short-term signal
+    (recomputed from recent candles, mirroring collect_once)."""
+    if sig is None:
+        return None
+    sig["funding"] = funding
+    sig["oi_chg_pct"] = oi_chg_pct
+    sig["components"] = []
+    sig["triggers"] = []
+    rows = store.recent_candles(conn, tf, 300)
+    if len(rows) < 35:
+        return sig
+    df = pd.DataFrame(rows)
+    df["open_time"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
+    try:
+        _score, comps = shortterm.st_composite(df, cfg, funding)
+        sig["components"] = [{"key": k, "label": _COMPONENT_LABELS.get(k, k), "value": v}
+                             for k, v in comps.items()]
+        state = sig.get("st_state", "NEUTRAL")
+        sig["triggers"] = [{
+            "key": t.key, "direction": t.direction, "label": t.label, "detail": t.detail,
+            "counter_trend": alerting.is_counter_trend(t.direction, state),
+        } for t in shortterm.detect_triggers(df, cfg, funding, oi_chg_pct)]
+    except Exception:  # noqa: BLE001 - never 500 the dashboard over a recompute
+        pass
+    return sig
 
 
 @app.get("/api/shortterm/latest")
 def shortterm_latest(cfg: Config = Depends(get_config), _=Depends(require_token)) -> dict:
     conn = _conn(cfg)
     try:
-        out = {tf: store.latest_st_signal(conn, tf) for tf in cfg.st_timeframes}
+        derivs = store.recent_derivs(conn, 1)
+        funding = derivs[-1]["funding"] if derivs else None
+        oi_chg_pct = derivs[-1]["oi_chg_pct"] if derivs else None
+        out = {tf: _enrich_st(conn, cfg, store.latest_st_signal(conn, tf), tf, funding, oi_chg_pct)
+               for tf in cfg.st_timeframes}
     finally:
         conn.close()
     return {"timeframes": out}
@@ -157,6 +259,23 @@ def derivs(limit: int = Query(200, le=1000),
     return {"derivs": rows}
 
 
+def _lt_alert_reason(row: dict) -> dict:
+    readings = row.get("readings") or {}
+    subs = readings.get("subscores") or {}
+    ps = readings.get("price_struct") or {}
+    raw = readings.get("raw") or {}
+    tier = row.get("tier", "")
+    return {
+        "type": "flash" if row.get("flash_alerted") else "tier",
+        "tier_label": alerting.TIER_LABELS.get(tier, tier),
+        "headline": alerting.TIER_HEADLINES.get(tier, ""),
+        "in_zone": scoring.indicators_in_zone(subs),
+        "levels": {"price_to_wma200": ps.get("price_to_wma200"),
+                   "realized_ratio": raw.get("realized_ratio"),
+                   "mayer": ps.get("mayer_multiple")},
+    }
+
+
 @app.get("/api/alerts")
 def alerts(limit: int = Query(50, le=500),
            cfg: Config = Depends(get_config), _=Depends(require_token)) -> dict:
@@ -166,4 +285,10 @@ def alerts(limit: int = Query(50, le=500),
         lt_rows = store.recent_run_alerts(conn, 20)
     finally:
         conn.close()
+    for r in lt_rows:
+        try:
+            r["reason"] = _lt_alert_reason(r)
+        except Exception:  # noqa: BLE001
+            r["reason"] = None
+        r.pop("readings", None)  # keep payload lean
     return {"short_term": st_rows, "long_term": lt_rows}
