@@ -18,8 +18,25 @@ except ImportError:  # python-dotenv is a convenience, not a hard requirement
     pass
 
 
+def _strip_inline_comment(value: str) -> str:
+    """Drop a trailing inline comment.
+
+    python-dotenv does not strip inline comments when the value is blank, so a
+    line like ``KEY=    # note`` yields the comment as the value. Our config
+    values never contain spaces, so we treat a leading ``#`` (after trim) as an
+    empty value and cut anything from the first `` #`` (space-hash) onward. A
+    ``#`` embedded in a value with no preceding space (e.g. a token) is kept.
+    """
+    if value.strip().startswith("#"):
+        return ""
+    idx = value.find(" #")
+    if idx != -1:
+        value = value[:idx]
+    return value
+
+
 def _get(name: str, default: str = "") -> str:
-    return os.environ.get(name, default).strip()
+    return _strip_inline_comment(os.environ.get(name, default)).strip()
 
 
 def _get_float(name: str, default: float) -> float:

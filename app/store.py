@@ -288,6 +288,19 @@ def recent_st_alerts(conn: sqlite3.Connection, limit: int = 50) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def recent_run_alerts(conn: sqlite3.Connection, limit: int = 20) -> list[dict]:
+    """Recent long-term runs that fired a tier or flash alert (for the merged feed)."""
+    rows = conn.execute(
+        """
+        SELECT run_ts, price, composite, tier, tier_alerted, flash_alerted
+        FROM runs WHERE tier_alerted = 1 OR flash_alerted = 1
+        ORDER BY run_ts DESC LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
 def last_collect_ts(conn: sqlite3.Connection) -> datetime | None:
     """Wall-clock time of the most recent collection (for the watchdog).
 
