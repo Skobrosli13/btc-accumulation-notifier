@@ -63,6 +63,11 @@ class Config:
     telegram_bot_token: str | None
     telegram_chat_id: str | None
 
+    # Email (Resend) — primary channel after the pivot
+    resend_api_key: str | None
+    email_from: str
+    email_to: str | None
+
     # Free data
     fred_api_key: str | None
 
@@ -72,9 +77,12 @@ class Config:
     coinglass_api_key: str | None
     sosovalue_api_key: str | None
 
-    # Signal config
-    symbol: str
+    # Market data
+    exchange: str          # okx (default) | kraken | binance (only from unrestricted regions)
+    symbol: str            # spot symbol, e.g. BTC-USDT (long-term price structure)
     db_path: str
+
+    # Long-term signal config
     weights: dict[str, float]
     tier_watch: float
     tier_accumulate: float
@@ -89,11 +97,35 @@ class Config:
     ath_date: date
     peak_to_trough_days: int
 
+    # Short-term swing config
+    st_timeframes: tuple[str, ...]   # e.g. ("4h", "1d")
+    st_cooldown_hours: float         # min hours between repeats of the same trigger+timeframe
+    st_rsi_oversold: float
+    st_rsi_overbought: float
+    st_vol_spike_mult: float
+    st_funding_spike: float          # |funding| above this (8h fraction) = spike
+    st_oi_surge_pct: float           # OI change over window above this % = surge
+    st_buy_threshold: float          # st_composite >= this => BUY state
+    st_strong_buy_threshold: float
+    st_sell_threshold: float         # st_composite <= this => SELL state (negative)
+    st_strong_sell_threshold: float
+
+    # Dashboard read-only API
+    api_token: str | None
+    api_cors_origin: str | None
+
+    # Watchdog (dead-man's-switch)
+    watchdog_stale_hours: float
+
     # --- Derived helpers -------------------------------------------------
 
     @property
     def onchain_active(self) -> bool:
         return bool(self.glassnode_api_key or self.cryptoquant_api_key)
+
+    @property
+    def email_active(self) -> bool:
+        return bool(self.resend_api_key and self.email_to)
 
     @property
     def derivs_paid_active(self) -> bool:
@@ -104,7 +136,19 @@ class Config:
         return bool(self.fred_api_key)
 
     def notifications_configured(self) -> bool:
-        return bool(self.ntfy_topic or (self.telegram_bot_token and self.telegram_chat_id))
+        return bool(
+            self.email_active
+            or self.ntfy_topic
+            or (self.telegram_bot_token and self.telegram_chat_id)
+        )
+
+
+def _get_tuple(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
+    raw = _get(name)
+    if not raw:
+        return default
+    parts = tuple(p.strip().lower() for p in raw.split(",") if p.strip())
+    return parts or default
 
 
 def load_config() -> Config:
@@ -113,12 +157,16 @@ def load_config() -> Config:
         ntfy_server=_get("NTFY_SERVER", "https://ntfy.sh").rstrip("/"),
         telegram_bot_token=_opt("TELEGRAM_BOT_TOKEN"),
         telegram_chat_id=_opt("TELEGRAM_CHAT_ID"),
+        resend_api_key=_opt("RESEND_API_KEY"),
+        email_from=_get("EMAIL_FROM", "onboarding@resend.dev"),
+        email_to=_opt("EMAIL_TO"),
         fred_api_key=_opt("FRED_API_KEY"),
         glassnode_api_key=_opt("GLASSNODE_API_KEY"),
         cryptoquant_api_key=_opt("CRYPTOQUANT_API_KEY"),
         coinglass_api_key=_opt("COINGLASS_API_KEY"),
         sosovalue_api_key=_opt("SOSOVALUE_API_KEY"),
-        symbol=_get("SYMBOL", "BTCUSDT"),
+        exchange=_get("EXCHANGE", "okx").lower(),
+        symbol=_get("SYMBOL", "BTC-USDT"),
         db_path=_get("DB_PATH", "./btc.db"),
         weights={
             "onchain": _get_float("W_ONCHAIN", 0.35),
@@ -135,4 +183,18 @@ def load_config() -> Config:
         flash_debounce_days=_get_int("FLASH_DEBOUNCE_DAYS", 3),
         ath_date=_parse_date(_get("ATH_DATE", "2025-10-06"), date(2025, 10, 6)),
         peak_to_trough_days=_get_int("PEAK_TO_TROUGH_DAYS", 370),
+        st_timeframes=_get_tuple("ST_TIMEFRAMES", ("4h", "1d")),
+        st_cooldown_hours=_get_float("ST_COOLDOWN_HOURS", 12),
+        st_rsi_oversold=_get_float("ST_RSI_OVERSOLD", 30),
+        st_rsi_overbought=_get_float("ST_RSI_OVERBOUGHT", 70),
+        st_vol_spike_mult=_get_float("ST_VOL_SPIKE_MULT", 2.0),
+        st_funding_spike=_get_float("ST_FUNDING_SPIKE", 0.0005),
+        st_oi_surge_pct=_get_float("ST_OI_SURGE_PCT", 10.0),
+        st_buy_threshold=_get_float("ST_BUY_THRESHOLD", 30),
+        st_strong_buy_threshold=_get_float("ST_STRONG_BUY_THRESHOLD", 60),
+        st_sell_threshold=_get_float("ST_SELL_THRESHOLD", -30),
+        st_strong_sell_threshold=_get_float("ST_STRONG_SELL_THRESHOLD", -60),
+        api_token=_opt("API_TOKEN"),
+        api_cors_origin=_opt("API_CORS_ORIGIN"),
+        watchdog_stale_hours=_get_float("WATCHDOG_STALE_HOURS", 3),
     )

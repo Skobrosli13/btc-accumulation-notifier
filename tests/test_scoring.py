@@ -8,6 +8,8 @@ import pytest
 from app import alerting, scoring
 from app.config import Config
 
+from tests.factories import make_config
+
 
 # --- linear_score ------------------------------------------------------------
 
@@ -135,18 +137,7 @@ def test_indicators_in_zone_uses_labels():
 # --- flash + decide_alerts ---------------------------------------------------
 
 def _cfg(**over) -> Config:
-    base = dict(
-        ntfy_topic=None, ntfy_server="https://ntfy.sh", telegram_bot_token=None,
-        telegram_chat_id=None, fred_api_key=None, glassnode_api_key=None,
-        cryptoquant_api_key=None, coinglass_api_key=None, sosovalue_api_key=None,
-        symbol="BTCUSDT", db_path=":memory:",
-        weights={"onchain": 0.35, "price": 0.20, "macro": 0.20, "sentiment": 0.10, "derivs": 0.15},
-        tier_watch=40, tier_accumulate=60, tier_deepvalue=80,
-        flash_fng_max=10, flash_drop_pct=10, flash_debounce_days=3,
-        ath_date=date(2025, 10, 6), peak_to_trough_days=370,
-    )
-    base.update(over)
-    return Config(**base)
+    return make_config(**over)
 
 
 def test_flash_fires_on_free_proxy():
