@@ -1,117 +1,133 @@
 # Deploy — always-on BTC signal stack (Lightsail 2GB)
 
-This supersedes the old nano + single-6h-cron runbook. The system is now:
+This describes the **live** box. The system is:
 
 ```
-Lightsail 2GB (Ubuntu, systemd)
+Lightsail 2GB (Ubuntu, systemd) — STATIC IP
  ├─ cron */10  → python -m app.collect_once   # short-term swing (4h/1d) → candles/derivs/signals → alerts
  ├─ cron 0 */6 → python -m app.run_once        # long-term accumulation score
- ├─ cron 0 */8 → python -m app.watchdog        # dead-man's-switch (emails if pipeline stale)
+ ├─ cron hourly→ python -m app.watchdog        # dead-man's-switch (run >= as often as WATCHDOG_STALE_HOURS)
  ├─ systemd    → uvicorn app.api:app (127.0.0.1:8000)   # read-only JSON API, localhost only
- ├─ systemd    → next start (btc-dashboard, 127.0.0.1:3000)
- ├─ systemd    → cloudflared tunnel            # OUTBOUND-only; no inbound ports
- └─ systemd    → litestream                    # continuous SQLite → S3 backup
+ ├─ systemd    → next start (btc-dashboard, 127.0.0.1:3000)   # localhost only
+ └─ nginx      → TLS (Let's Encrypt) + HTTP basic auth → reverse-proxy :3000
 
-Cloudflare Access (Google sign-in → your Gmail, long session) gates https://<host> → dashboard
-You (any device) → one-click Google login → dashboard
+Public:  https://btc.riverviewweb.com  → nginx (basic auth) → dashboard
 ```
 
-The API and dashboard are bound to **localhost**. The only thing reachable from
-the internet is the dashboard, **via the Cloudflare tunnel**, and **only by you**
-via Cloudflare Access. No inbound ports are opened on the box.
+The API and dashboard both bind to **localhost**. The only thing reachable from
+the internet is nginx on 80/443, which terminates TLS, enforces a shared HTTP
+basic-auth password, and proxies to the dashboard on :3000. The dashboard reads
+the API server-side over `127.0.0.1:8000` with the `API_TOKEN`, which never
+reaches the browser.
 
-## Prerequisites (gather these)
+> **Historical note.** An earlier design used a Cloudflare tunnel + Cloudflare
+> Access for ingress and Litestream for S3 backup. The live box does **not** use
+> these. The files `deploy/cloudflared-config.yml`, `deploy/btc-tunnel.service`,
+> and `deploy/litestream.yml` are leftovers from that design and are **not wired
+> in** — ignore them (or delete them) unless you deliberately revive that path.
 
-- **Resend**: account + `RESEND_API_KEY`; verify `skobrosli@gmail.com` (sandbox can only email
-  your verified address until you verify a domain).
-- **AWS**: Lightsail **2GB** Ubuntu instance; an **S3 bucket + credentials** for Litestream.
-- **Cloudflare** (free): a domain on a Cloudflare zone; you'll create a Tunnel + an Access app.
+## Prerequisites
+
+- **Resend**: account + `RESEND_API_KEY`; verify `skobrosli@gmail.com` (sandbox can only
+  email your verified address until you verify a domain).
+- **AWS**: Lightsail **2GB** Ubuntu instance with a **static IP** attached.
+- **DNS**: an A-record `btc.<yourdomain>` → the static IP.
 - A long random `API_TOKEN`: `openssl rand -hex 32`.
+- A private GitHub repo holding both sibling folders (`btc-accumulation-notifier/`
+  and `btc-dashboard/`).
 
-## 1. Put the code on the box (two sibling folders)
+## 1. Put the code on the box (git, two sibling folders)
 
 ```bash
-scp -i <key.pem> btc-accumulation-notifier.tar.gz btc-dashboard.tar.gz ubuntu@<IP>:~
-ssh -i <key.pem> ubuntu@<IP>
-tar -xzf btc-accumulation-notifier.tar.gz   # -> ~/btc-accumulation-notifier
-tar -xzf btc-dashboard.tar.gz               # -> ~/btc-dashboard  (sibling)
+ssh -i <key.pem> ubuntu@<STATIC_IP>
+# the two repos live as siblings directly under /home/ubuntu:
+git clone https://github.com/Skobrosli13/btc-accumulation-notifier.git ~/btc-accumulation-notifier
+git clone https://github.com/Skobrosli13/btc-dashboard.git ~/btc-dashboard
 ```
 
 ## 2. Configure secrets
 
-`~/btc-accumulation-notifier/.env`:
+`btc-accumulation-notifier/.env`:
 ```dotenv
 RESEND_API_KEY=...           # from Resend
 EMAIL_TO=skobrosli@gmail.com
 EXCHANGE=okx
 API_TOKEN=<openssl rand -hex 32>
-# leave paid keys blank to run free; ntfy/telegram optional
+PUBLIC_BASE_URL=https://btc.riverviewweb.com   # used to build the email unsubscribe link
+# leave paid keys (GLASSNODE_API_KEY/COINGLASS_API_KEY/...) blank to run free
 ```
-`~/btc-dashboard/.env.local`:
+`btc-dashboard/.env.local`:
 ```dotenv
 API_BASE_URL=http://127.0.0.1:8000
 API_TOKEN=<the SAME token as above>
 ```
 
-## 3. Run the installer
+## 3. Install services + crons
 
+`setup_lightsail.sh` installs the Python venv + deps, Node, builds the dashboard,
+installs/starts the `btc-api` and `btc-dashboard` systemd services, and adds the
+crons:
 ```bash
 cd ~/btc-accumulation-notifier && bash setup_lightsail.sh
 ```
-This installs Python venv + deps, Node 20, builds the dashboard, installs and starts the
-`btc-api` and `btc-dashboard` systemd services, and adds the three crons. It curls
-`/api/health` as a smoke test.
 
-## 4. Cloudflare Tunnel + Access (exposes the dashboard privately)
+## 4. Public ingress: nginx + TLS + basic auth
 
+Open inbound **80 and 443** in the Lightsail firewall, ensure the DNS A-record
+points at the static IP, then:
 ```bash
-sudo mkdir -p /usr/local/bin && \
-  curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
-  -o /usr/local/bin/cloudflared && sudo chmod +x /usr/local/bin/cloudflared
-cloudflared tunnel login
-cloudflared tunnel create btc-dashboard          # note the TUNNEL_ID + creds path
-cloudflared tunnel route dns btc-dashboard btc.<yourdomain>
+cd ~/btc-accumulation-notifier
+DOMAIN=btc.riverviewweb.com EMAIL=skobrosli@gmail.com bash deploy/setup_nginx_basicauth.sh
 ```
-Edit `deploy/cloudflared-config.yml` (fill `TUNNEL_ID`, creds path, and `hostname`), copy it to
-`~/.cloudflared/config.yml`, then install the tunnel service:
-```bash
-cp deploy/btc-tunnel.service /tmp && sudo cp /tmp/btc-tunnel.service /etc/systemd/system/
-sudo systemctl daemon-reload && sudo systemctl enable --now btc-tunnel
-```
-In the **Cloudflare Zero Trust dashboard** → Access → Applications → Add a *self-hosted* app on
-`btc.<yourdomain>`, with a policy **Allow → emails → skobrosli@gmail.com** and a session of e.g.
-30 days. Now visiting the host prompts a one-click Google login (rare, thanks to the long session).
+This provisions a Let's Encrypt cert (auto-renew via `certbot.timer`), sets up the
+basic-auth password file, and reverse-proxies the dashboard. The script also adds
+an **exact-match `location = /api/unsubscribe`** that bypasses basic auth and
+proxies straight to the FastAPI on :8000 — without it the email unsubscribe link
+(and the `List-Unsubscribe` header) would prompt for a password and then 404,
+since the dashboard has no such route.
 
-**Close inbound ports**: in the Lightsail networking tab, remove the 80/443 rules — the tunnel is
-outbound-only, nothing needs to be open.
+> If you edited nginx by hand on an existing box, make sure that
+> `location = /api/unsubscribe { auth_basic off; proxy_pass http://127.0.0.1:8000; }`
+> block is present, then `sudo nginx -t && sudo systemctl reload nginx`.
 
-## 5. Litestream backups
-
-```bash
-# install litestream (.deb from github.com/benbjohnson/litestream/releases), then:
-sudo cp deploy/litestream.yml /etc/litestream.yml      # edit YOUR_BUCKET_NAME
-echo 'AWS_ACCESS_KEY_ID=...'      | sudo tee /etc/default/litestream
-echo 'AWS_SECRET_ACCESS_KEY=...'  | sudo tee -a /etc/default/litestream
-sudo systemctl enable --now litestream
-```
-
-## 6. Verify
+## 5. Verify
 
 ```bash
 curl -s http://127.0.0.1:8000/api/health | python3 -m json.tool   # db_ok, layers, last_collect
-systemctl status btc-api btc-dashboard btc-tunnel --no-pager
-tail -f ~/btc-accumulation-notifier/logs/collect.log              # next 10-min collect
+systemctl status btc-api btc-dashboard --no-pager
+tail -f ~/btc-accumulation-notifier/logs/collect.log          # next 10-min collect
 ```
-Open `https://btc.<yourdomain>` → Google login → dashboard. Confirm `API_TOKEN` never appears in
-the browser network tab (all API calls are server-side).
+Open `https://btc.riverviewweb.com` → basic-auth prompt → dashboard. Confirm
+`API_TOKEN` never appears in the browser network tab (all API calls are
+server-side). Click an unsubscribe link from a test email and confirm it loads
+the confirmation page **without** a password prompt.
+
+## Deploy updates (git-based)
+
+```bash
+# on your machine: push to the private repo, then on the box:
+# backend code change:
+cd ~/btc-accumulation-notifier && git pull && sudo systemctl restart btc-api
+# dashboard change also needs a rebuild:
+cd ~/btc-dashboard && git pull && npm run build && sudo systemctl restart btc-dashboard
+```
+Config changes: edit the **server's** `.env` and `sudo systemctl restart btc-api`
+(the API caches config via `@lru_cache`; cron entrypoints pick up `.env` on their
+next run without a restart). The local Windows `.env` is separate from prod.
 
 ## Notes
 
-- **Binance is 451 from AWS/US** — the data layer uses **OKX** (primary) with a **Kraken** fallback
-  and CoinGecko as a last-resort price source. No action needed.
-- **Free-tier ceiling**: real liquidation-cascade + order-flow are paid (Coinglass/CryptoQuant);
-  free tier uses a funding/OI/volatility proxy. Add `GLASSNODE_API_KEY` / `COINGLASS_API_KEY` to
-  `.env` later and restart `btc-api` — layers activate automatically.
-- **Short-term cadence**: swing alerts evaluate on *closed* 4h/1d candles, so the fastest a swing
-  alert fires is 4h-candle-close. The 10-min cron is for dashboard liveness + funding/OI freshness.
-- **Costs**: ~$12–14/mo (2GB instance + S3 + domain). Cloudflare/Resend/data APIs are free-tier.
+- **Binance is 451 from AWS/US** — the data layer uses **OKX** (primary) with a
+  **Kraken** fallback and CoinGecko as a last-resort price source. No action needed.
+- **Free-tier ceiling**: real liquidation-cascade + order-flow are paid
+  (Coinglass/CryptoQuant); the free tier uses a funding/OI/volatility proxy. Add
+  `GLASSNODE_API_KEY` / `COINGLASS_API_KEY` to `.env` later and restart `btc-api`
+  — layers activate automatically.
+- **Short-term cadence**: swing alerts evaluate on *closed* 4h/1d candles, so the
+  fastest a swing alert fires is 4h-candle-close. The 10-min cron is for dashboard
+  liveness + funding/OI freshness.
+- **Alert recipients**: dashboard subscribers receive only the infrequent
+  long-term tier/flash alerts; short-term swing alerts go to the owner
+  (`EMAIL_TO`) / ntfy / Telegram only.
+- **Costs**: ~$12–14/mo (2GB instance + domain). Resend/data APIs are free-tier.
+```

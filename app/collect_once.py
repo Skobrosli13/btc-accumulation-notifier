@@ -85,7 +85,10 @@ def run(cfg: Config, *, dry_run: bool = False) -> dict:
             if dry_run:
                 log.info("[dry-run] ST ALERT %s/%s\n%s\n%s", tf, trig.key, title, body)
             else:
-                notify.send(cfg, title, body, conn=conn)
+                # Owner-only (no `conn` -> no subscriber broadcast). Short-term swing
+                # triggers are frequent; dashboard subscribers only get the infrequent
+                # long-term tier/flash alerts. To broadcast swings too, pass conn=conn.
+                notify.send(cfg, title, body)
                 store.record_st_alert(conn, ts=ev_ts, created_at=now.isoformat(),
                                       trigger_key=trig.key, timeframe=tf,
                                       direction=trig.direction, price=ev["price"],

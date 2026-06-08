@@ -1,8 +1,13 @@
-"""Dead-man's-switch (cron 0 */8).
+"""Dead-man's-switch.
 
-Emails once if no successful short-term collect (or long-term run) has landed
-within WATCHDOG_STALE_HOURS, so a broken pipeline (e.g. an exchange API change)
-never silently masquerades as "quiet market, no signal".
+Emails (once per watchdog run, while the condition persists — there is no
+separate debounce) if no successful short-term collect (or long-term run) has
+landed within WATCHDOG_STALE_HOURS, so a broken pipeline (e.g. an exchange API
+change) never silently masquerades as "quiet market, no signal".
+
+NOTE: detection latency is bounded by the watchdog's own cron cadence, so run it
+at least as often as WATCHDOG_STALE_HOURS (e.g. hourly for a 3h threshold) — a
+coarser schedule (the old `0 */8`) can delay the stale alert by up to 8h.
 
     python -m app.watchdog
     python -m app.watchdog --dry-run

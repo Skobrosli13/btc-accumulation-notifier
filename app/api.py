@@ -1,9 +1,10 @@
 """Read-only JSON API for the dashboard (FastAPI + uvicorn).
 
 Bound to localhost in production; the co-hosted Next.js server reads it over
-127.0.0.1 and the human-facing gate is Cloudflare Access in front of the
-dashboard. A bearer token (cfg.api_token) is an internal dashboard<->API secret:
-enforced when set, open when unset (local dev / localhost-only).
+127.0.0.1 and the human-facing gate is nginx HTTP basic auth in front of the
+dashboard (Let's Encrypt TLS). A bearer token (cfg.api_token) is an internal
+dashboard<->API secret: enforced when set, open when unset (local dev /
+localhost-only).
 
 The DB is opened READ-ONLY per request so the API can never corrupt collector
 writes (WAL allows concurrent reads).
@@ -65,7 +66,9 @@ def require_token(authorization: str | None = Header(None),
     """Enforce the internal bearer token when one is configured."""
     if not cfg.api_token:
         return  # dev / localhost-only: open
-    if authorization != f"Bearer {cfg.api_token}":
+    expected = f"Bearer {cfg.api_token}"
+    # Constant-time compare so the token can't be recovered byte-by-byte via timing.
+    if not authorization or not secrets.compare_digest(authorization, expected):
         raise HTTPException(status_code=401, detail="unauthorized")
 
 
@@ -207,6 +210,18 @@ def spot_price(cfg: Config = Depends(get_config), _=Depends(require_token)) -> d
     return {"price": exchange.spot_price(cfg.symbol, prefer=cfg.exchange)}
 
 
+def _drop_forming(df: pd.DataFrame) -> pd.DataFrame:
+    """Drop the still-forming candle before recomputing indicators.
+
+    The `candles` table does not persist the exchange ``confirmed`` flag, and the
+    newest stored row is always the in-progress candle (re-upserted each collect).
+    The collector and alert path evaluate on CLOSED candles only; this keeps the
+    dashboard's live recompute consistent so it never shows a phantom trigger that
+    the alerting path would never fire. Conservative if the collector is stale
+    (drops one already-closed candle at worst)."""
+    return df.iloc[:-1] if len(df) > 1 else df
+
+
 def _enrich_st(conn, cfg: Config, sig: dict | None, tf: str,
                funding: float | None, oi_chg_pct: float | None) -> dict | None:
     """Add live bias components + currently-active triggers to a short-term signal
@@ -222,6 +237,7 @@ def _enrich_st(conn, cfg: Config, sig: dict | None, tf: str,
         return sig
     df = pd.DataFrame(rows)
     df["open_time"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
+    df = _drop_forming(df)  # closed-candle-only, matching the collector/alert path
     try:
         _score, comps = shortterm.st_composite(df, cfg, funding)
         sig["components"] = [{"key": k, "label": _COMPONENT_LABELS.get(k, k), "value": v}
@@ -251,7 +267,7 @@ def shortterm_latest(cfg: Config = Depends(get_config), _=Depends(require_token)
 
 
 @app.get("/api/candles")
-def candles(timeframe: str = Query("4h"), limit: int = Query(300, le=1000),
+def candles(timeframe: str = Query("4h"), limit: int = Query(300, ge=1, le=1000),
             cfg: Config = Depends(get_config), _=Depends(require_token)) -> dict:
     if timeframe not in cfg.st_timeframes and timeframe not in ("4h", "1d", "1w"):
         raise HTTPException(status_code=400, detail="unknown timeframe")
@@ -275,6 +291,7 @@ def indicators(timeframe: str = Query("4h"),
         return {"timeframe": timeframe, "indicators": None, "n": len(rows)}
     df = pd.DataFrame(rows)
     df["open_time"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
+    df = _drop_forming(df)  # closed-candle-only, matching the collector/alert path
     ind = shortterm.compute_indicators(df)
     score, comps = shortterm.st_composite(df, cfg)
     return {"timeframe": timeframe, "indicators": ind,
@@ -282,7 +299,7 @@ def indicators(timeframe: str = Query("4h"),
 
 
 @app.get("/api/derivs")
-def derivs(limit: int = Query(200, le=1000),
+def derivs(limit: int = Query(200, ge=1, le=1000),
            cfg: Config = Depends(get_config), _=Depends(require_token)) -> dict:
     conn = _conn(cfg)
     try:
@@ -310,7 +327,7 @@ def _lt_alert_reason(row: dict) -> dict:
 
 
 @app.get("/api/alerts")
-def alerts(limit: int = Query(50, le=500),
+def alerts(limit: int = Query(50, ge=1, le=500),
            cfg: Config = Depends(get_config), _=Depends(require_token)) -> dict:
     conn = _conn(cfg)
     try:
@@ -337,12 +354,12 @@ def _send_welcome(cfg: Config, email: str, unsubscribe_url: str) -> None:
     """Confirmation email (also carries the unsubscribe link). Best-effort."""
     subject = "You're subscribed to BTC signal alerts"
     body = (
-        "You'll now receive Bitcoin signal alerts at this address.\n\n"
-        "Two alert types:\n"
-        "  • Long-term accumulation — tier changes (WATCH → ACCUMULATE → DEEP_VALUE)\n"
-        "  • Short-term swing — BUY/SELL triggers on closed candles\n\n"
-        "Not financial advice. Long-term is buy-only accumulation; short-term is "
-        "two-sided swing timing."
+        "You'll now receive Bitcoin long-term accumulation alerts at this address:\n\n"
+        "  • Tier changes — WATCH → ACCUMULATE → DEEP_VALUE\n"
+        "  • Capitulation flash — an acute, oversold-fear washout\n\n"
+        "These are infrequent, high-confluence signals (not the noisier short-term "
+        "swing triggers, which stay on the dashboard). Not financial advice — "
+        "long-term is buy-only accumulation; you decide whether, how much, and where."
     )
     notify_email.send_email(cfg, subject, body, to=email, unsubscribe_url=unsubscribe_url)
 

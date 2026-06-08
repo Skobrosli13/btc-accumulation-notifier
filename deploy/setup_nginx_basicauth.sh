@@ -50,6 +50,20 @@ server {
     server_name $DOMAIN;
     ssl_certificate /etc/letsencrypt/live/$DOMAIN/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/$DOMAIN/privkey.pem;
+
+    # Email unsubscribe link target. MUST bypass basic auth (email clients can't
+    # authenticate) and go straight to the FastAPI app on :8000 — the dashboard
+    # (:3000) has no /api/unsubscribe route, so without this the List-Unsubscribe
+    # link prompts for a password and then 404s. The token in the URL is the
+    # (unguessable) capability. Exact match so it can't shadow dashboard routes.
+    location = /api/unsubscribe {
+        auth_basic off;
+        proxy_pass http://127.0.0.1:8000;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+
     location / {
         auth_basic "BTC Dashboard";
         auth_basic_user_file /etc/nginx/.btc_htpasswd;

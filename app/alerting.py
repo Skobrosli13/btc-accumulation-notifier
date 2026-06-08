@@ -30,13 +30,23 @@ TIER_HEADLINES = {
 ALERT_TIERS = ("WATCH", "ACCUMULATE", "DEEP_VALUE")
 
 
-def evaluate_flash(readings: dict, cfg: Config) -> bool:
+def evaluate_flash(readings: dict, cfg: Config, *,
+                   acute_funding: float | None = None,
+                   acute_oi_chg_pct: float | None = None) -> bool:
     """True when an acute capitulation event is present (independent of tier).
 
     Requires ALL of: a capitulation signal (large liquidations, or the free
     funding/OI-flush proxy), Fear & Greed <= FLASH_FNG_MAX, and a price drop
     exceeding FLASH_DROP_PCT over 24-48h. Missing F&G or drop -> no flash
     (conservative).
+
+    ``acute_funding`` / ``acute_oi_chg_pct`` are the *instantaneous* funding and
+    ~1h OI change captured by the short-term collector (the ``derivs`` table).
+    The long-term ``readings`` only carry a 7-day funding AVERAGE and a paid
+    (Coinglass) OI flush — both of which a one-day washout barely moves — so on
+    the free tier the flash would otherwise almost never fire. Feeding the fresh
+    acute values in as additional capitulation legs makes the flash actually
+    responsive without touching the scored readings.
     """
     fng = readings.get("fng")
     drop = readings.get("drop_24_48h_pct")
@@ -54,6 +64,8 @@ def evaluate_flash(readings: dict, cfg: Config) -> bool:
         (liq is not None and liq >= _FLASH_LIQ_BN)
         or (funding is not None and funding <= _FLASH_FUNDING_NEG)
         or (oi_flush is not None and oi_flush <= _FLASH_OI_DROP_PCT)
+        or (acute_funding is not None and acute_funding <= _FLASH_FUNDING_NEG)
+        or (acute_oi_chg_pct is not None and acute_oi_chg_pct <= _FLASH_OI_DROP_PCT)
     )
     return bool(capitulation)
 

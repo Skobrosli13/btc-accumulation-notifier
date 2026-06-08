@@ -72,7 +72,15 @@ def run(cfg: Config, *, dry_run: bool = False) -> dict:
     store.init_db(conn)
     prev_tier = store.last_tier(conn)
     prev_flash_at = store.last_flash_at(conn)
-    flash_now = alerting.evaluate_flash(readings, cfg)
+    # Fresh acute funding/OI from the short-term collector (≤10min old) so the
+    # capitulation flash is responsive on the free tier — see evaluate_flash.
+    latest_derivs = store.recent_derivs(conn, 1)
+    acute = latest_derivs[-1] if latest_derivs else {}
+    flash_now = alerting.evaluate_flash(
+        readings, cfg,
+        acute_funding=acute.get("funding"),
+        acute_oi_chg_pct=acute.get("oi_chg_pct"),
+    )
     decisions = alerting.decide_alerts(
         current_tier, prev_tier, flash_now, prev_flash_at, cfg.flash_debounce_days, now
     )

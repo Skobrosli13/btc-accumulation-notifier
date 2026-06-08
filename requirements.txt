@@ -1,6 +1,8 @@
-pandas>=2.0
-requests>=2.31
-python-dotenv>=1.0
-fastapi>=0.110
-uvicorn[standard]>=0.29
-resend>=2.0
+# Pinned with upper bounds so a major upstream release can't silently break a
+# prod `pip install -r` (there is no lockfile for the backend). Bump deliberately.
+pandas>=2.0,<3.0
+requests>=2.31,<3.0
+python-dotenv>=1.0,<2.0
+fastapi>=0.110,<1.0
+uvicorn[standard]>=0.29,<1.0
+resend>=2.0,<3.0
