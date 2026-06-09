@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-06-09T17:23:38.845449+00:00",
+  "generated_at": "2026-06-09T18:00:52.901032+00:00",
   "method": "price+macro backbone, expanding-window percentile, timing-neutral",
   "days": 2929,
   "from": "2018-06-03",
@@ -37,7 +37,7 @@
   },
   "caveats": [
     "Backbone only: price-structure (200WMA/Mayer) + macro \u2014 the deep multi-cycle indicators.",
-    "On-chain (~2022+), sentiment, derivatives use economic thresholds and are NOT in this test.",
+    "On-chain, sentiment and derivatives are scored live but are NOT part of this backbone test.",
     "Timing multiplier neutralized; cycle context excluded.",
     "Past behavior is not a forecast."
   ]

@@ -109,6 +109,28 @@ def _fred_series(sid: str, key: str) -> pd.DataFrame:
     return df.sort_values("date").reset_index(drop=True)
 
 
+def _fng_history() -> pd.DataFrame:
+    """Full Fear & Greed history (alternative.me, free, back to 2018) -> [date, v]."""
+    try:
+        r = requests.get("https://api.alternative.me/fng/", params={"limit": 0},
+                         headers={"User-Agent": "btc-calibrate"}, timeout=30)
+        rows = r.json().get("data", []) if r.status_code == 200 else []
+    except Exception:  # noqa: BLE001
+        rows = []
+    out = []
+    for x in rows:
+        try:
+            out.append((int(x["timestamp"]), float(x["value"])))
+        except (KeyError, TypeError, ValueError):
+            continue
+    if not out:
+        return pd.DataFrame(columns=["date", "v"])
+    df = pd.DataFrame(out, columns=["ts", "v"])
+    df["date"] = (pd.to_datetime(df["ts"], unit="s", utc=True).dt.tz_localize(None)
+                  .dt.normalize().astype("datetime64[ns]"))
+    return df.drop_duplicates("date").sort_values("date").reset_index(drop=True)[["date", "v"]]
+
+
 def _macro_history(cfg) -> dict[str, pd.DataFrame]:
     """Per-indicator [date, value] frames (empty dict if no FRED key). Merged onto
     the weekly spine separately so daily spikes (e.g. HY blowouts) aren't resampled away."""
@@ -230,7 +252,7 @@ def _track_record(weekly: pd.DataFrame, cfg, calibrated: list[str]) -> dict:
         "horizons": horizons,
         "caveats": [
             "Backbone only: price-structure (200WMA/Mayer) + macro — the deep multi-cycle indicators.",
-            "On-chain (~2022+), sentiment, derivatives use economic thresholds and are NOT in this test.",
+            "On-chain, sentiment and derivatives are scored live but are NOT part of this backbone test.",
             "Timing multiplier neutralized; cycle context excluded.",
             "Past behavior is not a forecast.",
         ],
@@ -250,6 +272,9 @@ def main() -> int:
            "mayer": px[["date", "mayer"]].rename(columns={"mayer": "v"})}
     for name, df in macro.items():
         raw[name] = df.rename(columns={name: "v"})
+    fng = _fng_history()
+    if not fng.empty:
+        raw["fng"] = fng                      # Fear & Greed, percentile vs 2018+ history
     calib = _emit_calibration(raw)
     (APP_DIR / "calibration.json").write_text(json.dumps(calib, indent=2))
     print(f"  wrote app/calibration.json ({len(calib['indicators'])} indicators)")
