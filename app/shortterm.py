@@ -246,6 +246,23 @@ def st_state(score: float, cfg: Config) -> str:
     return "NEUTRAL"
 
 
+def current_regime(daily_close: "pd.Series | None", period: int = 200) -> str:
+    """Macro trend regime from the daily 200-MA: 'bull' (price >= 200DMA), 'bear',
+    or 'unknown' (insufficient history). The standard 'don't fight the trend' gate."""
+    if daily_close is None or len(daily_close) < period:
+        return "unknown"
+    ma = float(daily_close.tail(period).mean())
+    return "bull" if float(daily_close.iloc[-1]) >= ma else "bear"
+
+
+def regime_aligned(direction: str, regime: str) -> bool | None:
+    """True when a trigger points with the 200-day regime (BUY in bull / SELL in bear).
+    None when the regime is unknown. Counter-regime trades are lower win-rate."""
+    if regime not in ("bull", "bear"):
+        return None
+    return (direction == "BUY" and regime == "bull") or (direction == "SELL" and regime == "bear")
+
+
 def trade_levels(direction: str, price: float | None, atr: float | None,
                  k_stop: float = 1.5, k_target: float = 2.5) -> dict | None:
     """ATR-based stop/target for a swing trigger (uses the otherwise-unused ATR).

@@ -21,7 +21,7 @@ _BASE = dict(
     st_rsi_oversold=30, st_rsi_overbought=70, st_vol_spike_mult=2.0,
     st_funding_spike=0.0005, st_oi_surge_pct=10.0,
     st_buy_threshold=30, st_strong_buy_threshold=60,
-    st_sell_threshold=-30, st_strong_sell_threshold=-60,
+    st_sell_threshold=-30, st_strong_sell_threshold=-60, st_regime_suppress=False,
     api_token=None, api_cors_origin=None,
     public_base_url="https://btc.example.com", watchdog_stale_hours=3,
 )

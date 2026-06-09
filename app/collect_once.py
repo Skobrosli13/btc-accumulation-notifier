@@ -42,6 +42,12 @@ def run(cfg: Config, *, dry_run: bool = False) -> dict:
 
     frames = price.get_intraday_frames(cfg.symbol, cfg.st_timeframes, prefer=cfg.exchange)
 
+    # 200-day macro regime (price vs 200DMA) — context for triggers; optionally
+    # suppresses counter-regime alerts (ST_REGIME_SUPPRESS).
+    daily_df = frames.get("1d")
+    regime = shortterm.current_regime(
+        exchange.closed_only(daily_df)["close"] if daily_df is not None and not daily_df.empty else None)
+
     # Derivatives (best-effort) -> derivs time-series + OI change over ~1h.
     funding = exchange.funding_latest(cfg.symbol)
     oi = exchange.open_interest(cfg.symbol)
@@ -75,13 +81,16 @@ def run(cfg: Config, *, dry_run: bool = False) -> dict:
 
         fired = []
         for trig in ev["triggers"]:
+            if cfg.st_regime_suppress and shortterm.regime_aligned(trig.direction, regime) is False:
+                log.info("%s/%s suppressed (counter-%s-regime)", tf, trig.key, regime)
+                continue
             last = store.last_st_alert(conn, trig.key, tf)
             if not alerting.decide_st_alert(candle_ts=ev_ts, last_alert=last, now=now,
                                             cooldown_hours=cfg.st_cooldown_hours):
                 continue
             title, body = alerting.build_st_message(
                 trigger=trig, timeframe=tf, score=ev["score"], state=ev["state"],
-                price=ev["price"], indicators=ev["indicators"])
+                price=ev["price"], indicators=ev["indicators"], regime=regime)
             if dry_run:
                 log.info("[dry-run] ST ALERT %s/%s\n%s\n%s", tf, trig.key, title, body)
             else:

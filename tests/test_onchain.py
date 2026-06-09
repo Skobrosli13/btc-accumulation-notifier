@@ -33,7 +33,9 @@ def test_bitcoin_data_parsing(monkeypatch):
     assert out["sopr"] == pytest.approx(0.99)
     assert out["puell"] == pytest.approx(0.60)
     assert out["realized_ratio"] == pytest.approx(60000.0 / 50000.0)
-    assert set(out) == {"mvrv_z", "nupl", "sopr", "puell", "realized_ratio"}
+    # scored keys + context keys (reserve_risk/rhodl, None here since not in responses)
+    assert {"mvrv_z", "nupl", "sopr", "puell", "realized_ratio"} <= set(out)
+    assert out["reserve_risk"] is None and out["rhodl"] is None
 
 
 def test_bitcoin_data_fails_soft(monkeypatch):

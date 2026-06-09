@@ -122,3 +122,15 @@ def test_evaluate_shape():
     assert set(out) >= {"ts", "price", "score", "state", "components", "indicators", "triggers"}
     assert out["price"] == pytest.approx(101.0)
     assert isinstance(out["triggers"], list)
+
+
+def test_current_regime_and_alignment():
+    bull = pd.Series([100.0] * 199 + [200.0])   # last >= 200-MA
+    bear = pd.Series([200.0] * 199 + [100.0])
+    assert st.current_regime(bull) == "bull"
+    assert st.current_regime(bear) == "bear"
+    assert st.current_regime(pd.Series([1.0] * 50)) == "unknown"   # <200 points
+    assert st.regime_aligned("BUY", "bull") is True
+    assert st.regime_aligned("BUY", "bear") is False
+    assert st.regime_aligned("SELL", "bear") is True
+    assert st.regime_aligned("BUY", "unknown") is None

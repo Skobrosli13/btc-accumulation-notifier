@@ -136,6 +136,15 @@ def health(cfg: Config = Depends(get_config), _=Depends(require_token)) -> dict:
 
 
 @lru_cache(maxsize=1)
+def _st_winrates() -> dict:
+    """Read app/st_winrates.json once (emitted by scripts/st_calibrate.py). {} if absent."""
+    try:
+        return json.loads(Path(__file__).with_name("st_winrates.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+@lru_cache(maxsize=1)
 def _track_record_data() -> dict:
     """Read app/track_record.json once (emitted by scripts/calibrate.py). {} if absent."""
     try:
@@ -218,6 +227,8 @@ def _lt_breakdown(latest: dict, cfg: Config) -> dict:
                   "deep_value": cfg.tier_deepvalue},
         "playbook": readings.get("playbook"),
         "what_to_do": readings.get("what_to_do"),
+        # context-only on-chain metrics (shown, not scored)
+        "context": {"reserve_risk": raw.get("reserve_risk"), "rhodl": raw.get("rhodl")},
     }
 
 
@@ -270,13 +281,15 @@ def _drop_forming(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _enrich_st(conn, cfg: Config, sig: dict | None, tf: str,
-               funding: float | None, oi_chg_pct: float | None) -> dict | None:
+               funding: float | None, oi_chg_pct: float | None,
+               regime: str = "unknown") -> dict | None:
     """Add live bias components + currently-active triggers to a short-term signal
     (recomputed from recent candles, mirroring collect_once)."""
     if sig is None:
         return None
     sig["funding"] = funding
     sig["oi_chg_pct"] = oi_chg_pct
+    sig["regime"] = regime
     sig["components"] = []
     sig["triggers"] = []
     rows = store.recent_candles(conn, tf, 300)
@@ -292,10 +305,13 @@ def _enrich_st(conn, cfg: Config, sig: dict | None, tf: str,
         state = sig.get("st_state", "NEUTRAL")
         st_price = sig.get("price")
         atr = (sig.get("indicators") or {}).get("atr")
+        wr = _st_winrates().get("timeframes", {}).get(tf, {})
         sig["triggers"] = [{
             "key": t.key, "direction": t.direction, "label": t.label, "detail": t.detail,
             "counter_trend": alerting.is_counter_trend(t.direction, state),
+            "regime_aligned": shortterm.regime_aligned(t.direction, regime),
             "levels": shortterm.trade_levels(t.direction, st_price, atr),
+            "stats": wr.get(t.key),   # historical win-rate + ATR R-expectancy, or None
         } for t in shortterm.detect_triggers(df, cfg, funding, oi_chg_pct)]
     except Exception:  # noqa: BLE001 - never 500 the dashboard over a recompute
         pass
@@ -309,7 +325,10 @@ def shortterm_latest(cfg: Config = Depends(get_config), _=Depends(require_token)
         derivs = store.recent_derivs(conn, 1)
         funding = derivs[-1]["funding"] if derivs else None
         oi_chg_pct = derivs[-1]["oi_chg_pct"] if derivs else None
-        out = {tf: _enrich_st(conn, cfg, store.latest_st_signal(conn, tf), tf, funding, oi_chg_pct)
+        rows1d = store.recent_candles(conn, "1d", 300)
+        regime = shortterm.current_regime(pd.DataFrame(rows1d)["close"] if rows1d else None)
+        out = {tf: _enrich_st(conn, cfg, store.latest_st_signal(conn, tf), tf,
+                              funding, oi_chg_pct, regime)
                for tf in cfg.st_timeframes}
     finally:
         conn.close()

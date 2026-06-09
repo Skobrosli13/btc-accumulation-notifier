@@ -40,6 +40,13 @@ _BD_METRICS = {
     "puell":  ("puell-multiple", "puellMultiple"),
 }
 
+# Context-only metrics (shown, NOT scored — only ~1 cycle of free history to
+# threshold against, so they inform rather than move the composite).
+_BD_CONTEXT = {
+    "reserve_risk": ("reserve-risk", "reserveRisk"),
+    "rhodl":        ("rhodl-ratio", "rhodlRatio"),
+}
+
 
 def _gn_series(path: str, api_key: str) -> list[float]:
     """Fetch a Glassnode metric as a list of float values (oldest->newest)."""
@@ -101,6 +108,9 @@ def _from_bitcoin_data(price: float | None) -> dict:
     out = {key: _bd_last(slug, field) for key, (slug, field) in _BD_METRICS.items()}
     realized_price = _bd_last("realized-price", "realizedPrice")
     out["realized_ratio"] = (price / realized_price) if (price and realized_price) else None
+    # Context-only metrics (not scored).
+    for key, (slug, field) in _BD_CONTEXT.items():
+        out[key] = _bd_last(slug, field)
     return out
 
 

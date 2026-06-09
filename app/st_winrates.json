@@ -1,0 +1,149 @@
+{
+  "generated_at": "2026-06-09T16:33:54.865218+00:00",
+  "timeframes": {
+    "4h": {
+      "vol_flush_up": {
+        "direction": "SELL",
+        "n": 65,
+        "win_rate": 0.554,
+        "atr_expectancy_R": 0.094,
+        "resolved": 61
+      },
+      "ema_cross_bull": {
+        "direction": "BUY",
+        "n": 33,
+        "win_rate": 0.424,
+        "atr_expectancy_R": -0.166,
+        "resolved": 32
+      },
+      "bb_upper_reject": {
+        "direction": "SELL",
+        "n": 43,
+        "win_rate": 0.651,
+        "atr_expectancy_R": 0.265,
+        "resolved": 38
+      },
+      "macd_bear_cross": {
+        "direction": "SELL",
+        "n": 49,
+        "win_rate": 0.49,
+        "atr_expectancy_R": 0.335,
+        "resolved": 46
+      },
+      "ema_cross_bear": {
+        "direction": "SELL",
+        "n": 33,
+        "win_rate": 0.455,
+        "atr_expectancy_R": -0.11,
+        "resolved": 30
+      },
+      "macd_bull_cross": {
+        "direction": "BUY",
+        "n": 48,
+        "win_rate": 0.5,
+        "atr_expectancy_R": -0.09,
+        "resolved": 44
+      },
+      "rsi_overbought_rollover": {
+        "direction": "SELL",
+        "n": 21,
+        "win_rate": 0.619,
+        "atr_expectancy_R": 0.017,
+        "resolved": 21
+      },
+      "vol_flush_down": {
+        "direction": "BUY",
+        "n": 66,
+        "win_rate": 0.364,
+        "atr_expectancy_R": -0.387,
+        "resolved": 61
+      },
+      "bb_lower_reclaim": {
+        "direction": "BUY",
+        "n": 45,
+        "win_rate": 0.444,
+        "atr_expectancy_R": -0.023,
+        "resolved": 41
+      },
+      "rsi_oversold_bounce": {
+        "direction": "BUY",
+        "n": 23,
+        "win_rate": 0.348,
+        "atr_expectancy_R": -0.199,
+        "resolved": 20
+      }
+    },
+    "1d": {
+      "vol_flush_up": {
+        "direction": "SELL",
+        "n": 18,
+        "win_rate": 0.333,
+        "atr_expectancy_R": -0.333,
+        "resolved": 12
+      },
+      "bb_upper_reject": {
+        "direction": "SELL",
+        "n": 34,
+        "win_rate": 0.412,
+        "atr_expectancy_R": -0.157,
+        "resolved": 19
+      },
+      "macd_bear_cross": {
+        "direction": "SELL",
+        "n": 37,
+        "win_rate": 0.459,
+        "atr_expectancy_R": -0.237,
+        "resolved": 21
+      },
+      "macd_bull_cross": {
+        "direction": "BUY",
+        "n": 36,
+        "win_rate": 0.583,
+        "atr_expectancy_R": -0.146,
+        "resolved": 25
+      },
+      "rsi_overbought_rollover": {
+        "direction": "SELL",
+        "n": 19,
+        "win_rate": 0.263,
+        "atr_expectancy_R": -0.619,
+        "resolved": 14
+      },
+      "vol_flush_down": {
+        "direction": "BUY",
+        "n": 26,
+        "win_rate": 0.538,
+        "atr_expectancy_R": 0.038,
+        "resolved": 18
+      },
+      "ema_cross_bear": {
+        "direction": "SELL",
+        "n": 20,
+        "win_rate": 0.5,
+        "atr_expectancy_R": 0.214,
+        "resolved": 11
+      },
+      "ema_cross_bull": {
+        "direction": "BUY",
+        "n": 19,
+        "win_rate": 0.526,
+        "atr_expectancy_R": 0.699,
+        "resolved": 11
+      },
+      "bb_lower_reclaim": {
+        "direction": "BUY",
+        "n": 25,
+        "win_rate": 0.4,
+        "atr_expectancy_R": -0.237,
+        "resolved": 14
+      },
+      "rsi_oversold_bounce": {
+        "direction": "BUY",
+        "n": 8,
+        "win_rate": 0.375,
+        "atr_expectancy_R": -1.0,
+        "resolved": 4
+      }
+    }
+  }
+}

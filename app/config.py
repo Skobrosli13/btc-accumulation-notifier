@@ -139,6 +139,7 @@ class Config:
     st_strong_buy_threshold: float
     st_sell_threshold: float         # st_composite <= this => SELL state (negative)
     st_strong_sell_threshold: float
+    st_regime_suppress: bool         # if true, drop alerts that fight the 200-day regime
 
     # Dashboard read-only API
     api_token: str | None
@@ -245,6 +246,7 @@ def load_config() -> Config:
         st_strong_buy_threshold=_get_float("ST_STRONG_BUY_THRESHOLD", 60),
         st_sell_threshold=_get_float("ST_SELL_THRESHOLD", -30),
         st_strong_sell_threshold=_get_float("ST_STRONG_SELL_THRESHOLD", -60),
+        st_regime_suppress=_get_bool("ST_REGIME_SUPPRESS", False),
         api_token=_opt("API_TOKEN"),
         api_cors_origin=_opt("API_CORS_ORIGIN"),
         public_base_url=_get("PUBLIC_BASE_URL", "https://btc.riverviewweb.com").rstrip("/"),

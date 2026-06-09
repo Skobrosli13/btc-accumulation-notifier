@@ -238,7 +238,8 @@ def decide_st_alert(*, candle_ts: int, last_alert: dict | None,
 
 
 def build_st_message(*, trigger, timeframe: str, score: float, state: str,
-                     price: float | None, indicators: dict) -> tuple[str, str]:
+                     price: float | None, indicators: dict,
+                     regime: str = "unknown") -> tuple[str, str]:
     """Return (title, body) for a short-term swing alert. ``trigger`` is a
     shortterm.Trigger."""
     arrow = "[BUY]" if trigger.direction == "BUY" else "[SELL]"
@@ -256,6 +257,10 @@ def build_st_message(*, trigger, timeframe: str, score: float, state: str,
         lines.append(f"[!] Counter-trend: this {trigger.direction} fires against a "
                      f"{'bearish' if trigger.direction == 'BUY' else 'bullish'} regime "
                      "- treat as lower-confidence / fade risk.")
+    aligned = shortterm.regime_aligned(trigger.direction, regime)
+    if aligned is not None:
+        lines.append(f"200-day regime: {regime} — this {trigger.direction} is "
+                     f"{'with' if aligned else 'against'} the macro trend.")
 
     rsi = indicators.get("rsi")
     if isinstance(rsi, (list, tuple)) and rsi and rsi[0] is not None:
