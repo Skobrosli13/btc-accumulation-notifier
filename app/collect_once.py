@@ -80,9 +80,16 @@ def run(cfg: Config, *, dry_run: bool = False) -> dict:
                                    indicators=ev["indicators"])
 
         fired = []
+        dirs = [t.direction for t in ev["triggers"]]
         for trig in ev["triggers"]:
             if cfg.st_regime_suppress and shortterm.regime_aligned(trig.direction, regime) is False:
                 log.info("%s/%s suppressed (counter-%s-regime)", tf, trig.key, regime)
+                continue
+            if cfg.st_require_confluence and not shortterm.confluence_ok(
+                    dirs.count(trig.direction),
+                    shortterm.regime_aligned(trig.direction, regime),
+                    alerting.is_counter_trend(trig.direction, ev["state"])):
+                log.info("%s/%s suppressed (no confluence)", tf, trig.key)
                 continue
             last = store.last_st_alert(conn, trig.key, tf)
             if not alerting.decide_st_alert(candle_ts=ev_ts, last_alert=last, now=now,

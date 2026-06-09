@@ -134,3 +134,11 @@ def test_current_regime_and_alignment():
     assert st.regime_aligned("BUY", "bear") is False
     assert st.regime_aligned("SELL", "bear") is True
     assert st.regime_aligned("BUY", "unknown") is None
+
+
+def test_confluence_ok():
+    assert st.confluence_ok(2, None, True) is True       # >=2 agree -> passes
+    assert st.confluence_ok(1, True, False) is True       # lone, aligned + not counter
+    assert st.confluence_ok(1, True, True) is False        # counter-trend
+    assert st.confluence_ok(1, False, False) is False      # against regime
+    assert st.confluence_ok(1, None, False) is False       # unknown regime

@@ -339,6 +339,14 @@ def recent_run_alerts(conn: sqlite3.Connection, limit: int = 20) -> list[dict]:
     return out
 
 
+def all_runs(conn: sqlite3.Connection) -> list[dict]:
+    """All runs (ts, price, tier) oldest->newest — for live forward-testing."""
+    rows = conn.execute(
+        "SELECT run_ts, price, tier FROM runs ORDER BY run_ts ASC"
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
 def last_alerted_run(conn: sqlite3.Connection) -> dict | None:
     """Most recent run that fired a tier/flash alert, parsed — for the 'what changed
     since the last alert' diff. None if no alert has ever fired."""

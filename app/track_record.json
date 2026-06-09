@@ -1,22 +1,38 @@
 {
-  "generated_at": "2026-06-09T16:32:34.163960+00:00",
+  "generated_at": "2026-06-09T17:23:38.845449+00:00",
   "method": "price+macro backbone, expanding-window percentile, timing-neutral",
   "days": 2929,
   "from": "2018-06-03",
   "to": "2026-06-09",
   "signal_days": 752,
+  "signal_episodes": 29,
   "horizons": {
     "90d": {
       "signal_hit_rate": 0.689,
-      "base_rate": 0.561
+      "base_rate": 0.561,
+      "episode_hit_rate": 0.444,
+      "ci": [
+        0.296,
+        0.593
+      ]
     },
     "180d": {
       "signal_hit_rate": 0.726,
-      "base_rate": 0.608
+      "base_rate": 0.608,
+      "episode_hit_rate": 0.44,
+      "ci": [
+        0.28,
+        0.6
+      ]
     },
     "365d": {
       "signal_hit_rate": 0.861,
-      "base_rate": 0.711
+      "base_rate": 0.711,
+      "episode_hit_rate": 0.52,
+      "ci": [
+        0.36,
+        0.68
+      ]
     }
   },
   "caveats": [

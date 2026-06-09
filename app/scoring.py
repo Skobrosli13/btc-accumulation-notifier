@@ -209,6 +209,45 @@ def tier(score: float, price: float, wma200: float | None,
     return "NEUTRAL"
 
 
+_TIER_ORDER = ["NEUTRAL", "WATCH", "ACCUMULATE", "DEEP_VALUE"]
+_TIER_FLOOR_KEY = {"WATCH": 0, "ACCUMULATE": 1, "DEEP_VALUE": 2}
+
+
+def tier_hysteresis(score: float, price: float, wma200: float | None,
+                    prev_tier: str, t_watch: float, t_acc: float, t_deep: float,
+                    margin: float = 2.0) -> str:
+    """Tier with a dead-band so a composite hovering on a threshold doesn't whipsaw.
+
+    A move to a HIGHER tier requires the composite to clear that tier's floor by
+    ``margin``; a move LOWER requires it to fall ``margin`` below the previous
+    tier's floor. Inside the band the previous tier holds. margin=0 reproduces the
+    plain ``tier``.
+    """
+    raw = tier(score, price, wma200, t_watch, t_acc, t_deep)
+    if margin <= 0 or raw == prev_tier or prev_tier not in _TIER_ORDER:
+        return raw
+    floors = [t_watch, t_acc, t_deep]
+    raw_i, prev_i = _TIER_ORDER.index(raw), _TIER_ORDER.index(prev_tier)
+    if raw_i > prev_i:  # upgrade: require clearing the NEW floor by margin
+        floor = floors[_TIER_FLOOR_KEY[raw]]
+        return raw if score >= floor + margin else prev_tier
+    # downgrade: require falling margin below the PREVIOUS tier's floor
+    floor = floors[_TIER_FLOOR_KEY[prev_tier]]
+    return raw if score <= floor - margin else prev_tier
+
+
+def category_agreement(category_scores: dict[str, float | None]) -> dict | None:
+    """Confidence proxy from how much the active categories AGREE. High spread
+    (e.g. on-chain cheap but macro risk-off) = lower confidence. None if <2 active."""
+    vals = [v for v in category_scores.values() if v is not None]
+    if len(vals) < 2:
+        return None
+    spread = max(vals) - min(vals)
+    label = "high" if spread <= 0.25 else ("medium" if spread <= 0.5 else "low")
+    return {"active": len(vals), "spread": round(spread, 3),
+            "agreement": round(1.0 - spread, 3), "confidence": label}
+
+
 # --- Built on top of the reference helpers -----------------------------------
 
 def score_indicators(readings: dict[str, float | None]) -> dict[str, float | None]:

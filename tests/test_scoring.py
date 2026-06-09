@@ -93,6 +93,25 @@ def test_tier_thresholds():
     assert scoring.tier(65, 100, 200, 40, 60, 80) == "ACCUMULATE"
 
 
+def test_tier_hysteresis_dead_band():
+    # margin 2: a composite just over a floor doesn't upgrade until it clears floor+margin
+    assert scoring.tier_hysteresis(61, 100, 200, "WATCH", 40, 60, 80, margin=2) == "WATCH"   # 61 < 60+2
+    assert scoring.tier_hysteresis(63, 100, 200, "WATCH", 40, 60, 80, margin=2) == "ACCUMULATE"  # >= 62
+    # holds the higher tier until it falls margin below the floor (no whipsaw)
+    assert scoring.tier_hysteresis(59, 100, 200, "ACCUMULATE", 40, 60, 80, margin=2) == "ACCUMULATE"  # 59 > 60-2
+    assert scoring.tier_hysteresis(57, 100, 200, "ACCUMULATE", 40, 60, 80, margin=2) == "WATCH"        # <= 58
+    # margin 0 reproduces plain tier
+    assert scoring.tier_hysteresis(61, 100, 200, "WATCH", 40, 60, 80, margin=0) == "ACCUMULATE"
+
+
+def test_category_agreement():
+    assert scoring.category_agreement({"a": 0.8, "b": 0.7}) == {
+        "active": 2, "spread": 0.1, "agreement": 0.9, "confidence": "high"}
+    low = scoring.category_agreement({"a": 0.9, "b": 0.1, "c": None})
+    assert low["confidence"] == "low" and low["active"] == 2
+    assert scoring.category_agreement({"a": 0.5, "b": None}) is None   # <2 active
+
+
 def test_deep_value_requires_price_below_wma200():
     # score high enough, but price ABOVE 200wma => not deep value
     assert scoring.tier(85, 250, 200, 40, 60, 80) == "ACCUMULATE"

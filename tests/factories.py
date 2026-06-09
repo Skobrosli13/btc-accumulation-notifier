@@ -14,7 +14,7 @@ _BASE = dict(
     onchain_free_enabled=True, oi_flush_window_hours=24.0,
     exchange="okx", symbol="BTC-USDT", db_path=":memory:",
     weights={"onchain": 0.35, "price": 0.20, "macro": 0.20, "sentiment": 0.10, "derivs": 0.15},
-    tier_watch=40, tier_accumulate=60, tier_deepvalue=80,
+    tier_watch=40, tier_accumulate=60, tier_deepvalue=80, tier_hysteresis_margin=2.0,
     flash_fng_max=10, flash_drop_pct=10, flash_debounce_days=3,
     ath_date=date(2025, 10, 6), peak_to_trough_days=370, cycle_mult_swing=0.05,
     st_timeframes=("4h", "1d"), st_cooldown_hours=12,
@@ -22,6 +22,7 @@ _BASE = dict(
     st_funding_spike=0.0005, st_oi_surge_pct=10.0,
     st_buy_threshold=30, st_strong_buy_threshold=60,
     st_sell_threshold=-30, st_strong_sell_threshold=-60, st_regime_suppress=False,
+    st_require_confluence=True,
     api_token=None, api_cors_origin=None,
     public_base_url="https://btc.example.com", watchdog_stale_hours=3,
 )

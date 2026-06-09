@@ -87,13 +87,17 @@ def run(cfg: Config, *, dry_run: bool = False) -> dict:
     mult = scoring.cycle_multiplier(now.date(), ath, cfg.peak_to_trough_days,
                                     swing=cfg.cycle_mult_swing)
     composite_score, active_cats = scoring.composite(cat_scores, cfg.weights, mult)
-    current_tier = scoring.tier(
+    # Hysteresis: a tier change must clear the threshold by a margin so a composite
+    # hovering on a cutoff doesn't whipsaw the tier (and spam alerts).
+    prev_tier = store.last_tier(conn)
+    current_tier = scoring.tier_hysteresis(
         composite_score, price_struct["price"], price_struct.get("wma200"),
-        cfg.tier_watch, cfg.tier_accumulate, cfg.tier_deepvalue,
-    )
+        prev_tier, cfg.tier_watch, cfg.tier_accumulate, cfg.tier_deepvalue,
+        margin=cfg.tier_hysteresis_margin)
+    # Confidence proxy: how much the active categories agree.
+    agreement = scoring.category_agreement(cat_scores)
 
     # Decide (needs ledger state).
-    prev_tier = store.last_tier(conn)
     prev_flash_at = store.last_flash_at(conn)
     # Fresh acute funding/OI from the short-term collector (≤10min old) so the
     # capitulation flash is responsive on the free tier — see evaluate_flash.
@@ -161,6 +165,7 @@ def run(cfg: Config, *, dry_run: bool = False) -> dict:
         "category_scores": cat_scores,
         "cycle_multiplier": mult,
         "conviction": conv,
+        "agreement": agreement,
         "playbook": plan,
         "what_to_do": what_to_do,
         "changed": changed,
@@ -192,6 +197,7 @@ def run(cfg: Config, *, dry_run: bool = False) -> dict:
         "category_scores": cat_scores,
         "price_struct": price_struct,
         "conviction": conv,
+        "agreement": agreement,
         "playbook": plan,
         "what_to_do": what_to_do,
         "changed": changed,

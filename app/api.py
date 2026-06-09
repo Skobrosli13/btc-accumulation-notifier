@@ -28,7 +28,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
-from . import alerting, notify_email, scoring, shortterm, store
+from . import alerting, notify_email, perf, scoring, shortterm, store
 from .config import Config, load_config
 from .sources import exchange
 
@@ -153,6 +153,26 @@ def _track_record_data() -> dict:
         return {}
 
 
+@app.get("/api/live_performance")
+def live_performance(cfg: Config = Depends(get_config), _=Depends(require_token)) -> dict:
+    """Forward-tested record of the system's OWN past signals (out-of-sample; grows
+    over time). Long-term runs + fired swing alerts priced against stored candles."""
+    conn = _conn(cfg)
+    try:
+        runs = store.all_runs(conn)
+        candles = store.recent_candles(conn, "1d", 400)
+        st_rows = store.recent_st_alerts(conn, 500)
+    finally:
+        conn.close()
+    alerts = [{"ts": a.get("ts"), "direction": a.get("direction"), "price": a.get("price")}
+              for a in st_rows]
+    return {
+        "long_term": perf.long_term_performance(runs, candles),
+        "short_term": perf.short_term_performance(alerts, candles),
+        "note": "Forward-tested on the system's live signals as they age — out-of-sample, grows over time.",
+    }
+
+
 @app.get("/api/track_record")
 def track_record(_=Depends(require_token)) -> dict:
     """Historical forward-return hit-rate of the percentile backbone (illustrative,
@@ -227,6 +247,7 @@ def _lt_breakdown(latest: dict, cfg: Config) -> dict:
                   "deep_value": cfg.tier_deepvalue},
         "playbook": readings.get("playbook"),
         "what_to_do": readings.get("what_to_do"),
+        "agreement": readings.get("agreement"),   # category-agreement confidence proxy
         # context-only on-chain metrics (shown, not scored)
         "context": {"reserve_risk": raw.get("reserve_risk"), "rhodl": raw.get("rhodl")},
     }
@@ -306,13 +327,18 @@ def _enrich_st(conn, cfg: Config, sig: dict | None, tf: str,
         st_price = sig.get("price")
         atr = (sig.get("indicators") or {}).get("atr")
         wr = _st_winrates().get("timeframes", {}).get(tf, {})
+        live_trigs = shortterm.detect_triggers(df, cfg, funding, oi_chg_pct)
+        dirs = [t.direction for t in live_trigs]
         sig["triggers"] = [{
             "key": t.key, "direction": t.direction, "label": t.label, "detail": t.detail,
             "counter_trend": alerting.is_counter_trend(t.direction, state),
             "regime_aligned": shortterm.regime_aligned(t.direction, regime),
+            "confluence": shortterm.confluence_ok(
+                dirs.count(t.direction), shortterm.regime_aligned(t.direction, regime),
+                alerting.is_counter_trend(t.direction, state)),
             "levels": shortterm.trade_levels(t.direction, st_price, atr),
             "stats": wr.get(t.key),   # historical win-rate + ATR R-expectancy, or None
-        } for t in shortterm.detect_triggers(df, cfg, funding, oi_chg_pct)]
+        } for t in live_trigs]
     except Exception:  # noqa: BLE001 - never 500 the dashboard over a recompute
         pass
     return sig

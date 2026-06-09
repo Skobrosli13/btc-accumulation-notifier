@@ -18,6 +18,7 @@ The live path only reads the committed app/calibration.json; re-run this to refr
 from __future__ import annotations
 
 import json
+import random
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -189,12 +190,34 @@ def _track_record(weekly: pd.DataFrame, cfg, calibrated: list[str]) -> dict:
             return None
         return round(sum(1 for i in idxs if closes[i + h] > closes[i]) / len(idxs), 3)
 
-    horizons = {}
     signal_idx = [i for i, t in enumerate(tiers) if t in ("ACCUMULATE", "DEEP_VALUE")]
+
+    # Independent EPISODES: consecutive signal days are autocorrelated, so collapse
+    # each run of signal days to one (its start). Daily hit-rate overstates n;
+    # episodes are the honest sample size for the confidence interval.
+    episodes, in_ep = [], False
+    for i, t in enumerate(tiers):
+        sig = t in ("ACCUMULATE", "DEEP_VALUE")
+        if sig and not in_ep:
+            episodes.append(i)
+        in_ep = sig
+
+    def bootstrap_ci(outcomes, iters=2000):
+        if len(outcomes) < 3:
+            return None
+        rnd = random.Random(42)
+        n = len(outcomes)
+        rates = sorted(sum(outcomes[rnd.randrange(n)] for _ in range(n)) / n for _ in range(iters))
+        return [round(rates[int(0.05 * iters)], 3), round(rates[int(0.95 * iters)], 3)]
+
+    horizons = {}
     for h in FORWARD_DAYS:
+        ep_outcomes = [1 if closes[s + h] > closes[s] else 0 for s in episodes if s + h < len(closes)]
         horizons[f"{h}d"] = {
             "signal_hit_rate": winrate(signal_idx, h),
             "base_rate": winrate(list(range(len(closes))), h),
+            "episode_hit_rate": round(sum(ep_outcomes) / len(ep_outcomes), 3) if ep_outcomes else None,
+            "ci": bootstrap_ci(ep_outcomes),   # 90% bootstrap CI on the episode hit-rate
         }
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -203,6 +226,7 @@ def _track_record(weekly: pd.DataFrame, cfg, calibrated: list[str]) -> dict:
         "from": str(rows["date"].iloc[0].date()) if len(rows) else None,
         "to": str(rows["date"].iloc[-1].date()) if len(rows) else None,
         "signal_days": len(signal_idx),
+        "signal_episodes": len(episodes),
         "horizons": horizons,
         "caveats": [
             "Backbone only: price-structure (200WMA/Mayer) + macro — the deep multi-cycle indicators.",

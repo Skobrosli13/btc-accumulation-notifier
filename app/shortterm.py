@@ -255,6 +255,16 @@ def current_regime(daily_close: "pd.Series | None", period: int = 200) -> str:
     return "bull" if float(daily_close.iloc[-1]) >= ma else "bear"
 
 
+def confluence_ok(same_direction_count: int, regime_aligned_: bool | None,
+                  counter_trend: bool) -> bool:
+    """Whether a swing trigger has enough confluence to alert. Single triggers are
+    near coin-flips (see st_winrates); require EITHER >=2 triggers agreeing, OR a
+    single trigger aligned with BOTH the 200-day regime and the composite state."""
+    if same_direction_count >= 2:
+        return True
+    return regime_aligned_ is True and not counter_trend
+
+
 def regime_aligned(direction: str, regime: str) -> bool | None:
     """True when a trigger points with the 200-day regime (BUY in bull / SELL in bear).
     None when the regime is unknown. Counter-regime trades are lower win-rate."""

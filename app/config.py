@@ -116,6 +116,7 @@ class Config:
     tier_watch: float
     tier_accumulate: float
     tier_deepvalue: float
+    tier_hysteresis_margin: float   # dead-band (composite pts) before a tier change sticks
 
     # Acute-capitulation flash
     flash_fng_max: float
@@ -140,6 +141,7 @@ class Config:
     st_sell_threshold: float         # st_composite <= this => SELL state (negative)
     st_strong_sell_threshold: float
     st_regime_suppress: bool         # if true, drop alerts that fight the 200-day regime
+    st_require_confluence: bool       # if true, a lone unaligned trigger won't alert
 
     # Dashboard read-only API
     api_token: str | None
@@ -229,6 +231,7 @@ def load_config() -> Config:
         tier_watch=_get_float("TIER_WATCH", 40),
         tier_accumulate=_get_float("TIER_ACCUMULATE", 60),
         tier_deepvalue=_get_float("TIER_DEEPVALUE", 80),
+        tier_hysteresis_margin=_get_float("TIER_HYSTERESIS_MARGIN", 2.0),
         flash_fng_max=_get_float("FLASH_FNG_MAX", 10),
         flash_drop_pct=_get_float("FLASH_DROP_PCT", 10),
         flash_debounce_days=_get_int("FLASH_DEBOUNCE_DAYS", 3),
@@ -247,6 +250,7 @@ def load_config() -> Config:
         st_sell_threshold=_get_float("ST_SELL_THRESHOLD", -30),
         st_strong_sell_threshold=_get_float("ST_STRONG_SELL_THRESHOLD", -60),
         st_regime_suppress=_get_bool("ST_REGIME_SUPPRESS", False),
+        st_require_confluence=_get_bool("ST_REQUIRE_CONFLUENCE", True),
         api_token=_opt("API_TOKEN"),
         api_cors_origin=_opt("API_CORS_ORIGIN"),
         public_base_url=_get("PUBLIC_BASE_URL", "https://btc.riverviewweb.com").rstrip("/"),
