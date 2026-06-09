@@ -67,7 +67,11 @@ def run(cfg: Config, *, dry_run: bool = False) -> dict:
     # was produced (don't clobber it). Needs ~1 window of collector history.
     if readings.get("oi_flush") is None:
         now_ms = int(now.timestamp() * 1000)
-        base = store.oi_at_or_before(conn, now_ms - int(cfg.oi_flush_window_hours * 3600_000))
+        window_ms = int(cfg.oi_flush_window_hours * 3600_000)
+        # Floor the baseline age at one extra window below the target so a stale
+        # sample (collector outage) can't turn a slow bleed into a phantom flush.
+        base = store.oi_at_or_before(conn, now_ms - window_ms,
+                                     not_before_ms=now_ms - 2 * window_ms)
         cur = store.latest_oi(conn)
         if base and cur:
             readings["oi_flush"] = (cur / base - 1.0) * 100.0
@@ -76,10 +80,13 @@ def run(cfg: Config, *, dry_run: bool = False) -> dict:
     subscores = scoring.score_indicators(readings)
     cat_scores = scoring.category_scores(subscores)
     # Cycle timing keys off the ATH derived from price history (config date is a
-    # fallback only), with a soft, config-tunable swing.
+    # fallback only), with a soft, config-tunable swing. The CoinGecko fallback only
+    # spans 365 days, so its "ATH" is a 1-year max, not a cycle top — do NOT let it
+    # override the config date (that would mistime the cycle multiplier whenever the
+    # real top is >365d old). Trust only multi-year sources (exchange/coinbase).
     ath = cfg.ath_date
     ath_iso = price_struct.get("ath_date")
-    if ath_iso:
+    if ath_iso and price_struct.get("source") != "coingecko":
         try:
             ath = datetime.strptime(ath_iso, "%Y-%m-%d").date()
         except (ValueError, TypeError):
@@ -88,8 +95,10 @@ def run(cfg: Config, *, dry_run: bool = False) -> dict:
                                     swing=cfg.cycle_mult_swing)
     composite_score, active_cats = scoring.composite(cat_scores, cfg.weights, mult)
     # Hysteresis: a tier change must clear the threshold by a margin so a composite
-    # hovering on a cutoff doesn't whipsaw the tier (and spam alerts).
+    # hovering on a cutoff doesn't whipsaw the tier (and spam alerts). Keyed off the
+    # last *computed* tier (display/state continuity), not the alert cursor.
     prev_tier = store.last_tier(conn)
+    prev_active_cats = store.last_active_cats(conn)
     current_tier = scoring.tier_hysteresis(
         composite_score, price_struct["price"], price_struct.get("wma200"),
         prev_tier, cfg.tier_watch, cfg.tier_accumulate, cfg.tier_deepvalue,
@@ -97,25 +106,33 @@ def run(cfg: Config, *, dry_run: bool = False) -> dict:
     # Confidence proxy: how much the active categories agree.
     agreement = scoring.category_agreement(cat_scores)
 
-    # Decide (needs ledger state).
+    # Decide (needs ledger state). The tier decision compares against the last
+    # SUCCESSFULLY NOTIFIED tier so a failed send is retried, not lost.
+    prev_notified_tier = store.last_notified_tier(conn)
     prev_flash_at = store.last_flash_at(conn)
     # Fresh acute funding/OI from the short-term collector (≤10min old) so the
-    # capitulation flash is responsive on the free tier — see evaluate_flash.
+    # capitulation flash is responsive on the free tier — see evaluate_flash. Guard
+    # against a STALE acute row (collector down): an hours-old funding/OI reading is
+    # not an "acute" capitulation leg, so ignore it past a freshness window.
     latest_derivs = store.recent_derivs(conn, 1)
     acute = latest_derivs[-1] if latest_derivs else {}
+    acute_age_ms = (int(now.timestamp() * 1000) - acute["ts"]) if acute.get("ts") else None
+    acute_fresh = acute_age_ms is not None and acute_age_ms <= 30 * 60 * 1000  # 30 min
     flash_now = alerting.evaluate_flash(
         readings, cfg,
-        acute_funding=acute.get("funding"),
-        acute_oi_chg_pct=acute.get("oi_chg_pct"),
+        acute_funding=acute.get("funding") if acute_fresh else None,
+        acute_oi_chg_pct=acute.get("oi_chg_pct") if acute_fresh else None,
     )
     decisions = alerting.decide_alerts(
-        current_tier, prev_tier, flash_now, prev_flash_at, cfg.flash_debounce_days, now
+        current_tier, prev_notified_tier, flash_now, prev_flash_at,
+        cfg.flash_debounce_days, now,
+        prev_active_cats=prev_active_cats, active_cats=active_cats,
     )
 
     log.info(
-        "composite=%.1f tier=%s (was %s) active=%s mult=%.3f flash_now=%s decisions=%s",
-        composite_score, current_tier, prev_tier, ",".join(active_cats), mult,
-        flash_now, decisions,
+        "composite=%.1f tier=%s (was %s, notified %s) active=%s mult=%.3f flash_now=%s decisions=%s",
+        composite_score, current_tier, prev_tier, prev_notified_tier, ",".join(active_cats),
+        mult, flash_now, decisions,
     )
 
     # Playbook (illustrative, display-only): conviction-scaled ladder, unified
@@ -139,23 +156,45 @@ def run(cfg: Config, *, dry_run: bool = False) -> dict:
     changed = alerting.diff_since(
         prev_for_diff, {"composite": composite_score, "tier": current_tier, "subscores": subscores})
 
-    # Notify.
+    # Notify. Capture each send's success so the ledger only advances the alert
+    # cursors (notified_tier / flash_alerted) when the user was actually reached —
+    # a failed send is retried next run instead of being silently swallowed.
     msg_kwargs = dict(composite=composite_score, tier=current_tier, subscores=subscores,
                       price_struct=price_struct, readings=readings, active_cats=active_cats,
                       onchain_active=cfg.onchain_active,
                       changed=changed, what_to_do=what_to_do, plan=plan)
+    tier_send_ok = True   # True when nothing needed sending (cursor may advance freely)
     if decisions["tier_alert"]:
-        title, body = alerting.build_tier_message(**msg_kwargs)
+        title, body = alerting.build_tier_message(cats_changed=decisions["cats_changed"], **msg_kwargs)
         if dry_run:
             log.info("[dry-run] TIER ALERT\n%s\n%s", title, body)
         else:
-            notify.send(cfg, title, body, conn=conn)
+            tier_send_ok = notify.send(cfg, title, body, conn=conn)
+    elif decisions["exit_alert"]:
+        title, body = alerting.build_exit_message(prev_tier=prev_notified_tier,
+                                                  cats_changed=decisions["cats_changed"], **msg_kwargs)
+        if dry_run:
+            log.info("[dry-run] EXIT ALERT\n%s\n%s", title, body)
+        else:
+            tier_send_ok = notify.send(cfg, title, body, conn=conn)
+
+    flash_send_ok = False
     if decisions["flash_alert"]:
         title, body = alerting.build_flash_message(**msg_kwargs)
         if dry_run:
             log.info("[dry-run] FLASH ALERT\n%s\n%s", title, body)
+            flash_send_ok = True
         else:
-            notify.send(cfg, title, body, conn=conn)
+            flash_send_ok = notify.send(cfg, title, body, conn=conn)
+
+    # Alert cursors. notified_tier advances to the current tier only if any needed
+    # tier/exit alert was delivered; otherwise it holds so the next run retries.
+    tier_communicated = decisions["tier_alert"] or decisions["exit_alert"]
+    notified_tier = current_tier if (not tier_communicated or tier_send_ok) else prev_notified_tier
+    # flash_alerted records a DELIVERED flash only, so the debounce isn't started by
+    # a flash nobody received.
+    flash_recorded = decisions["flash_alert"] and flash_send_ok
+    tier_recorded = tier_communicated and tier_send_ok
 
     # Persist (full readings + sub-scores + category scores for later calibration).
     record = {
@@ -179,8 +218,9 @@ def run(cfg: Config, *, dry_run: bool = False) -> dict:
             tier=current_tier,
             active_cats=active_cats,
             readings=record,
-            tier_alerted=decisions["tier_alert"],
-            flash_alerted=decisions["flash_alert"],
+            tier_alerted=tier_recorded,
+            flash_alerted=flash_recorded,
+            notified_tier=notified_tier,
         )
     conn.close()
 

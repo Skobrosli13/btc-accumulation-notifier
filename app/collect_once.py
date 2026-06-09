@@ -21,8 +21,10 @@ from .sources import exchange, price
 
 log = logging.getLogger("btc-collect")
 
-# OI baseline lookback: ~the sample stored ~1h ago (6 x 10-min samples).
-_OI_BASELINE_SAMPLES = 6
+# OI baseline lookback target (~1h ago) and the oldest a baseline may be before it
+# is rejected as stale (so a collector outage can't turn a slow bleed into a flush).
+_OI_BASELINE_MS = 3600_000
+_OI_BASELINE_MAX_AGE_MS = 2 * 3600_000
 
 
 def _candle_rows(df) -> list[tuple]:
@@ -48,25 +50,31 @@ def run(cfg: Config, *, dry_run: bool = False) -> dict:
     regime = shortterm.current_regime(
         exchange.closed_only(daily_df)["close"] if daily_df is not None and not daily_df.empty else None)
 
-    # Derivatives (best-effort) -> derivs time-series + OI change over ~1h.
+    # Derivatives (best-effort) -> derivs time-series + OI change over ~1h. The
+    # baseline is timestamp-bounded (target ~1h ago, rejected if older than ~2h) so
+    # a gap after a collector outage can't read a slow bleed as a phantom flush.
     funding = exchange.funding_latest(cfg.symbol)
     oi = exchange.open_interest(cfg.symbol)
     oi_chg_pct = None
-    hist = store.recent_derivs(conn, _OI_BASELINE_SAMPLES)
-    if oi is not None and hist:
-        base = hist[0].get("oi")
+    now_ms = int(now.timestamp() * 1000)
+    if oi is not None:
+        base = store.oi_at_or_before(conn, now_ms - _OI_BASELINE_MS,
+                                     not_before_ms=now_ms - _OI_BASELINE_MAX_AGE_MS)
         if base:
             oi_chg_pct = (oi / base - 1.0) * 100.0
-    now_ms = int(now.timestamp() * 1000)
     if not dry_run:
         store.record_derivs(conn, ts=now_ms, funding=funding, oi=oi, oi_chg_pct=oi_chg_pct)
 
     summary = {"now": now.isoformat(), "funding": funding, "oi": oi,
                "oi_chg_pct": oi_chg_pct, "timeframes": {}, "alerts": []}
 
+    # Collect every eligible (passes suppression + confluence + cooldown) trigger
+    # across all timeframes, then send ONE batched email per direction below.
+    eligible: list[dict] = []
     for tf, df in frames.items():
         if not dry_run:
-            store.upsert_candles(conn, tf, _candle_rows(df))
+            store.upsert_candles(conn, tf, _candle_rows(df),
+                                 source=df.attrs.get("source"))
 
         ev = shortterm.evaluate(df, cfg, funding=funding, oi_chg_pct=oi_chg_pct)
         ev_ts = ev.get("ts")
@@ -79,7 +87,7 @@ def run(cfg: Config, *, dry_run: bool = False) -> dict:
                                    st_score=ev["score"], st_state=ev["state"],
                                    indicators=ev["indicators"])
 
-        fired = []
+        passed = []
         dirs = [t.direction for t in ev["triggers"]]
         for trig in ev["triggers"]:
             if cfg.st_regime_suppress and shortterm.regime_aligned(trig.direction, regime) is False:
@@ -95,29 +103,46 @@ def run(cfg: Config, *, dry_run: bool = False) -> dict:
             if not alerting.decide_st_alert(candle_ts=ev_ts, last_alert=last, now=now,
                                             cooldown_hours=cfg.st_cooldown_hours):
                 continue
-            title, body = alerting.build_st_message(
-                trigger=trig, timeframe=tf, score=ev["score"], state=ev["state"],
-                price=ev["price"], indicators=ev["indicators"], regime=regime)
-            if dry_run:
-                log.info("[dry-run] ST ALERT %s/%s\n%s\n%s", tf, trig.key, title, body)
-            else:
-                # Owner-only (no `conn` -> no subscriber broadcast). Short-term swing
-                # triggers are frequent; dashboard subscribers only get the infrequent
-                # long-term tier/flash alerts. To broadcast swings too, pass conn=conn.
-                notify.send(cfg, title, body)
-                store.record_st_alert(conn, ts=ev_ts, created_at=now.isoformat(),
-                                      trigger_key=trig.key, timeframe=tf,
-                                      direction=trig.direction, price=ev["price"],
-                                      message=body, sent=True)
-            fired.append(trig.key)
+            eligible.append({"trigger": trig, "timeframe": tf, "ts": ev_ts,
+                             "score": ev["score"], "state": ev["state"],
+                             "price": ev["price"], "indicators": ev["indicators"],
+                             "regime": regime})
+            passed.append(trig.key)
 
-        log.info("%s: score=%.1f state=%s triggers=%s fired=%s",
-                 tf, ev["score"], ev["state"], [t.key for t in ev["triggers"]], fired)
+        log.info("%s: score=%.1f state=%s triggers=%s eligible=%s",
+                 tf, ev["score"], ev["state"], [t.key for t in ev["triggers"]], passed)
         summary["timeframes"][tf] = {"score": ev["score"], "state": ev["state"],
                                      "triggers": [t.key for t in ev["triggers"]],
-                                     "fired": fired}
-        summary["alerts"].extend(fired)
+                                     "eligible": passed}
 
+    # One email per direction. Record each trigger's cooldown row ONLY on a
+    # successful send, so a failed send is retried next run (see store.last_st_alert,
+    # which counts sent=1 rows only) rather than silently swallowed + cooled down.
+    fired: list[str] = []
+    for direction in ("BUY", "SELL"):
+        items = [e for e in eligible if e["trigger"].direction == direction]
+        if not items:
+            continue
+        title, body = alerting.build_st_batch_message(items, direction)
+        if dry_run:
+            log.info("[dry-run] ST ALERT %s x%d\n%s\n%s", direction, len(items), title, body)
+            fired.extend(f"{e['timeframe']}/{e['trigger'].key}" for e in items)
+            continue
+        # Owner-only (no `conn` -> no subscriber broadcast): swing triggers are
+        # frequent; subscribers only get the infrequent long-term tier/flash alerts.
+        ok = notify.send(cfg, title, body)
+        if not ok:
+            log.warning("ST %s batch (%d triggers) send failed; will retry next run",
+                        direction, len(items))
+            continue
+        for e in items:
+            store.record_st_alert(conn, ts=e["ts"], created_at=now.isoformat(),
+                                  trigger_key=e["trigger"].key, timeframe=e["timeframe"],
+                                  direction=direction, price=e["price"],
+                                  message=body, sent=True)
+            fired.append(f"{e['timeframe']}/{e['trigger'].key}")
+
+    summary["alerts"] = fired
     if not dry_run:
         store.prune(conn, 400)
     conn.close()

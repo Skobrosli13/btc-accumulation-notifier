@@ -28,7 +28,7 @@ def client(tmp_path):
     }
     store.record_run(conn, run_ts="2026-06-08T00:00:00+00:00", price=63000, composite=58.0,
                      tier="WATCH", active_cats=["price", "sentiment"], readings=readings,
-                     tier_alerted=True, flash_alerted=False)
+                     tier_alerted=True, flash_alerted=False, notified_tier="WATCH")
     base = int(datetime(2026, 6, 1, tzinfo=timezone.utc).timestamp() * 1000)
     step = 4 * 3600_000
     rows = [(base + i * step, 100 + i, 101 + i, 99 + i, 100 + i, 10.0) for i in range(40)]
@@ -152,14 +152,22 @@ def test_subscribe_unsubscribe_flow(tmp_path):
         assert len(subs) == 1 and subs[0][0] == "friend@example.com"
         token = subs[0][1]
 
-        # unsubscribe is public (no bearer) and returns a self-contained HTML page
-        u = c.get(f"/api/unsubscribe?token={token}")
+        # GET is a non-mutating confirmation page (mail scanners must not be able
+        # to unsubscribe by merely fetching the link); the subscriber stays active.
+        g = c.get(f"/api/unsubscribe?token={token}")
+        assert g.status_code == 200 and "unsubscribe" in g.text.lower()
+        ro = store.connect_readonly(db)
+        assert len(store.list_active_subscribers(ro)) == 1
+        ro.close()
+
+        # POST (button / RFC 8058 one-click) performs the deactivation.
+        u = c.post(f"/api/unsubscribe?token={token}")
         assert u.status_code == 200 and "unsubscribed" in u.text.lower()
         ro = store.connect_readonly(db)
         assert store.list_active_subscribers(ro) == []
         ro.close()
 
-        bad = c.get("/api/unsubscribe?token=bogus")
+        bad = c.post("/api/unsubscribe?token=bogus")
         assert bad.status_code == 200 and "invalid" in bad.text.lower()
     finally:
         api.app.dependency_overrides.clear()

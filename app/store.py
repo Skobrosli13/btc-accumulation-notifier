@@ -24,13 +24,15 @@ CREATE TABLE IF NOT EXISTS runs (
   active_cats   TEXT,                 -- comma list of categories that had data
   readings_json TEXT,                 -- full per-indicator readings + sub-scores for later calibration
   tier_alerted  INTEGER DEFAULT 0,
-  flash_alerted INTEGER DEFAULT 0
+  flash_alerted INTEGER DEFAULT 0,
+  notified_tier TEXT                   -- tier last SUCCESSFULLY communicated (alert cursor; NULL pre-migration)
 );
 
 CREATE TABLE IF NOT EXISTS candles (
   timeframe TEXT,                      -- 4h | 1d | 1w
   ts        INTEGER,                   -- candle open time, epoch ms (UTC)
   open      REAL, high REAL, low REAL, close REAL, volume REAL,
+  source    TEXT,                      -- venue the candle came from (okx | kraken | coinbase | coingecko)
   PRIMARY KEY (timeframe, ts)
 );
 CREATE INDEX IF NOT EXISTS ix_candles_tf_ts ON candles(timeframe, ts DESC);
@@ -72,6 +74,11 @@ CREATE TABLE IF NOT EXISTS subscribers (
   active     INTEGER NOT NULL DEFAULT 1,
   created_at TEXT NOT NULL            -- ISO timestamp (UTC)
 );
+
+CREATE TABLE IF NOT EXISTS meta (
+  key   TEXT PRIMARY KEY,             -- small key-value state (e.g. watchdog debounce)
+  value TEXT
+);
 """
 
 
@@ -97,19 +104,68 @@ def connect_readonly(db_path: str) -> sqlite3.Connection:
     return conn
 
 
+def _add_column_if_missing(conn: sqlite3.Connection, table: str, column: str,
+                           decl: str) -> None:
+    """Idempotent ALTER TABLE ADD COLUMN (SQLite has no IF NOT EXISTS for columns).
+
+    Lets the schema evolve against an existing prod DB without a dump/reload.
+    """
+    cols = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    if column not in cols:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+
+
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(_SCHEMA)
+    # Migrations for DBs created before these columns existed.
+    _add_column_if_missing(conn, "runs", "notified_tier", "TEXT")
+    _add_column_if_missing(conn, "candles", "source", "TEXT")
     conn.commit()
 
 
 # --- Long-term (runs) --------------------------------------------------------
 
 def last_tier(conn: sqlite3.Connection) -> str:
-    """Most recent recorded tier; 'NEUTRAL' if the ledger is empty."""
+    """Most recent recorded (computed) tier; 'NEUTRAL' if the ledger is empty.
+
+    This is the *display/hysteresis* state — always the latest computed tier.
+    For the ALERT cursor (what we last told the user) use ``last_notified_tier``.
+    """
     row = conn.execute(
         "SELECT tier FROM runs ORDER BY run_ts DESC LIMIT 1"
     ).fetchone()
     return row["tier"] if row and row["tier"] else "NEUTRAL"
+
+
+def last_notified_tier(conn: sqlite3.Connection) -> str:
+    """The tier we last SUCCESSFULLY communicated to the user; 'NEUTRAL' if none.
+
+    Distinct from ``last_tier``: the alert decision compares against this so a
+    FAILED send (which leaves ``notified_tier`` unchanged) is retried on the next
+    run instead of being silently swallowed by an advanced display tier. Rows
+    predating the migration have NULL notified_tier and are skipped.
+    """
+    row = conn.execute(
+        "SELECT notified_tier FROM runs WHERE notified_tier IS NOT NULL "
+        "ORDER BY run_ts DESC LIMIT 1"
+    ).fetchone()
+    return row["notified_tier"] if row and row["notified_tier"] else "NEUTRAL"
+
+
+def last_active_cats(conn: sqlite3.Connection) -> list[str] | None:
+    """Active categories of the most recent run, parsed from the comma list.
+
+    None if the ledger is empty. Used to detect when the scored category set
+    changed run-to-run (a renormalization jump can cross a tier boundary purely
+    because a heavy category like on-chain dropped out, not because the market
+    moved) so the alert can be caveated rather than read as a market move.
+    """
+    row = conn.execute(
+        "SELECT active_cats FROM runs ORDER BY run_ts DESC LIMIT 1"
+    ).fetchone()
+    if not row or row["active_cats"] is None:
+        return None
+    return [c for c in row["active_cats"].split(",") if c]
 
 
 def last_flash_at(conn: sqlite3.Connection) -> datetime | None:
@@ -150,14 +206,20 @@ def last_run_ts(conn: sqlite3.Connection) -> datetime | None:
 
 def record_run(conn: sqlite3.Connection, *, run_ts: str, price: float | None,
                composite: float, tier: str, active_cats: list[str],
-               readings: dict, tier_alerted: bool, flash_alerted: bool) -> None:
-    """Persist one run. ``readings`` should hold raw values AND sub-scores."""
+               readings: dict, tier_alerted: bool, flash_alerted: bool,
+               notified_tier: str) -> None:
+    """Persist one run. ``readings`` should hold raw values AND sub-scores.
+
+    ``notified_tier`` is the alert cursor: the tier we have successfully told the
+    user about as of this run (== ``tier`` when no alert was needed or the alert
+    sent OK; the *previous* notified tier when a needed alert failed to send).
+    """
     conn.execute(
         """
         INSERT OR REPLACE INTO runs
           (run_ts, price, composite, tier, active_cats, readings_json,
-           tier_alerted, flash_alerted)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+           tier_alerted, flash_alerted, notified_tier)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             run_ts,
@@ -168,6 +230,7 @@ def record_run(conn: sqlite3.Connection, *, run_ts: str, price: float | None,
             json.dumps(readings, default=str),
             int(tier_alerted),
             int(flash_alerted),
+            notified_tier,
         ),
     )
     conn.commit()
@@ -176,31 +239,56 @@ def record_run(conn: sqlite3.Connection, *, run_ts: str, price: float | None,
 # --- Time-series capture (candles, derivs) -----------------------------------
 
 def upsert_candles(conn: sqlite3.Connection, timeframe: str,
-                   rows: list[tuple[int, float, float, float, float, float]]) -> None:
-    """Insert/replace candles. ``rows`` = [(ts_ms, open, high, low, close, volume), ...]."""
+                   rows: list[tuple[int, float, float, float, float, float]],
+                   source: str | None = None) -> None:
+    """Insert/replace candles. ``rows`` = [(ts_ms, open, high, low, close, volume), ...].
+
+    ``source`` tags the venue so a fallback-venue batch (e.g. Kraken XBT/USD,
+    different quote currency and ~10x lower volume than OKX BTC-USDT) is
+    distinguishable downstream — recomputes that span a venue switch produce
+    garbage volume-spike triggers and a price/volume seam in the chart.
+    """
     if not rows:
         return
     conn.executemany(
         """
-        INSERT OR REPLACE INTO candles (timeframe, ts, open, high, low, close, volume)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT OR REPLACE INTO candles (timeframe, ts, open, high, low, close, volume, source)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        [(timeframe, *r) for r in rows],
+        [(timeframe, *r, source) for r in rows],
     )
     conn.commit()
 
 
-def recent_candles(conn: sqlite3.Connection, timeframe: str, limit: int = 400) -> list[dict]:
-    """Most recent ``limit`` candles for a timeframe, returned OLDEST->NEWEST."""
+def recent_candles(conn: sqlite3.Connection, timeframe: str, limit: int = 400,
+                   contiguous_source: bool = False) -> list[dict]:
+    """Most recent ``limit`` candles for a timeframe, returned OLDEST->NEWEST.
+
+    When ``contiguous_source`` is set, only the newest run of candles sharing the
+    most-recent ``source`` is returned (older rows from a different venue are
+    dropped) so indicator recomputes never straddle a venue switch. Rows with a
+    NULL source (pre-migration) are treated as one undifferentiated venue.
+    """
     rows = conn.execute(
         """
-        SELECT ts, open, high, low, close, volume FROM (
+        SELECT ts, open, high, low, close, volume, source FROM (
             SELECT * FROM candles WHERE timeframe = ? ORDER BY ts DESC LIMIT ?
         ) ORDER BY ts ASC
         """,
         (timeframe, limit),
     ).fetchall()
-    return [dict(r) for r in rows]
+    out = [dict(r) for r in rows]
+    if contiguous_source and out:
+        newest_src = out[-1].get("source")
+        # Keep only the trailing contiguous block matching the newest source.
+        keep: list[dict] = []
+        for r in reversed(out):
+            if r.get("source") == newest_src:
+                keep.append(r)
+            else:
+                break
+        out = list(reversed(keep))
+    return out
 
 
 def record_derivs(conn: sqlite3.Connection, *, ts: int, funding: float | None,
@@ -233,17 +321,30 @@ def latest_oi(conn: sqlite3.Connection) -> float | None:
     return row["oi"] if row else None
 
 
-def oi_at_or_before(conn: sqlite3.Connection, ts_ms: int) -> float | None:
+def oi_at_or_before(conn: sqlite3.Connection, ts_ms: int,
+                    not_before_ms: int | None = None) -> float | None:
     """Open interest from the newest sample at or before ``ts_ms`` (epoch ms).
 
     Timestamp-bounded (not count-based) so a baseline lookback tolerates the
     10-min collector cadence and any gaps — used to derive a free long-term
     ``oi_flush`` (% OI change over a window) when no paid Coinglass key is set.
+
+    ``not_before_ms`` floors how old the baseline may be: after a collector
+    outage the newest sample "at or before" the window could be days stale, which
+    would turn a slow OI bleed into a phantom acute flush. Pass a floor (e.g. one
+    window width below ``ts_ms``) to reject such stale baselines (returns None).
     """
-    row = conn.execute(
-        "SELECT oi FROM derivs WHERE ts <= ? AND oi IS NOT NULL ORDER BY ts DESC LIMIT 1",
-        (ts_ms,),
-    ).fetchone()
+    if not_before_ms is not None:
+        row = conn.execute(
+            "SELECT oi FROM derivs WHERE ts <= ? AND ts >= ? AND oi IS NOT NULL "
+            "ORDER BY ts DESC LIMIT 1",
+            (ts_ms, not_before_ms),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT oi FROM derivs WHERE ts <= ? AND oi IS NOT NULL ORDER BY ts DESC LIMIT 1",
+            (ts_ms,),
+        ).fetchone()
     return row["oi"] if row else None
 
 
@@ -284,11 +385,16 @@ def latest_st_signal(conn: sqlite3.Connection, timeframe: str | None = None) -> 
 
 
 def last_st_alert(conn: sqlite3.Connection, trigger_key: str, timeframe: str) -> dict | None:
-    """The most recent alert for a (trigger_key, timeframe) pair — the cooldown memory."""
+    """The most recent SUCCESSFULLY-SENT alert for a (trigger_key, timeframe) pair.
+
+    This is the cooldown/debounce memory. Filtering on ``sent = 1`` means a failed
+    send neither starts the cooldown nor dedups the candle, so the next run
+    re-attempts the alert instead of silently swallowing it.
+    """
     row = conn.execute(
         """
         SELECT ts, created_at FROM st_alerts
-        WHERE trigger_key = ? AND timeframe = ?
+        WHERE trigger_key = ? AND timeframe = ? AND sent = 1
         ORDER BY ts DESC LIMIT 1
         """,
         (trigger_key, timeframe),
@@ -420,6 +526,22 @@ def list_active_subscribers(conn: sqlite3.Connection) -> list[tuple[str, str]]:
         "SELECT email, token FROM subscribers WHERE active = 1 ORDER BY created_at"
     ).fetchall()
     return [(r["email"], r["token"]) for r in rows]
+
+
+# --- Small key-value state (watchdog debounce, etc.) -------------------------
+
+def get_meta(conn: sqlite3.Connection, key: str) -> str | None:
+    row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+    return row["value"] if row else None
+
+
+def set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
+    conn.execute(
+        "INSERT INTO meta (key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (key, value),
+    )
+    conn.commit()
 
 
 # --- Retention ---------------------------------------------------------------

@@ -25,10 +25,15 @@ log = logging.getLogger(__name__)
 
 OKX_BASE = "https://www.okx.com"
 KRAKEN_BASE = "https://api.kraken.com"
+COINBASE_BASE = "https://api.exchange.coinbase.com"
 
 # timeframe -> venue-specific interval codes
 _OKX_BAR = {"4h": "4H", "1d": "1Dutc", "1w": "1Wutc"}
 _KRAKEN_MIN = {"4h": 240, "1d": 1440, "1w": 10080}
+# Coinbase only offers a fixed granularity set (seconds); 4h and 1w are NOT in it,
+# so Coinbase serves as a daily/6h fallback only (still fixes the long-term ATH /
+# 200-MA problem that CoinGecko's 365-day cap creates).
+_COINBASE_GRAN = {"1d": 86400, "6h": 21600, "1h": 3600}
 _TF_MS = {"4h": 4 * 3600_000, "1d": 86_400_000, "1w": 7 * 86_400_000}
 
 _COLS = ["open_time", "open", "high", "low", "close", "volume", "confirmed"]
@@ -43,9 +48,19 @@ def _swap_inst(symbol: str) -> str:
     return symbol if symbol.endswith("-SWAP") else f"{symbol}-SWAP"
 
 
-def _kraken_pair(symbol: str) -> str:
-    # Only BTC/USD is in scope; Kraken uses XBT for BTC.
-    return "XBTUSD"
+def _is_btc(symbol: str) -> bool:
+    return symbol.upper().startswith(("BTC", "XBT"))
+
+
+def _kraken_pair(symbol: str) -> str | None:
+    # Only BTC/USD is wired for the Kraken fallback; Kraken uses XBT for BTC.
+    # Return None for a non-BTC symbol so we never silently mix another asset's
+    # BTC data into the series.
+    return "XBTUSD" if _is_btc(symbol) else None
+
+
+def _coinbase_product(symbol: str) -> str | None:
+    return "BTC-USD" if _is_btc(symbol) else None
 
 
 def _df_from_rows(rows: list[list]) -> pd.DataFrame:
@@ -78,10 +93,11 @@ def _okx_klines(timeframe: str, limit: int, symbol: str) -> pd.DataFrame | None:
 
 def _kraken_klines(timeframe: str, symbol: str) -> pd.DataFrame | None:
     interval = _KRAKEN_MIN.get(timeframe)
-    if interval is None:
+    pair = _kraken_pair(symbol)
+    if interval is None or pair is None:
         return None
     data = get_json(f"{KRAKEN_BASE}/0/public/OHLC",
-                    params={"pair": _kraken_pair(symbol), "interval": interval})
+                    params={"pair": pair, "interval": interval})
     if not data or data.get("error") or not data.get("result"):
         return None
     result = data["result"]
@@ -97,22 +113,116 @@ def _kraken_klines(timeframe: str, symbol: str) -> pd.DataFrame | None:
     return _df_from_rows(rows)
 
 
+# --- Coinbase (last-resort klines; daily/6h only) -----------------------------
+
+def _coinbase_klines(timeframe: str, symbol: str) -> pd.DataFrame | None:
+    """Coinbase Exchange candles (free, no key, US-reachable). Daily/6h only.
+
+    Row format: [time(s), low, high, open, close, volume], newest-first, max 300.
+    """
+    gran = _COINBASE_GRAN.get(timeframe)
+    product = _coinbase_product(symbol)
+    if gran is None or product is None:
+        return None
+    data = get_json(f"{COINBASE_BASE}/products/{product}/candles",
+                    params={"granularity": gran})
+    if not data or not isinstance(data, list):
+        return None
+    rows = []
+    for c in data:  # [time, low, high, open, close, volume]
+        try:
+            rows.append([int(c[0]) * 1000, c[3], c[2], c[1], c[4], c[5], True])
+        except (IndexError, TypeError, ValueError):
+            continue
+    if not rows:
+        return None
+    rows.sort(key=lambda r: r[0])  # -> oldest-first
+    # Coinbase doesn't flag the forming candle; mark the last bar unconfirmed if it
+    # is the current period so closed_only stays correct.
+    return _df_from_rows(rows)
+
+
+def coinbase_daily_history(total: int, symbol: str = "BTC-USDT") -> pd.DataFrame | None:
+    """Paginate Coinbase daily candles backward to assemble ~``total`` days.
+
+    Used as the price-structure fallback ahead of CoinGecko: CoinGecko's free tier
+    caps at 365 days, which yields a bogus 1-year "ATH" and no real 200-week MA.
+    Coinbase reaches back years (300 candles/request via start/end).
+    """
+    product = _coinbase_product(symbol)
+    if product is None:
+        return None
+    gran = 86400
+    frames: list[list] = []
+    end = None  # ISO8601; None = now
+    pages = max(1, (total // 300) + 1)
+    for _ in range(pages + 1):
+        params = {"granularity": gran}
+        if end is not None:
+            params["end"] = end
+            params["start"] = _iso(end_epoch=_parse_iso(end) - 300 * gran)
+        data = get_json(f"{COINBASE_BASE}/products/{product}/candles", params=params)
+        if not data or not isinstance(data, list):
+            break
+        chunk = sorted(data, key=lambda c: int(c[0]))
+        frames.extend(chunk)
+        oldest = int(chunk[0][0])
+        end = _iso(end_epoch=oldest - gran)
+        if len(chunk) < 300:
+            break
+    if not frames:
+        return None
+    seen = {}
+    for c in frames:  # dedup by ts; [time, low, high, open, close, volume]
+        try:
+            seen[int(c[0])] = [int(c[0]) * 1000, c[3], c[2], c[1], c[4], c[5], True]
+        except (IndexError, TypeError, ValueError):
+            continue
+    rows = [seen[k] for k in sorted(seen)]
+    if not rows:
+        return None
+    return _df_from_rows(rows).tail(total).reset_index(drop=True)
+
+
+def _parse_iso(iso: str) -> int:
+    from datetime import datetime
+    return int(datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp())
+
+
+def _iso(end_epoch: int) -> str:
+    from datetime import datetime, timezone
+    return datetime.fromtimestamp(end_epoch, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 # --- Public interface ---------------------------------------------------------
+
+_KLINE_VENUES = {
+    "okx": _okx_klines,
+    "kraken": lambda tf, limit, sym: _kraken_klines(tf, sym),
+    "coinbase": lambda tf, limit, sym: _coinbase_klines(tf, sym),
+}
+
 
 def klines(timeframe: str, limit: int = 300, symbol: str = "BTC-USDT",
            prefer: str = "okx") -> pd.DataFrame:
-    """Normalized OHLCV for a timeframe, oldest-first. Tries OKX then Kraken
-    (order set by ``prefer``). Raises if BOTH fail (klines are mandatory; callers
-    like price.py fall back to CoinGecko)."""
-    order = ["kraken", "okx"] if prefer == "kraken" else ["okx", "kraken"]
+    """Normalized OHLCV for a timeframe, oldest-first. Tries OKX -> Kraken ->
+    Coinbase (order set by ``prefer``). Raises if ALL fail (klines are mandatory;
+    callers like price.py then fall back to CoinGecko).
+
+    The returned frame carries ``df.attrs['source']`` = the venue that served it,
+    so persisted candles can be venue-tagged (a fallback batch has a different
+    quote currency + volume scale and must not be mixed into indicator recomputes).
+    """
+    order = (["kraken", "okx", "coinbase"] if prefer == "kraken"
+             else ["okx", "kraken", "coinbase"])
     for venue in order:
         try:
-            df = _okx_klines(timeframe, limit, symbol) if venue == "okx" \
-                else _kraken_klines(timeframe, symbol)
+            df = _KLINE_VENUES[venue](timeframe, limit, symbol)
         except Exception as exc:  # noqa: BLE001
             log.warning("%s klines(%s) failed: %s", venue, timeframe, exc)
             df = None
         if df is not None and not df.empty:
+            df.attrs["source"] = venue
             return df
     raise RuntimeError(f"all exchanges failed for klines({timeframe}, {symbol})")
 
@@ -206,8 +316,11 @@ def spot_price(symbol: str = "BTC-USDT", prefer: str = "okx") -> float | None:
                 if data and data.get("code") == "0" and data.get("data"):
                     return float(data["data"][0]["last"])
             else:
+                pair = _kraken_pair(symbol)
+                if pair is None:
+                    continue
                 data = get_json(f"{KRAKEN_BASE}/0/public/Ticker",
-                                params={"pair": _kraken_pair(symbol)})
+                                params={"pair": pair})
                 if data and not data.get("error") and data.get("result"):
                     row = next(iter(data["result"].values()), None)
                     if row:

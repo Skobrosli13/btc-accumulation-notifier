@@ -215,13 +215,20 @@ _TIER_FLOOR_KEY = {"WATCH": 0, "ACCUMULATE": 1, "DEEP_VALUE": 2}
 
 def tier_hysteresis(score: float, price: float, wma200: float | None,
                     prev_tier: str, t_watch: float, t_acc: float, t_deep: float,
-                    margin: float = 2.0) -> str:
+                    margin: float = 2.0, deep_exit_band: float = 0.02) -> str:
     """Tier with a dead-band so a composite hovering on a threshold doesn't whipsaw.
 
     A move to a HIGHER tier requires the composite to clear that tier's floor by
     ``margin``; a move LOWER requires it to fall ``margin`` below the previous
     tier's floor. Inside the band the previous tier holds. margin=0 reproduces the
     plain ``tier``.
+
+    Special case — DEEP_VALUE is gated on ``price <= wma200``, not just score. If
+    the only reason ``raw`` left DEEP_VALUE is that price rose back above the 200WMA
+    (score still clears ``t_deep``), the COMPOSITE dead-band must not trap the tier
+    in DEEP_VALUE while the defining price condition is false. Exit on a small PRICE
+    band (``deep_exit_band``, default 2% above the 200WMA) instead, so the system
+    can't keep reporting "heaviest tranches" 20% above the 200WMA.
     """
     raw = tier(score, price, wma200, t_watch, t_acc, t_deep)
     if margin <= 0 or raw == prev_tier or prev_tier not in _TIER_ORDER:
@@ -231,7 +238,13 @@ def tier_hysteresis(score: float, price: float, wma200: float | None,
     if raw_i > prev_i:  # upgrade: require clearing the NEW floor by margin
         floor = floors[_TIER_FLOOR_KEY[raw]]
         return raw if score >= floor + margin else prev_tier
-    # downgrade: require falling margin below the PREVIOUS tier's floor
+    # downgrade.
+    if (prev_tier == "DEEP_VALUE" and score >= t_deep
+            and wma200 is not None and price > wma200):
+        # Gate-driven exit (price above the 200WMA): use a price band, not the
+        # composite margin, so a clear breach can't be held by a high composite.
+        return raw if price > wma200 * (1 + deep_exit_band) else prev_tier
+    # otherwise: require falling margin below the PREVIOUS tier's floor
     floor = floors[_TIER_FLOOR_KEY[prev_tier]]
     return raw if score <= floor - margin else prev_tier
 

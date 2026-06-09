@@ -33,11 +33,15 @@ def _send_ntfy(cfg: Config, title: str, body: str) -> bool:
 
 def _send_telegram(cfg: Config, title: str, body: str) -> bool:
     url = f"https://api.telegram.org/bot{cfg.telegram_bot_token}/sendMessage"
-    text = f"*{title}*\n\n{body}"
+    # Send as PLAIN TEXT (no parse_mode): our bodies contain underscores and arrows
+    # (e.g. "tier ACCUMULATE→DEEP_VALUE") that legacy-Markdown parses as unmatched
+    # entities -> Telegram 400 -> a silently-failed send on exactly the important
+    # alerts. Plain text can't be malformed.
+    text = f"{title}\n\n{body}"
     try:
         r = requests.post(
             url,
-            json={"chat_id": cfg.telegram_chat_id, "text": text, "parse_mode": "Markdown"},
+            json={"chat_id": cfg.telegram_chat_id, "text": text},
             timeout=15,
         )
         r.raise_for_status()

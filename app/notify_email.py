@@ -66,7 +66,13 @@ def send_email(cfg: Config, subject: str, body: str, *,
             "text": text,
         }
         if unsubscribe_url:
-            payload["headers"] = {"List-Unsubscribe": f"<{unsubscribe_url}>"}
+            # RFC 8058 one-click: Gmail/Yahoo POST to the URL with the body
+            # `List-Unsubscribe=One-Click` (handled by the POST route). Scanners that
+            # merely GET the link hit the non-mutating confirmation page instead.
+            payload["headers"] = {
+                "List-Unsubscribe": f"<{unsubscribe_url}>",
+                "List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
+            }
         resend.Emails.send(payload)
         return True
     except Exception as exc:  # noqa: BLE001 - graceful like ntfy/telegram

@@ -70,7 +70,11 @@ def require_token(authorization: str | None = Header(None),
         return  # dev / localhost-only: open
     expected = f"Bearer {cfg.api_token}"
     # Constant-time compare so the token can't be recovered byte-by-byte via timing.
-    if not authorization or not secrets.compare_digest(authorization, expected):
+    # Compare bytes so a non-ASCII header can't raise TypeError -> 500 (compare_digest
+    # rejects mixed/non-ASCII str); a bad header should be a clean 401.
+    ok = bool(authorization) and secrets.compare_digest(
+        (authorization or "").encode("utf-8", "ignore"), expected.encode("utf-8"))
+    if not ok:
         raise HTTPException(status_code=401, detail="unauthorized")
 
 
@@ -97,6 +101,12 @@ def _conn_rw(cfg: Config) -> sqlite3.Connection:
         raise HTTPException(status_code=503, detail=f"database unavailable: {exc}")
 
 
+# Long-term runs are a 6h cron; allow ~2 cadences + slack before "stale" so a
+# single missed run isn't flagged, but a dead run_once (which the 10-min collector
+# would otherwise mask) is caught.
+_RUN_STALE_HOURS = 13.0
+
+
 @app.get("/api/health")
 def health(cfg: Config = Depends(get_config), _=Depends(require_token)) -> dict:
     now = datetime.now(timezone.utc)
@@ -117,6 +127,11 @@ def health(cfg: Config = Depends(get_config), _=Depends(require_token)) -> dict:
         "last_collect": None,
         "last_run": None,
         "collect_age_hours": None,
+        "run_age_hours": None,
+        # Default to stale=True so a DB error never renders as "healthy".
+        "collect_stale": True,
+        "run_stale": True,
+        "stale": True,
     }
     try:
         conn = store.connect_readonly(cfg.db_path)
@@ -126,10 +141,16 @@ def health(cfg: Config = Depends(get_config), _=Depends(require_token)) -> dict:
         out["db_ok"] = True
         out["last_collect"] = lc.isoformat() if lc else None
         out["last_run"] = lr.isoformat() if lr else None
-        if lc:
-            out["collect_age_hours"] = round((now - lc).total_seconds() / 3600.0, 2)
-        out["stale"] = (lc is None) or ((now - lc).total_seconds() / 3600.0 > cfg.watchdog_stale_hours)
-    except sqlite3.OperationalError as exc:
+        collect_age = (now - lc).total_seconds() / 3600.0 if lc else None
+        run_age = (now - lr).total_seconds() / 3600.0 if lr else None
+        out["collect_age_hours"] = round(collect_age, 2) if collect_age is not None else None
+        out["run_age_hours"] = round(run_age, 2) if run_age is not None else None
+        # Each pipeline is judged against its OWN cadence: the fresh 10-min collector
+        # must not hide a dead 6h long-term run (and vice versa).
+        out["collect_stale"] = collect_age is None or collect_age > cfg.watchdog_stale_hours
+        out["run_stale"] = run_age is None or run_age > _RUN_STALE_HOURS
+        out["stale"] = out["collect_stale"] or out["run_stale"]
+    except sqlite3.Error as exc:
         out["ok"] = False
         out["error"] = str(exc)
     return out
@@ -313,7 +334,10 @@ def _enrich_st(conn, cfg: Config, sig: dict | None, tf: str,
     sig["regime"] = regime
     sig["components"] = []
     sig["triggers"] = []
-    rows = store.recent_candles(conn, tf, 300)
+    # contiguous_source: never recompute indicators/triggers across a venue switch
+    # (a fallback batch has a different quote currency + volume scale, which would
+    # produce phantom vol-spike triggers right at the boundary).
+    rows = store.recent_candles(conn, tf, 300, contiguous_source=True)
     if len(rows) < 35:
         return sig
     df = pd.DataFrame(rows)
@@ -351,8 +375,13 @@ def shortterm_latest(cfg: Config = Depends(get_config), _=Depends(require_token)
         derivs = store.recent_derivs(conn, 1)
         funding = derivs[-1]["funding"] if derivs else None
         oi_chg_pct = derivs[-1]["oi_chg_pct"] if derivs else None
-        rows1d = store.recent_candles(conn, "1d", 300)
-        regime = shortterm.current_regime(pd.DataFrame(rows1d)["close"] if rows1d else None)
+        rows1d = store.recent_candles(conn, "1d", 300, contiguous_source=True)
+        # Drop the still-forming daily candle so the dashboard regime matches the
+        # collector/alert path (which is closed-candle-only) — no intraday flip-flop
+        # of regime_aligned/confluence near the 200DMA.
+        closed1d = rows1d[:-1] if len(rows1d) > 1 else rows1d
+        regime = shortterm.current_regime(
+            pd.DataFrame(closed1d)["close"] if closed1d else None)
         out = {tf: _enrich_st(conn, cfg, store.latest_st_signal(conn, tf), tf,
                               funding, oi_chg_pct, regime)
                for tf in cfg.st_timeframes}
@@ -379,7 +408,7 @@ def indicators(timeframe: str = Query("4h"),
                cfg: Config = Depends(get_config), _=Depends(require_token)) -> dict:
     conn = _conn(cfg)
     try:
-        rows = store.recent_candles(conn, timeframe, 300)
+        rows = store.recent_candles(conn, timeframe, 300, contiguous_source=True)
     finally:
         conn.close()
     if len(rows) < 35:
@@ -476,13 +505,16 @@ def subscribe(body: SubscribeIn, background: BackgroundTasks,
             created_at=datetime.now(timezone.utc).isoformat())
     finally:
         conn.close()
-    if cfg.resend_api_key:
+    # Only send the welcome on a genuinely NEW subscription — re-POSTing an existing
+    # address (a refresh, or an abuse loop) must not re-send mail (Resend quota /
+    # reputation / unsolicited-mail vector).
+    if cfg.resend_api_key and is_new:
         unsub = f"{cfg.public_base_url}/api/unsubscribe?token={token}"
         background.add_task(_send_welcome, cfg, email, unsub)
     return {"ok": True, "email": email, "new": is_new}
 
 
-def _unsub_page(message: str) -> HTMLResponse:
+def _unsub_page(message: str, *, body_html: str = "") -> HTMLResponse:
     safe = message  # message is one of our own fixed strings (no user input)
     html_doc = f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
@@ -496,25 +528,54 @@ def _unsub_page(message: str) -> HTMLResponse:
     border:1px solid rgba(255,255,255,.06);border-radius:16px;text-align:center;
     box-shadow:0 8px 24px rgba(0,0,0,.22)}}
   h1{{font-size:18px;margin:0 0 10px}}
-  p{{color:#98a1b2;font-size:14px;line-height:1.5;margin:0}}
+  p{{color:#98a1b2;font-size:14px;line-height:1.5;margin:0 0 16px}}
+  button{{background:#e8eaf0;color:#0b0d12;border:0;border-radius:10px;
+    padding:11px 22px;font-size:14px;font-weight:600;cursor:pointer}}
 </style></head>
-<body><div class="box"><h1>BTC signal alerts</h1><p>{safe}</p></div></body></html>"""
+<body><div class="box"><h1>BTC signal alerts</h1><p>{safe}</p>{body_html}</div></body></html>"""
     return HTMLResponse(content=html_doc)
 
 
+def _do_unsubscribe(token: str, cfg: Config) -> str | None:
+    if not token:
+        return None
+    conn = _conn_rw(cfg)
+    try:
+        return store.deactivate_subscriber(conn, token)
+    finally:
+        conn.close()
+
+
 @app.get("/api/unsubscribe", response_class=HTMLResponse)
-def unsubscribe(token: str = Query(""),
-                cfg: Config = Depends(get_config)) -> HTMLResponse:
-    """Public (no bearer token) — the unguessable ``token`` from the email link
-    is the capability. Returns a self-contained confirmation page so it works as
-    a direct email-link target without any dashboard assets."""
-    email = None
-    if token:
-        conn = _conn_rw(cfg)
-        try:
-            email = store.deactivate_subscriber(conn, token)
-        finally:
-            conn.close()
+def unsubscribe_confirm(token: str = Query(""),
+                        cfg: Config = Depends(get_config)) -> HTMLResponse:
+    """Public confirmation page — does NOT mutate.
+
+    A GET must be side-effect-free: corporate/AV mail link scanners (Outlook
+    SafeLinks, Gmail/Yahoo prefetch, Mimecast) issue GETs on every link in an
+    email, which previously unsubscribed subscribers the moment a message was
+    merely scanned. The actual deactivation happens on the POST below — triggered
+    either by the button here or by an RFC 8058 one-click request from the mail
+    client. (The token in the URL remains the capability.)
+    """
+    form = (f'<form method="post" action="/api/unsubscribe?token={token}">'
+            f'<button type="submit">Unsubscribe</button></form>') if token else ""
+    return _unsub_page(
+        "Click below to stop receiving BTC signal alerts at your address."
+        if token else "This unsubscribe link is invalid.",
+        body_html=form)
+
+
+@app.post("/api/unsubscribe", response_class=HTMLResponse)
+def unsubscribe_do(token: str = Query(""),
+                   cfg: Config = Depends(get_config)) -> HTMLResponse:
+    """Public (no bearer token) — the unguessable ``token`` is the capability.
+
+    Handles both the confirmation-page button and RFC 8058 one-click POSTs
+    (``List-Unsubscribe-Post: List-Unsubscribe=One-Click``) from Gmail/Yahoo.
+    Idempotent.
+    """
+    email = _do_unsubscribe(token, cfg)
     if email:
         return _unsub_page(
             f"You’ve been unsubscribed. {email} will no longer receive alerts.")

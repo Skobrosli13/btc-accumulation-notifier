@@ -70,11 +70,35 @@ def evaluate_flash(readings: dict, cfg: Config, *,
     return bool(capitulation)
 
 
-def decide_alerts(current_tier: str, last_tier: str,
-                  flash_now: bool, last_flash_at, debounce_days: int, now) -> dict:
-    out = {"tier_alert": False, "flash_alert": False}
-    if current_tier != last_tier and current_tier in ("WATCH", "ACCUMULATE", "DEEP_VALUE"):
-        out["tier_alert"] = True
+def decide_alerts(current_tier: str, prev_notified_tier: str,
+                  flash_now: bool, last_flash_at, debounce_days: int, now,
+                  *, prev_active_cats: list[str] | None = None,
+                  active_cats: list[str] | None = None) -> dict:
+    """Decide which alerts to fire this run.
+
+    ``prev_notified_tier`` is the tier we last SUCCESSFULLY communicated (NOT the
+    last computed tier): comparing against it means a failed send is retried next
+    run instead of being swallowed by an advanced display tier, and a genuine
+    re-entry (NEUTRAL→WATCH→NEUTRAL→WATCH) still re-alerts each time.
+
+    * ``tier_alert``  — entered/changed into an alert tier (WATCH/ACCUMULATE/DEEP_VALUE).
+    * ``exit_alert``  — dropped back to NEUTRAL from an alert tier (a low-key "zone
+                        closed" note so a laddering user learns the window ended).
+    * ``flash_alert`` — acute capitulation, independent of tier, own debounce.
+    * ``cats_changed``— the scored category set differs from the previous run, so a
+                        tier change may be a renormalization artifact, not a market
+                        move; the message builder caveats this.
+    """
+    out = {"tier_alert": False, "flash_alert": False, "exit_alert": False,
+           "cats_changed": False}
+    if current_tier != prev_notified_tier:
+        if current_tier in ALERT_TIERS:
+            out["tier_alert"] = True
+        elif current_tier == "NEUTRAL" and prev_notified_tier in ALERT_TIERS:
+            out["exit_alert"] = True
+    if (out["tier_alert"] or out["exit_alert"]) and \
+            prev_active_cats is not None and active_cats is not None:
+        out["cats_changed"] = set(prev_active_cats) != set(active_cats)
     if flash_now and (last_flash_at is None or (now - last_flash_at).days >= debounce_days):
         out["flash_alert"] = True
     return out
@@ -118,10 +142,19 @@ def _common_lines(*, composite: float, tier: str, subscores: dict,
     return lines
 
 
+_CATS_CHANGED_CAVEAT = (
+    "[!] Note: the available data categories changed since the last run, so this "
+    "tier move may partly reflect a category dropping out / coming back (the "
+    "composite renormalizes over whatever returned data) rather than a pure market "
+    "move. Confirm against the indicator breakdown before acting."
+)
+
+
 def build_tier_message(*, composite: float, tier: str, subscores: dict,
                        price_struct: dict, readings: dict, active_cats: list[str],
                        onchain_active: bool, changed: dict | None = None,
-                       what_to_do: dict | None = None, plan: dict | None = None) -> tuple[str, str]:
+                       what_to_do: dict | None = None, plan: dict | None = None,
+                       cats_changed: bool = False) -> tuple[str, str]:
     """Return (title, body) for a tier-transition alert."""
     label = TIER_LABELS.get(tier, tier)
     headline = TIER_HEADLINES.get(tier, "")
@@ -130,6 +163,38 @@ def build_tier_message(*, composite: float, tier: str, subscores: dict,
     body_lines += _common_lines(composite=composite, tier=tier, subscores=subscores,
                                 price_struct=price_struct, readings=readings,
                                 active_cats=active_cats, onchain_active=onchain_active)
+    if cats_changed:
+        body_lines += ["", _CATS_CHANGED_CAVEAT]
+    pb = _playbook_lines(changed, what_to_do, plan)
+    if pb:
+        body_lines += ["", *pb]
+    return title, "\n".join(body_lines)
+
+
+def build_exit_message(*, composite: float, tier: str, subscores: dict,
+                       price_struct: dict, readings: dict, active_cats: list[str],
+                       onchain_active: bool, prev_tier: str = "",
+                       changed: dict | None = None, what_to_do: dict | None = None,
+                       plan: dict | None = None, cats_changed: bool = False) -> tuple[str, str]:
+    """Return (title, body) for a zone-exit note (alert tier -> NEUTRAL).
+
+    A low-key bookend to the tier alerts: a user laddering on the last ACCUMULATE
+    email is otherwise never told the accumulation window closed.
+    """
+    prev_label = TIER_LABELS.get(prev_tier, prev_tier) if prev_tier else "the accumulation zone"
+    title = f"BTC accumulation: zone exited ({composite:.0f}/100)"
+    body_lines = [
+        f"Accumulation zone CLOSED - dropped from {prev_label.upper()} back to NEUTRAL.",
+        "The confluence that opened the zone has faded; no new laddering signal. "
+        "Existing positions are your call - this is the long-term thesis cooling, "
+        "not a sell signal.",
+        "",
+    ]
+    body_lines += _common_lines(composite=composite, tier=tier, subscores=subscores,
+                                price_struct=price_struct, readings=readings,
+                                active_cats=active_cats, onchain_active=onchain_active)
+    if cats_changed:
+        body_lines += ["", _CATS_CHANGED_CAVEAT]
     pb = _playbook_lines(changed, what_to_do, plan)
     if pb:
         body_lines += ["", *pb]
@@ -273,6 +338,55 @@ def build_st_message(*, trigger, timeframe: str, score: float, state: str,
         lines.append(f"ATR risk frame (illustrative): stop ${lv['stop']:,.0f} / "
                      f"target ${lv['target']:,.0f}" + (f" (~{lv['rr']}R)" if lv["rr"] else ""))
 
+    lines.append("")
+    lines.append("Short-term swing timing - separate from the long-term accumulation thesis.")
+    lines.append("Not financial advice - alert only. You decide whether, how much, and where to trade.")
+    return title, "\n".join(lines)
+
+
+def build_st_batch_message(items: list[dict], direction: str) -> tuple[str, str]:
+    """Return (title, body) for ALL same-direction triggers fired this run.
+
+    ``items`` is a list of {trigger, timeframe, score, state, price, indicators,
+    regime}. Batching into one email per direction kills the duplicate-email
+    fatigue from the confluence gate (which guarantees >=2 triggers) and from the
+    same event firing on both 4h and 1d. A single email below 4-6 near-identical
+    ones is what keeps the rare long-term alert from being trained-out.
+    """
+    if len(items) == 1:
+        it = items[0]
+        return build_st_message(
+            trigger=it["trigger"], timeframe=it["timeframe"], score=it["score"],
+            state=it["state"], price=it["price"], indicators=it["indicators"],
+            regime=it.get("regime", "unknown"))
+
+    arrow = "[BUY]" if direction == "BUY" else "[SELL]"
+    # Count triggers per timeframe for the subject, e.g. "2 on 4h, 1 on 1d".
+    by_tf: dict[str, int] = {}
+    for it in items:
+        by_tf[it["timeframe"]] = by_tf.get(it["timeframe"], 0) + 1
+    tf_summary = ", ".join(f"{n} on {tf}" for tf, n in by_tf.items())
+    title = f"BTC swing {direction}: {len(items)} triggers ({tf_summary})"
+
+    lines = [f"{arrow} {len(items)} short-term {direction} triggers fired this run ({tf_summary}).",
+             "Confluence across multiple triggers/timeframes — higher conviction than a lone trigger.",
+             ""]
+    for it in items:
+        trig = it["trigger"]
+        tf = it["timeframe"]
+        price = it["price"]
+        counter = is_counter_trend(direction, it["state"])
+        flag = " [counter-trend]" if counter else ""
+        head = f"• {tf}: {trig.label}{flag}"
+        if price is not None:
+            head += f" @ ${price:,.0f}"
+        lines.append(head)
+        if trig.detail:
+            lines.append(f"    {trig.detail}")
+        lv = shortterm.trade_levels(direction, price, (it["indicators"] or {}).get("atr"))
+        if lv:
+            lines.append(f"    risk frame: stop ${lv['stop']:,.0f} / target ${lv['target']:,.0f}"
+                         + (f" (~{lv['rr']}R)" if lv["rr"] else ""))
     lines.append("")
     lines.append("Short-term swing timing - separate from the long-term accumulation thesis.")
     lines.append("Not financial advice - alert only. You decide whether, how much, and where to trade.")

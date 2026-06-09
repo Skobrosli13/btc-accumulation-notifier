@@ -38,24 +38,38 @@ def _coingecko_daily(days: str = "365") -> pd.DataFrame:
     return df[["open_time", "close"]]
 
 
+def _weekly_from_daily(daily: pd.DataFrame) -> pd.DataFrame:
+    return (daily.set_index("open_time")["close"]
+            .resample("1W").last().dropna().reset_index())
+
+
 def get_frames(symbol: str = "BTC-USDT", prefer: str = "okx") -> tuple[pd.DataFrame, pd.DataFrame, str]:
-    """Return (daily, weekly, source). Tries the exchange adapter, then CoinGecko.
+    """Return (daily, weekly, source). Tries the exchange adapter, then Coinbase
+    (multi-year daily history), then CoinGecko (365-day, last resort).
 
     Both frames have at least 'open_time' and 'close' columns, oldest first.
-    ``source`` is "exchange" or "coingecko" for the dashboard health panel.
+    ``source`` is the venue ("exchange"/"coinbase"/"coingecko") — used by the
+    dashboard health panel AND by run_once to decide whether the derived ATH is
+    trustworthy enough to override the config cycle date (CoinGecko's 365-day cap
+    gives a bogus 1-year "ATH", so that source must NOT override).
     """
     try:
         daily = exchange.klines("1d", limit=300, symbol=symbol, prefer=prefer)
         weekly = exchange.klines("1w", limit=300, symbol=symbol, prefer=prefer)
         return daily, weekly, "exchange"
     except Exception as exc:  # noqa: BLE001
-        log.warning("exchange klines failed (%s); falling back to CoinGecko", exc)
-        daily = _coingecko_daily()
-        weekly = (
-            daily.set_index("open_time")["close"]
-            .resample("1W").last().dropna().reset_index()
-        )
-        return daily, weekly, "coingecko"
+        log.warning("exchange klines failed (%s); trying Coinbase daily history", exc)
+    # Coinbase: real multi-year daily history (resampled to weekly) — preserves a
+    # sane 200-week MA and cycle ATH where CoinGecko cannot.
+    try:
+        cb = exchange.coinbase_daily_history(1500, symbol=symbol)
+        if cb is not None and len(cb) >= 200:
+            daily = cb[["open_time", "close"]]
+            return daily, _weekly_from_daily(daily), "coinbase"
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Coinbase daily history failed (%s); falling back to CoinGecko", exc)
+    daily = _coingecko_daily()
+    return daily, _weekly_from_daily(daily), "coingecko"
 
 
 def get_intraday_frames(symbol: str = "BTC-USDT", timeframes=("4h", "1d"),

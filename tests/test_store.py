@@ -78,10 +78,12 @@ def test_derivs_and_signals_roundtrip(conn):
 def test_latest_run_roundtrip(conn):
     store.record_run(conn, run_ts="2026-01-01T00:00:00+00:00", price=100, composite=58.0,
                      tier="WATCH", active_cats=["price", "sentiment"], readings={"x": 1},
-                     tier_alerted=True, flash_alerted=False)
+                     tier_alerted=True, flash_alerted=False, notified_tier="WATCH")
     latest = store.latest_run(conn)
     assert latest["tier"] == "WATCH"
     assert latest["readings"] == {"x": 1}
+    assert latest["notified_tier"] == "WATCH"
+    assert store.last_notified_tier(conn) == "WATCH"
 
 
 def test_subscriber_lifecycle(conn):
