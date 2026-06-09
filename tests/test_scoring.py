@@ -134,6 +134,18 @@ def test_cycle_multiplier_bounds_and_peak():
         assert 0.9 <= m <= 1.1
 
 
+def test_cycle_multiplier_swing_and_killswitch():
+    ath = date(2025, 10, 6)
+    at = ath + timedelta(days=370)
+    far = ath + timedelta(days=370 + 2000)
+    # softer swing 0.05 -> band [0.95, 1.05]
+    assert scoring.cycle_multiplier(at, ath, 370, swing=0.05) == pytest.approx(1.05)
+    assert scoring.cycle_multiplier(far, ath, 370, swing=0.05) == pytest.approx(0.95)
+    # kill-switch: swing=0 -> always exactly 1.0 (timing off)
+    assert scoring.cycle_multiplier(at, ath, 370, swing=0.0) == pytest.approx(1.0)
+    assert scoring.cycle_multiplier(far, ath, 370, swing=0.0) == pytest.approx(1.0)
+
+
 # --- indicators_in_zone ------------------------------------------------------
 
 def test_indicators_in_zone_uses_labels():

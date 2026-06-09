@@ -13,7 +13,7 @@ import logging
 import sys
 from datetime import datetime, timezone
 
-from . import alerting, notify, scoring, store
+from . import alerting, notify, playbook, scoring, store
 from .config import Config, load_config
 from .sources import derivatives, etf_flows, funding, macro, onchain, price, sentiment
 
@@ -75,7 +75,17 @@ def run(cfg: Config, *, dry_run: bool = False) -> dict:
     # Score.
     subscores = scoring.score_indicators(readings)
     cat_scores = scoring.category_scores(subscores)
-    mult = scoring.cycle_multiplier(now.date(), cfg.ath_date, cfg.peak_to_trough_days)
+    # Cycle timing keys off the ATH derived from price history (config date is a
+    # fallback only), with a soft, config-tunable swing.
+    ath = cfg.ath_date
+    ath_iso = price_struct.get("ath_date")
+    if ath_iso:
+        try:
+            ath = datetime.strptime(ath_iso, "%Y-%m-%d").date()
+        except (ValueError, TypeError):
+            pass
+    mult = scoring.cycle_multiplier(now.date(), ath, cfg.peak_to_trough_days,
+                                    swing=cfg.cycle_mult_swing)
     composite_score, active_cats = scoring.composite(cat_scores, cfg.weights, mult)
     current_tier = scoring.tier(
         composite_score, price_struct["price"], price_struct.get("wma200"),
@@ -104,10 +114,32 @@ def run(cfg: Config, *, dry_run: bool = False) -> dict:
         flash_now, decisions,
     )
 
+    # Playbook (illustrative, display-only): conviction-scaled ladder, unified
+    # "what to do now", and "what changed since the last alert".
+    conv = playbook.conviction(composite_score, current_tier,
+                               cfg.tier_watch, cfg.tier_accumulate, cfg.tier_deepvalue)
+    rr = readings.get("realized_ratio")
+    realized_price = (price_struct["price"] / rr) if (rr and price_struct.get("price")) else None
+    plan = playbook.laddering_plan(
+        composite=composite_score, tier=current_tier, conviction_=conv,
+        price=price_struct.get("price"), wma200=price_struct.get("wma200"),
+        realized_price=realized_price, atr_daily=None)
+    st_sig = store.latest_st_signal(conn)
+    what_to_do = playbook.what_to_do_now(
+        long_tier=current_tier, long_conviction=conv,
+        st_state=(st_sig or {}).get("st_state"), st_triggers=[])
+    prev_alert = store.last_alerted_run(conn)
+    prev_for_diff = ({"composite": prev_alert["composite"], "tier": prev_alert["tier"],
+                      "subscores": (prev_alert.get("readings") or {}).get("subscores"),
+                      "run_ts": prev_alert["run_ts"]} if prev_alert else None)
+    changed = alerting.diff_since(
+        prev_for_diff, {"composite": composite_score, "tier": current_tier, "subscores": subscores})
+
     # Notify.
     msg_kwargs = dict(composite=composite_score, tier=current_tier, subscores=subscores,
                       price_struct=price_struct, readings=readings, active_cats=active_cats,
-                      onchain_active=cfg.onchain_active)
+                      onchain_active=cfg.onchain_active,
+                      changed=changed, what_to_do=what_to_do, plan=plan)
     if decisions["tier_alert"]:
         title, body = alerting.build_tier_message(**msg_kwargs)
         if dry_run:
@@ -128,6 +160,10 @@ def run(cfg: Config, *, dry_run: bool = False) -> dict:
         "subscores": subscores,
         "category_scores": cat_scores,
         "cycle_multiplier": mult,
+        "conviction": conv,
+        "playbook": plan,
+        "what_to_do": what_to_do,
+        "changed": changed,
     }
     if not dry_run:
         store.record_run(
@@ -155,6 +191,10 @@ def run(cfg: Config, *, dry_run: bool = False) -> dict:
         "subscores": subscores,
         "category_scores": cat_scores,
         "price_struct": price_struct,
+        "conviction": conv,
+        "playbook": plan,
+        "what_to_do": what_to_do,
+        "changed": changed,
     }
 
 

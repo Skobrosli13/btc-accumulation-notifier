@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from . import scoring
+from . import scoring, shortterm
 from .config import Config
 
 # Free-tier flash proxies (the spec's "sharp funding + OI flush proxy").
@@ -120,7 +120,8 @@ def _common_lines(*, composite: float, tier: str, subscores: dict,
 
 def build_tier_message(*, composite: float, tier: str, subscores: dict,
                        price_struct: dict, readings: dict, active_cats: list[str],
-                       onchain_active: bool) -> tuple[str, str]:
+                       onchain_active: bool, changed: dict | None = None,
+                       what_to_do: dict | None = None, plan: dict | None = None) -> tuple[str, str]:
     """Return (title, body) for a tier-transition alert."""
     label = TIER_LABELS.get(tier, tier)
     headline = TIER_HEADLINES.get(tier, "")
@@ -129,12 +130,16 @@ def build_tier_message(*, composite: float, tier: str, subscores: dict,
     body_lines += _common_lines(composite=composite, tier=tier, subscores=subscores,
                                 price_struct=price_struct, readings=readings,
                                 active_cats=active_cats, onchain_active=onchain_active)
+    pb = _playbook_lines(changed, what_to_do, plan)
+    if pb:
+        body_lines += ["", *pb]
     return title, "\n".join(body_lines)
 
 
 def build_flash_message(*, composite: float, tier: str, subscores: dict,
                         price_struct: dict, readings: dict, active_cats: list[str],
-                        onchain_active: bool) -> tuple[str, str]:
+                        onchain_active: bool, changed: dict | None = None,
+                        what_to_do: dict | None = None, plan: dict | None = None) -> tuple[str, str]:
     """Return (title, body) for an acute-capitulation flash alert."""
     drop = readings.get("drop_24_48h_pct")
     fng = readings.get("fng")
@@ -151,10 +156,55 @@ def build_flash_message(*, composite: float, tier: str, subscores: dict,
     body_lines += _common_lines(composite=composite, tier=tier, subscores=subscores,
                                 price_struct=price_struct, readings=readings,
                                 active_cats=active_cats, onchain_active=onchain_active)
+    pb = _playbook_lines(changed, what_to_do, plan)
+    if pb:
+        body_lines += ["", *pb]
     return title, "\n".join(body_lines)
 
 
 # --- Short-term swing alerts -------------------------------------------------
+
+def diff_since(prev: dict | None, cur: dict) -> dict | None:
+    """'What changed' between the last alerted run and now. prev/cur each carry
+    {composite, tier, subscores}. None when there's no prior alert to diff against."""
+    if not prev:
+        return None
+    prev_zone = set(scoring.indicators_in_zone(prev.get("subscores") or {}))
+    cur_zone = set(scoring.indicators_in_zone(cur.get("subscores") or {}))
+    return {
+        "composite_delta": round((cur.get("composite") or 0.0) - (prev.get("composite") or 0.0), 1),
+        "tier_from": prev.get("tier"),
+        "tier_to": cur.get("tier"),
+        "newly_in_zone": sorted(cur_zone - prev_zone),
+        "dropped_out": sorted(prev_zone - cur_zone),
+        "since": prev.get("run_ts"),
+    }
+
+
+def _playbook_lines(changed: dict | None, what_to_do: dict | None,
+                    plan: dict | None) -> list[str]:
+    """Render the playbook blocks for an email body (omitted sections stay quiet)."""
+    lines: list[str] = []
+    if changed:
+        d = changed["composite_delta"]
+        parts = [f"What changed: composite {d:+.1f}"]
+        if changed["tier_from"] != changed["tier_to"]:
+            parts.append(f"tier {changed['tier_from']}→{changed['tier_to']}")
+        if changed["newly_in_zone"]:
+            parts.append("new in-zone: " + ", ".join(changed["newly_in_zone"]))
+        if changed["dropped_out"]:
+            parts.append("left zone: " + ", ".join(changed["dropped_out"]))
+        lines.append(". ".join(parts) + ".")
+    if what_to_do:
+        lines.append(f"What to do now: {what_to_do['stance']} — {what_to_do['suggested_action']} "
+                     f"({what_to_do['rationale']})")
+    if plan and plan.get("tranches"):
+        ladder = "; ".join(f"{t['label']} ~{t['pct']:.0f}%"
+                           + (f" @ ${t['price']:,.0f}" if t['label'] != 'now' else "")
+                           for t in plan["tranches"])
+        lines.append(f"Illustrative ladder ({plan['deploy_now_pct']:.0f}% now): {ladder}")
+    return lines
+
 
 def is_counter_trend(direction: str, state: str) -> bool:
     """A trigger is counter-trend when it points against the regime bias — a BUY in
@@ -213,6 +263,10 @@ def build_st_message(*, trigger, timeframe: str, score: float, state: str,
     atr_pct = indicators.get("atr_pct")
     if atr_pct is not None:
         lines.append(f"ATR: {atr_pct:.1f}% (volatility)")
+    lv = shortterm.trade_levels(trigger.direction, price, indicators.get("atr"))
+    if lv:
+        lines.append(f"ATR risk frame (illustrative): stop ${lv['stop']:,.0f} / "
+                     f"target ${lv['target']:,.0f}" + (f" (~{lv['rr']}R)" if lv["rr"] else ""))
 
     lines.append("")
     lines.append("Short-term swing timing - separate from the long-term accumulation thesis.")

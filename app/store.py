@@ -339,6 +339,23 @@ def recent_run_alerts(conn: sqlite3.Connection, limit: int = 20) -> list[dict]:
     return out
 
 
+def last_alerted_run(conn: sqlite3.Connection) -> dict | None:
+    """Most recent run that fired a tier/flash alert, parsed — for the 'what changed
+    since the last alert' diff. None if no alert has ever fired."""
+    row = conn.execute(
+        "SELECT run_ts, composite, tier, readings_json FROM runs "
+        "WHERE tier_alerted = 1 OR flash_alerted = 1 ORDER BY run_ts DESC LIMIT 1"
+    ).fetchone()
+    if not row:
+        return None
+    d = dict(row)
+    try:
+        d["readings"] = json.loads(d.pop("readings_json") or "{}")
+    except (json.JSONDecodeError, TypeError):
+        d["readings"] = {}
+    return d
+
+
 def last_collect_ts(conn: sqlite3.Connection) -> datetime | None:
     """Wall-clock time of the most recent collection (for the watchdog).
 

@@ -6,13 +6,20 @@ via ``linear_score``. Category scores are the mean of their available
 sub-scores; the composite is a weight-renormalized sum scaled by a cycle-timing
 multiplier and clamped to 0-100.
 
-Thresholds below are *starting defaults* (n=3 cycles — expect imperfection).
-They live here in one place so they are easy to tune and so ``scripts/backtest.py``
-can import and sanity-check them against history.
+Sub-scores come from one of two mappings, per indicator:
+  * **percentile-rank** against history when ``app/calibration.json`` carries
+    breakpoints for that indicator (empirical, regime-adaptive); else
+  * the fixed ``THRESHOLDS`` ``linear_score`` (economic-logic defaults).
+``scripts/calibrate.py`` emits the calibration file offline; the live path only
+does a pure interpolation lookup. With no calibration file present the scoring is
+byte-identical to the legacy threshold behavior.
 """
 from __future__ import annotations
 
+import bisect
+import json
 from datetime import date
+from pathlib import Path
 
 # --- Per-indicator thresholds: (neutral, extreme) -----------------------------
 # Read linear_score's docstring: for "lower = more bullish" metrics neutral > extreme;
@@ -42,6 +49,14 @@ THRESHOLDS: dict[str, dict[str, float]] = {
     "liq_magnitude":   {"neutral": 0.0,   "extreme": 2.0},      # $bn 24h aggregate liqs; large -> capitulation (higher)
 }
 
+# Direction of each indicator, derived from its threshold ordering (single source
+# of truth, reused by the calibrator + the percentile mapping):
+#   lower value = more bullish  <=> neutral > extreme.
+DIRECTION: dict[str, str] = {
+    name: ("lower_bullish" if th["neutral"] > th["extreme"] else "higher_bullish")
+    for name, th in THRESHOLDS.items()
+}
+
 # Which indicators belong to which category.
 CATEGORY_INDICATORS: dict[str, list[str]] = {
     "onchain":   ["mvrv_z", "realized_ratio", "nupl", "sopr", "puell"],
@@ -49,6 +64,22 @@ CATEGORY_INDICATORS: dict[str, list[str]] = {
     "macro":     ["m2_yoy", "hy_spread", "real_yield", "etf_flow"],
     "sentiment": ["fng"],
     "derivs":    ["funding", "oi_flush", "liq_magnitude"],
+}
+
+# Highly-correlated indicators that measure the same thing — each group collapses
+# to ONE term in its category mean (average-then-count-once) so the duplicated
+# signal isn't double-counted. Members stay individually visible in the breakdown.
+REDUNDANCY_GROUPS: dict[str, list[list[str]]] = {
+    "onchain": [["mvrv_z", "nupl", "realized_ratio"]],  # realized-value valuation (~0.9 corr)
+    "price":   [["price_to_wma200", "mayer"]],           # both price-vs-long-MA (~0.99 corr)
+}
+
+# Reverse lookup: indicator -> its group's representative key (for breakdown tagging).
+INDICATOR_GROUP: dict[str, str] = {
+    member: group[0]
+    for groups in REDUNDANCY_GROUPS.values()
+    for group in groups
+    for member in group
 }
 
 # Human-readable labels for alert text.
@@ -74,8 +105,66 @@ INDICATOR_LABELS: dict[str, str] = {
 IN_ZONE_THRESHOLD = 0.6
 
 # Cycle-timing multiplier: beyond this many days from the typical bottom window
-# the multiplier bottoms out at 0.9.
-CYCLE_WINDOW_HALFWIDTH_DAYS = 200
+# the multiplier bottoms out. Widened to 300 — cycle timing is a soft prior, not a
+# clock (the 4-year cadence is looser in the ETF era).
+CYCLE_WINDOW_HALFWIDTH_DAYS = 300
+
+
+# --- Calibration (offline-computed percentile breakpoints) -------------------
+
+_CALIB: dict | None = None  # module cache so the live path stays pure (one read)
+
+
+def _load_calibration() -> dict:
+    """Load app/calibration.json once (cached). Missing/invalid -> {} (fallback)."""
+    global _CALIB
+    if _CALIB is None:
+        try:
+            _CALIB = json.loads(Path(__file__).with_name("calibration.json").read_text())
+        except (OSError, json.JSONDecodeError):
+            _CALIB = {}
+    return _CALIB
+
+
+def set_calibration(calib: dict | None) -> None:
+    """Inject calibration (tests) or reset to re-read the file on next access (None)."""
+    global _CALIB
+    _CALIB = calib
+
+
+def percentile_score(value: float, breakpoints: list[float], probs: list[float],
+                     direction: str) -> float | None:
+    """Map a raw value to [0,1] by its empirical percentile vs ``breakpoints``.
+
+    ``breakpoints[i]`` is the historical value at quantile ``probs[i]`` (both
+    ascending). Interpolates the percentile of ``value`` and flips it for
+    'lower_bullish' metrics (low value -> high score). Pure arithmetic.
+    """
+    if not breakpoints or not probs or len(breakpoints) != len(probs):
+        return None
+    if value <= breakpoints[0]:
+        p = probs[0]
+    elif value >= breakpoints[-1]:
+        p = probs[-1]
+    else:
+        i = bisect.bisect_right(breakpoints, value)  # breakpoints[i-1] <= value < breakpoints[i]
+        lo_v, hi_v = breakpoints[i - 1], breakpoints[i]
+        lo_p, hi_p = probs[i - 1], probs[i]
+        frac = (value - lo_v) / (hi_v - lo_v) if hi_v > lo_v else 0.0
+        p = lo_p + frac * (hi_p - lo_p)
+    score = (1.0 - p) if direction == "lower_bullish" else p
+    return max(0.0, min(1.0, score))
+
+
+def rank_score(history: list[float], value: float, direction: str) -> float | None:
+    """Percentile RANK of ``value`` within ``history`` (fraction <= value), flipped
+    for direction. The calibration backtest passes the EXPANDING [start..t] slice so
+    a historical day is scored only against its own past — no look-ahead bias."""
+    if not history:
+        return None
+    p = sum(1 for h in history if h <= value) / len(history)
+    score = (1.0 - p) if direction == "lower_bullish" else p
+    return max(0.0, min(1.0, score))
 
 
 # --- Reference helpers (implemented as written in the spec) -------------------
@@ -123,40 +212,76 @@ def tier(score: float, price: float, wma200: float | None,
 # --- Built on top of the reference helpers -----------------------------------
 
 def score_indicators(readings: dict[str, float | None]) -> dict[str, float | None]:
-    """Map raw indicator readings to [0,1] sub-scores using THRESHOLDS.
+    """Map raw indicator readings to [0,1] sub-scores.
 
-    A missing key or a None value yields a None sub-score (treated as
-    unavailable downstream). Unknown keys in ``readings`` are ignored.
+    Uses the calibrated percentile mapping when ``calibration.json`` carries
+    breakpoints for the indicator, else the fixed ``THRESHOLDS`` linear_score.
+    A missing key or None value yields a None sub-score (unavailable downstream).
+    Unknown keys in ``readings`` are ignored.
     """
+    calib = _load_calibration()
+    cal_inds = calib.get("indicators", {})
+    default_probs = calib.get("probs")
+
     out: dict[str, float | None] = {}
     for name, th in THRESHOLDS.items():
         value = readings.get(name)
         if value is None:
             out[name] = None
+            continue
+        c = cal_inds.get(name)
+        probs = (c.get("probs") if c else None) or default_probs
+        if c and probs:
+            out[name] = percentile_score(
+                float(value), c["breakpoints"], probs,
+                c.get("direction", DIRECTION.get(name, "higher_bullish")))
         else:
             out[name] = linear_score(float(value), th["neutral"], th["extreme"])
     return out
 
 
+def _category_terms(cat: str, inds: list[str],
+                    subscores: dict[str, float | None]) -> list[float]:
+    """Per-category list of available terms, with each redundancy group collapsed
+    to ONE term (mean of its available members) so correlated indicators don't
+    double-count. Ungrouped indicators are each their own term."""
+    groups = REDUNDANCY_GROUPS.get(cat, [])
+    grouped = {m for g in groups for m in g}
+    terms: list[float] = []
+    for g in groups:
+        vals = [subscores.get(m) for m in g if subscores.get(m) is not None]
+        if vals:
+            terms.append(sum(vals) / len(vals))
+    for ind in inds:
+        if ind not in grouped and subscores.get(ind) is not None:
+            terms.append(subscores[ind])
+    return terms
+
+
 def category_scores(subscores: dict[str, float | None]) -> dict[str, float | None]:
-    """Aggregate per-indicator sub-scores into per-category scores."""
-    return {
-        cat: category_score({ind: subscores.get(ind) for ind in inds})
-        for cat, inds in CATEGORY_INDICATORS.items()
-    }
+    """Aggregate per-indicator sub-scores into per-category scores, collapsing
+    redundancy groups to a single term (see REDUNDANCY_GROUPS)."""
+    out: dict[str, float | None] = {}
+    for cat, inds in CATEGORY_INDICATORS.items():
+        terms = _category_terms(cat, inds, subscores)
+        out[cat] = (sum(terms) / len(terms)) if terms else None
+    return out
 
 
 def cycle_multiplier(today: date, ath_date: date, peak_to_trough_days: int,
-                     halfwidth_days: int = CYCLE_WINDOW_HALFWIDTH_DAYS) -> float:
-    """Context-only multiplier in [0.9, 1.1] from proximity to the typical bottom window.
+                     halfwidth_days: int = CYCLE_WINDOW_HALFWIDTH_DAYS,
+                     swing: float = 0.1) -> float:
+    """Context-only multiplier in [1-swing, 1+swing] from proximity to the typical
+    bottom window.
 
-    Closer to (ath_date + peak_to_trough_days) -> toward 1.1; far -> toward 0.9.
+    Closer to (ath_date + peak_to_trough_days) -> toward 1+swing; far -> toward
+    1-swing. ``swing=0`` disables timing entirely (always 1.0) — the kill-switch.
     This only *weights* confluence; it never creates a signal on its own.
     """
     days_since_peak = (today - ath_date).days
     distance = abs(days_since_peak - peak_to_trough_days)
     frac = min(1.0, distance / max(1, halfwidth_days))
-    return 1.1 - 0.2 * frac
+    return (1.0 + swing) - 2.0 * swing * frac
 
 
 def indicators_in_zone(subscores: dict[str, float | None],

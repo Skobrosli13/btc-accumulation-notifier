@@ -16,7 +16,7 @@ _BASE = dict(
     weights={"onchain": 0.35, "price": 0.20, "macro": 0.20, "sentiment": 0.10, "derivs": 0.15},
     tier_watch=40, tier_accumulate=60, tier_deepvalue=80,
     flash_fng_max=10, flash_drop_pct=10, flash_debounce_days=3,
-    ath_date=date(2025, 10, 6), peak_to_trough_days=370,
+    ath_date=date(2025, 10, 6), peak_to_trough_days=370, cycle_mult_swing=0.05,
     st_timeframes=("4h", "1d"), st_cooldown_hours=12,
     st_rsi_oversold=30, st_rsi_overbought=70, st_vol_spike_mult=2.0,
     st_funding_spike=0.0005, st_oi_surge_pct=10.0,

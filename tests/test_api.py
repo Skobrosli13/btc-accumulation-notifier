@@ -75,6 +75,9 @@ def test_longterm_latest(client):
     assert {c["key"] for c in bd["categories"]} == {"onchain", "price", "macro", "sentiment", "derivs"}
     price_cat = next(c for c in bd["categories"] if c["key"] == "price")
     assert price_cat["active"] is True and price_cat["weight"] == 0.20
+    # redundancy grouping is surfaced: price/200WMA + Mayer share a group
+    p2w = next(i for i in price_cat["indicators"] if i["key"] == "price_to_wma200")
+    assert p2w["group"] == "price_to_wma200"
     assert "Fear & Greed" in bd["in_zone"]              # fng subscore 0.84 >= 0.6
     assert bd["levels"]["wma200_rel"] == "above"        # price 63000 > wma200 62000
     assert bd["cycle"]["multiplier"] == 0.975 and "days_since_ath" in bd["cycle"]
@@ -108,6 +111,20 @@ def test_alerts_feed(client):
     assert lt["reason"]["type"] == "tier"
     assert "Fear & Greed" in lt["reason"]["in_zone"]
     assert "readings" not in lt          # bulky readings stripped from payload
+
+
+def test_playbook_endpoint(client):
+    assert client.get("/api/playbook").status_code == 401   # token-gated
+    j = client.get("/api/playbook", headers=_auth()).json()
+    assert "playbook" in j and "what_to_do" in j and "tier" in j
+
+
+def test_track_record(client):
+    assert client.get("/api/track_record").status_code == 401   # token-gated
+    j = client.get("/api/track_record", headers=_auth()).json()
+    assert "available" in j
+    if j["available"]:
+        assert "horizons" in j and isinstance(j["horizons"], dict)
 
 
 def test_subscribe_unsubscribe_flow(tmp_path):

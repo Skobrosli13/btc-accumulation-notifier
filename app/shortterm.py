@@ -246,6 +246,25 @@ def st_state(score: float, cfg: Config) -> str:
     return "NEUTRAL"
 
 
+def trade_levels(direction: str, price: float | None, atr: float | None,
+                 k_stop: float = 1.5, k_target: float = 2.5) -> dict | None:
+    """ATR-based stop/target for a swing trigger (uses the otherwise-unused ATR).
+
+    BUY: stop = price - k_stop*ATR, target = price + k_target*ATR (SELL mirrored).
+    Returns None when price/ATR are unavailable. Illustrative risk frame, not advice.
+    """
+    if price is None or atr is None or atr <= 0:
+        return None
+    if direction == "BUY":
+        stop, target = price - k_stop * atr, price + k_target * atr
+    else:
+        stop, target = price + k_stop * atr, price - k_target * atr
+    risk = abs(price - stop)
+    rr = round(abs(target - price) / risk, 2) if risk else None
+    return {"stop": round(stop, 2), "target": round(target, 2), "rr": rr,
+            "atr": round(atr, 2)}
+
+
 def evaluate(df: pd.DataFrame, cfg: Config, funding: float | None = None,
              oi_chg_pct: float | None = None) -> dict:
     """One-call evaluation for the collector: indicators + composite + state +

@@ -104,6 +104,17 @@ def _from_bitcoin_data(price: float | None) -> dict:
     return out
 
 
+def history(slug: str) -> list[dict]:
+    """Full daily series for a bitcoin-data.com metric (OFFLINE calibration only).
+
+    GET /v1/<slug> (no /last) -> [{"d","unixTs","<field>":v}, ...]. Returns [] on
+    failure. Rate-limited (~10 req/hr) — NEVER call from the live run/collect/api
+    paths; only scripts/calibrate.py uses this.
+    """
+    data = get_json(f"{BITCOIN_DATA_BASE}/{slug}")
+    return data if isinstance(data, list) else []
+
+
 def onchain(price: float | None = None) -> dict:
     """On-chain readings keyed for the scorer.
 

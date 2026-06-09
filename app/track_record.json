@@ -1,0 +1,28 @@
+{
+  "generated_at": "2026-06-09T15:14:31.968453+00:00",
+  "method": "price+macro backbone, expanding-window percentile, timing-neutral",
+  "weeks": 337,
+  "from": "2019-12-30",
+  "to": "2026-06-08",
+  "signal_weeks": 18,
+  "horizons": {
+    "13w": {
+      "signal_hit_rate": 0.944,
+      "base_rate": 0.568
+    },
+    "26w": {
+      "signal_hit_rate": 1.0,
+      "base_rate": 0.669
+    },
+    "52w": {
+      "signal_hit_rate": 1.0,
+      "base_rate": 0.649
+    }
+  },
+  "caveats": [
+    "Backbone only: price-vs-200WMA + macro (the deep multi-cycle indicators).",
+    "On-chain (~2022+), sentiment, derivatives use economic thresholds and are NOT in this test.",
+    "Timing multiplier neutralized; cycle context excluded.",
+    "Past behavior is not a forecast."
+  ]
+}

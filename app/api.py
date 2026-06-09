@@ -13,11 +13,13 @@ Run:  uvicorn app.api:app --host 127.0.0.1 --port 8000
 """
 from __future__ import annotations
 
+import json
 import re
 import secrets
 import sqlite3
 from datetime import datetime, timezone
 from functools import lru_cache
+from pathlib import Path
 
 import pandas as pd
 from fastapi import (BackgroundTasks, Depends, FastAPI, Header, HTTPException,
@@ -133,6 +135,23 @@ def health(cfg: Config = Depends(get_config), _=Depends(require_token)) -> dict:
     return out
 
 
+@lru_cache(maxsize=1)
+def _track_record_data() -> dict:
+    """Read app/track_record.json once (emitted by scripts/calibrate.py). {} if absent."""
+    try:
+        return json.loads(Path(__file__).with_name("track_record.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+@app.get("/api/track_record")
+def track_record(_=Depends(require_token)) -> dict:
+    """Historical forward-return hit-rate of the percentile backbone (illustrative,
+    not a forecast). {"available": false} until the calibration script has run."""
+    tr = _track_record_data()
+    return {"available": True, **tr} if tr else {"available": False}
+
+
 def _lt_breakdown(latest: dict, cfg: Config) -> dict:
     """Display-ready decomposition of the latest long-term run (reuses scoring labels)."""
     readings = latest.get("readings") or {}
@@ -156,6 +175,9 @@ def _lt_breakdown(latest: dict, cfg: Config) -> dict:
                 "subscore": subs.get(k),
                 "raw": raw.get(k),
                 "in_zone": (subs.get(k) is not None and subs.get(k) >= scoring.IN_ZONE_THRESHOLD),
+                # representative key when k is part of a redundancy group (else None);
+                # members of the same group count once toward the category score.
+                "group": scoring.INDICATOR_GROUP.get(k),
             } for k in inds],
         })
 
@@ -169,9 +191,16 @@ def _lt_breakdown(latest: dict, cfg: Config) -> dict:
         "drop_24_48h_pct": ps.get("drop_24_48h_pct"), "source": ps.get("source"),
     }
 
-    days_since_ath = (datetime.now(timezone.utc).date() - cfg.ath_date).days
+    ath_d = cfg.ath_date
+    if ps.get("ath_date"):
+        try:
+            ath_d = datetime.strptime(ps["ath_date"], "%Y-%m-%d").date()
+        except (ValueError, TypeError):
+            pass
+    days_since_ath = (datetime.now(timezone.utc).date() - ath_d).days
     cycle = {
-        "ath_date": cfg.ath_date.isoformat(),
+        "ath_date": ath_d.isoformat(),
+        "ath_price": ps.get("ath_price"),
         "days_since_ath": days_since_ath,
         "typical_days": cfg.peak_to_trough_days,
         "window_lo": cfg.peak_to_trough_days - scoring.CYCLE_WINDOW_HALFWIDTH_DAYS,
@@ -187,6 +216,8 @@ def _lt_breakdown(latest: dict, cfg: Config) -> dict:
         "cycle": cycle,
         "tiers": {"watch": cfg.tier_watch, "accumulate": cfg.tier_accumulate,
                   "deep_value": cfg.tier_deepvalue},
+        "playbook": readings.get("playbook"),
+        "what_to_do": readings.get("what_to_do"),
     }
 
 
@@ -200,6 +231,21 @@ def longterm_latest(cfg: Config = Depends(get_config), _=Depends(require_token))
     if latest:
         latest["breakdown"] = _lt_breakdown(latest, cfg)
     return {"latest": latest}
+
+
+@app.get("/api/playbook")
+def playbook_latest(cfg: Config = Depends(get_config), _=Depends(require_token)) -> dict:
+    """The latest run's illustrative playbook — ladder + unified 'what to do now'."""
+    conn = _conn(cfg)
+    try:
+        latest = store.latest_run(conn)
+    finally:
+        conn.close()
+    readings = (latest or {}).get("readings") or {}
+    return {"tier": (latest or {}).get("tier"),
+            "conviction": readings.get("conviction"),
+            "playbook": readings.get("playbook"),
+            "what_to_do": readings.get("what_to_do")}
 
 
 @app.get("/api/price")
@@ -244,9 +290,12 @@ def _enrich_st(conn, cfg: Config, sig: dict | None, tf: str,
         sig["components"] = [{"key": k, "label": _COMPONENT_LABELS.get(k, k), "value": v}
                              for k, v in comps.items()]
         state = sig.get("st_state", "NEUTRAL")
+        st_price = sig.get("price")
+        atr = (sig.get("indicators") or {}).get("atr")
         sig["triggers"] = [{
             "key": t.key, "direction": t.direction, "label": t.label, "detail": t.detail,
             "counter_trend": alerting.is_counter_trend(t.direction, state),
+            "levels": shortterm.trade_levels(t.direction, st_price, atr),
         } for t in shortterm.detect_triggers(df, cfg, funding, oi_chg_pct)]
     except Exception:  # noqa: BLE001 - never 500 the dashboard over a recompute
         pass
@@ -324,6 +373,7 @@ def _lt_alert_reason(row: dict) -> dict:
         "levels": {"price_to_wma200": ps.get("price_to_wma200"),
                    "realized_ratio": raw.get("realized_ratio"),
                    "mayer": ps.get("mayer_multiple")},
+        "changed": readings.get("changed"),
     }
 
 

@@ -88,6 +88,15 @@ def price_structure(symbol: str = "BTC-USDT", prefer: str = "okx") -> dict:
     wma200 = float(weekly["close"].tail(200).mean()) if len(weekly) >= 200 else None
     dma200 = float(daily["close"].tail(200).mean()) if len(daily) >= 200 else None
 
+    # Derive the cycle ATH from the deepest available close history (weekly reaches
+    # ~2013 via Kraken) so cycle timing isn't pinned to a hardcoded config date.
+    ath_price = ath_date = None
+    deep = weekly if len(weekly) >= len(daily) else daily
+    if not deep.empty and "open_time" in deep.columns:
+        imax = int(deep["close"].idxmax())
+        ath_price = float(deep["close"].iloc[imax])
+        ath_date = deep["open_time"].iloc[imax].date().isoformat()
+
     drop = None
     if len(daily) >= 3:
         drop = float((daily["close"].iloc[-1] / daily["close"].iloc[-3] - 1) * -100)
@@ -99,5 +108,7 @@ def price_structure(symbol: str = "BTC-USDT", prefer: str = "okx") -> dict:
         "price_to_wma200": (price / wma200) if wma200 else None,
         "mayer_multiple": (price / dma200) if dma200 else None,
         "drop_24_48h_pct": drop,
+        "ath_price": ath_price,
+        "ath_date": ath_date,
         "source": source,
     }

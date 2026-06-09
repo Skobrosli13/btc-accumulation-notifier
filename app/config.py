@@ -123,8 +123,9 @@ class Config:
     flash_debounce_days: int
 
     # Cycle context
-    ath_date: date
+    ath_date: date            # fallback only; the live ATH is derived from price history
     peak_to_trough_days: int
+    cycle_mult_swing: float   # +/- swing of the cycle-timing multiplier (0 = timing off)
 
     # Short-term swing config
     st_timeframes: tuple[str, ...]   # e.g. ("4h", "1d")
@@ -232,6 +233,7 @@ def load_config() -> Config:
         flash_debounce_days=_get_int("FLASH_DEBOUNCE_DAYS", 3),
         ath_date=_parse_date(_get("ATH_DATE", "2025-10-06"), date(2025, 10, 6)),
         peak_to_trough_days=_get_int("PEAK_TO_TROUGH_DAYS", 370),
+        cycle_mult_swing=_get_float("CYCLE_MULT_SWING", 0.05),
         st_timeframes=_get_tuple("ST_TIMEFRAMES", ("4h", "1d")),
         st_cooldown_hours=_get_float("ST_COOLDOWN_HOURS", 12),
         st_rsi_oversold=_get_float("ST_RSI_OVERSOLD", 30),
