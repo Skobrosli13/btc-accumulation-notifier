@@ -11,6 +11,7 @@ _BASE = dict(
     resend_api_key=None, email_from="onboarding@resend.dev", email_to=None,
     fred_api_key=None, glassnode_api_key=None, cryptoquant_api_key=None,
     coinglass_api_key=None, sosovalue_api_key=None,
+    onchain_free_enabled=True, oi_flush_window_hours=24.0,
     exchange="okx", symbol="BTC-USDT", db_path=":memory:",
     weights={"onchain": 0.35, "price": 0.20, "macro": 0.20, "sentiment": 0.10, "derivs": 0.15},
     tier_watch=40, tier_accumulate=60, tier_deepvalue=80,

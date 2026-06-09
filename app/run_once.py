@@ -57,6 +57,21 @@ def run(cfg: Config, *, dry_run: bool = False) -> dict:
 
     readings, price_struct = gather_readings(cfg)
 
+    # SQLite is the only state; open it now — used both to derive the free
+    # oi_flush below (before scoring) and for the ledger reads/writes later.
+    conn = store.connect(cfg.db_path)
+    store.init_db(conn)
+
+    # Free long-term oi_flush: % OI change over a window from the OKX open-interest
+    # the short-term collector already stores. Only when no paid Coinglass value
+    # was produced (don't clobber it). Needs ~1 window of collector history.
+    if readings.get("oi_flush") is None:
+        now_ms = int(now.timestamp() * 1000)
+        base = store.oi_at_or_before(conn, now_ms - int(cfg.oi_flush_window_hours * 3600_000))
+        cur = store.latest_oi(conn)
+        if base and cur:
+            readings["oi_flush"] = (cur / base - 1.0) * 100.0
+
     # Score.
     subscores = scoring.score_indicators(readings)
     cat_scores = scoring.category_scores(subscores)
@@ -68,8 +83,6 @@ def run(cfg: Config, *, dry_run: bool = False) -> dict:
     )
 
     # Decide (needs ledger state).
-    conn = store.connect(cfg.db_path)
-    store.init_db(conn)
     prev_tier = store.last_tier(conn)
     prev_flash_at = store.last_flash_at(conn)
     # Fresh acute funding/OI from the short-term collector (≤10min old) so the

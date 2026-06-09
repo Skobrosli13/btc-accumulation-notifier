@@ -110,6 +110,7 @@ def health(cfg: Config = Depends(get_config), _=Depends(require_token)) -> dict:
             "derivs_paid": cfg.derivs_paid_active,
             "email": cfg.email_active,
         },
+        "onchain_source": cfg.onchain_source,
         "db_ok": False,
         "last_collect": None,
         "last_run": None,

@@ -54,6 +54,17 @@ def test_st_alert_cooldown_memory(conn):
     assert store.last_st_alert(conn, "ema_cross_bull", "1d") is None
 
 
+def test_oi_helpers(conn):
+    assert store.latest_oi(conn) is None
+    assert store.oi_at_or_before(conn, _ms(2)) is None
+    store.record_derivs(conn, ts=_ms(1), funding=None, oi=1000.0, oi_chg_pct=None)
+    store.record_derivs(conn, ts=_ms(3), funding=None, oi=750.0, oi_chg_pct=None)
+    assert store.latest_oi(conn) == pytest.approx(750.0)            # newest sample
+    assert store.oi_at_or_before(conn, _ms(2)) == pytest.approx(1000.0)  # newest <= ts
+    assert store.oi_at_or_before(conn, _ms(3)) == pytest.approx(750.0)
+    assert store.oi_at_or_before(conn, _ms(1) - 1) is None          # nothing that old
+
+
 def test_derivs_and_signals_roundtrip(conn):
     store.record_derivs(conn, ts=_ms(1), funding=-0.0003, oi=1000.0, oi_chg_pct=5.0)
     assert store.recent_derivs(conn)[-1]["funding"] == pytest.approx(-0.0003)

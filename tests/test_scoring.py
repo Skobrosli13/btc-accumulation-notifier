@@ -27,6 +27,15 @@ def test_linear_score_higher_is_bullish():
     assert scoring.linear_score(4.0, neutral=0.0, extreme=8.0) == pytest.approx(0.5)
 
 
+def test_m2_yoy_recalibrated_band():
+    # Locks the recalibrated threshold (neutral=2, extreme=10): contraction scores
+    # ~0, typical ~5-6% lands mid-band, strong easing maxes out.
+    s = scoring.score_indicators
+    assert s({"m2_yoy": 0.0})["m2_yoy"] < 0.2
+    assert 0.3 < s({"m2_yoy": 6.0})["m2_yoy"] < 0.7
+    assert s({"m2_yoy": 10.0})["m2_yoy"] == pytest.approx(1.0)
+
+
 def test_linear_score_clamps_and_degenerate():
     assert scoring.linear_score(-5.0, neutral=2.0, extreme=0.0) == 1.0  # beyond extreme
     assert scoring.linear_score(99.0, neutral=2.0, extreme=0.0) == 0.0  # beyond neutral

@@ -63,6 +63,9 @@ def test_health_ok(client):
     assert j["db_ok"] is True
     assert j["exchange"] == "okx"
     assert "last_collect" in j and "layers" in j
+    # on-chain is free-by-default now -> active layer + reported source
+    assert j["layers"]["onchain"] is True
+    assert j["onchain_source"] == "bitcoin-data"
 
 
 def test_longterm_latest(client):

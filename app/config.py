@@ -59,6 +59,13 @@ def _get_int(name: str, default: int) -> int:
         return default
 
 
+def _get_bool(name: str, default: bool) -> bool:
+    raw = _get(name).lower()
+    if not raw:
+        return default
+    return raw not in ("0", "false", "no", "off")
+
+
 def _opt(name: str) -> str | None:
     """An optional secret: empty string -> None, so callers test truthiness."""
     val = _get(name)
@@ -93,6 +100,11 @@ class Config:
     cryptoquant_api_key: str | None
     coinglass_api_key: str | None
     sosovalue_api_key: str | None
+
+    # Free on-chain default (bitcoin-data.com / BGeometrics) — on unless disabled.
+    onchain_free_enabled: bool
+    # Window for the free OKX-OI-derived oi_flush (long-term derivs), in hours.
+    oi_flush_window_hours: float
 
     # Market data
     exchange: str          # okx (default) | kraken | binance (only from unrestricted regions)
@@ -141,7 +153,22 @@ class Config:
 
     @property
     def onchain_active(self) -> bool:
-        return bool(self.glassnode_api_key or self.cryptoquant_api_key)
+        # On-chain valuation is available for free (bitcoin-data.com) by default,
+        # so the layer is active unless the free feed is explicitly disabled and no
+        # paid key is set. CryptoQuant is excluded (unwired stub — returns no data).
+        # NOTE: this only drives health/messaging — scoring lights up purely from
+        # onchain() returning real numbers.
+        return bool(self.glassnode_api_key) or self.onchain_free_enabled
+
+    @property
+    def onchain_source(self) -> str | None:
+        """Which provider onchain() will actually use — kept aligned with the
+        precedence in app/sources/onchain.py so /api/health never lies."""
+        if self.glassnode_api_key:
+            return "glassnode"
+        if self.onchain_free_enabled:
+            return "bitcoin-data"
+        return None
 
     @property
     def email_active(self) -> bool:
@@ -185,6 +212,8 @@ def load_config() -> Config:
         cryptoquant_api_key=_opt("CRYPTOQUANT_API_KEY"),
         coinglass_api_key=_opt("COINGLASS_API_KEY"),
         sosovalue_api_key=_opt("SOSOVALUE_API_KEY"),
+        onchain_free_enabled=_get_bool("ONCHAIN_FREE", True),
+        oi_flush_window_hours=_get_float("OI_FLUSH_WINDOW_HOURS", 24.0),
         exchange=_get("EXCHANGE", "okx").lower(),
         symbol=_get("SYMBOL", "BTC-USDT"),
         db_path=_get("DB_PATH", "./btc.db"),

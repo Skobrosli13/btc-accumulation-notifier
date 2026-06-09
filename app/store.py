@@ -225,6 +225,28 @@ def recent_derivs(conn: sqlite3.Connection, limit: int = 200) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def latest_oi(conn: sqlite3.Connection) -> float | None:
+    """Most recent non-null open interest sample, or None."""
+    row = conn.execute(
+        "SELECT oi FROM derivs WHERE oi IS NOT NULL ORDER BY ts DESC LIMIT 1"
+    ).fetchone()
+    return row["oi"] if row else None
+
+
+def oi_at_or_before(conn: sqlite3.Connection, ts_ms: int) -> float | None:
+    """Open interest from the newest sample at or before ``ts_ms`` (epoch ms).
+
+    Timestamp-bounded (not count-based) so a baseline lookback tolerates the
+    10-min collector cadence and any gaps — used to derive a free long-term
+    ``oi_flush`` (% OI change over a window) when no paid Coinglass key is set.
+    """
+    row = conn.execute(
+        "SELECT oi FROM derivs WHERE ts <= ? AND oi IS NOT NULL ORDER BY ts DESC LIMIT 1",
+        (ts_ms,),
+    ).fetchone()
+    return row["oi"] if row else None
+
+
 # --- Short-term signals + alert cooldown -------------------------------------
 
 def record_st_signal(conn: sqlite3.Connection, *, ts: int, timeframe: str,

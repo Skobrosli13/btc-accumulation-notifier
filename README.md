@@ -37,11 +37,16 @@ watchdog(8h) ───┘                                                   └�
   HTTP-451 from US/AWS), **CoinGecko** last-resort price. See [app/sources/exchange.py](app/sources/exchange.py).
 - **Sentiment:** alternative.me Fear & Greed.
 - **Macro:** FRED (free key) — `M2`, real yields, HY spread.
-- **Paid drop-ins (optional, auto-activate when a key is set):** Glassnode (on-chain — biggest
-  long-term lever), Coinglass (real liquidations/OI), CryptoQuant.
+- **On-chain valuation:** **bitcoin-data.com / BGeometrics** (free, no key) — MVRV-Z, NUPL, SOPR,
+  Puell, realized price. The biggest long-term lever, now active on the free tier. Disable with
+  `ONCHAIN_FREE=false`. See [app/sources/onchain.py](app/sources/onchain.py).
+- **Long-term OI flush:** derived free from the OKX open-interest the collector already stores.
+- **Paid drop-ins (optional upgrades, auto-activate when a key is set):** Glassnode (7d-smoothed
+  on-chain), Coinglass (real liquidations / OI-weighted funding), CryptoQuant.
 
-> **Free-tier ceiling:** true liquidation-cascade + real-time order-flow are paid. The free tier
-> uses a funding/OI/volatility *proxy*; the dashboard health bar states this honestly.
+> **Free-tier ceiling:** only true liquidation-cascade + real-time order-flow remain paid (Coinglass).
+> The free tier uses a funding/OI/volatility *proxy* for those; the dashboard health bar states this
+> honestly. On-chain valuation is now fully available for free.
 
 ## Notifications
 

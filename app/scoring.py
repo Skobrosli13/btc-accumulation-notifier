@@ -28,7 +28,9 @@ THRESHOLDS: dict[str, dict[str, float]] = {
     "price_to_wma200": {"neutral": 1.10,  "extreme": 0.85},
     "mayer":           {"neutral": 1.0,   "extreme": 0.5},
     # Macro / liquidity
-    "m2_yoy":          {"neutral": 0.0,   "extreme": 8.0},    # % YoY; expanding -> bullish (higher)
+    # % YoY; expanding -> bullish (higher). Post-2010 US M2 YoY median ~5-6%;
+    # <2% (incl. 2023's negative prints) = tightening/risk-off; >10% = clear easing.
+    "m2_yoy":          {"neutral": 2.0,   "extreme": 10.0},
     "hy_spread":       {"neutral": 3.5,   "extreme": 8.0},    # OAS %; wide risk-off -> capitulation (higher)
     "real_yield":      {"neutral": 2.0,   "extreme": 0.0},    # %; falling -> bullish (lower)
     "etf_flow":        {"neutral": 0.0,   "extreme": 5.0},    # $bn 30d net; persistent inflows -> bullish (higher)
@@ -54,7 +56,7 @@ INDICATOR_LABELS: dict[str, str] = {
     "mvrv_z": "MVRV Z-Score",
     "realized_ratio": "Realized-price ratio",
     "nupl": "NUPL",
-    "sopr": "SOPR (7d)",
+    "sopr": "SOPR",
     "puell": "Puell Multiple",
     "price_to_wma200": "Price / 200-week MA",
     "mayer": "Mayer Multiple",

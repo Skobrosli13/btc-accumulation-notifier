@@ -84,10 +84,11 @@ def decide_alerts(current_tier: str, last_tier: str,
 
 def _data_tier_note(active_cats: list[str], onchain_active: bool) -> str:
     if onchain_active and "onchain" in active_cats:
-        return "Data tier: on-chain layer ACTIVE (full signal)."
-    return ("Data tier: running on free data only (on-chain valuation layer inactive - "
-            "the highest-signal bottom layer). Confidence leans on price-structure, "
-            "macro, and sentiment.")
+        return ("Data tier: on-chain valuation ACTIVE (free BGeometrics feed). "
+                "Only real liquidation-cascade / order-flow remains a paid gap.")
+    return ("Data tier: on-chain valuation layer inactive this run (free feed "
+            "unreachable - the highest-signal bottom layer). Confidence leans on "
+            "price-structure, macro, and sentiment.")
 
 
 def _common_lines(*, composite: float, tier: str, subscores: dict,
