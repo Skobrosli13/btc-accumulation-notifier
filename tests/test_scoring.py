@@ -215,6 +215,21 @@ def test_froth_in_zone_uses_labels():
     assert "Fear & Greed" not in out["in_zone"]
 
 
+def test_nan_readings_score_as_missing():
+    # NaN survives `is None` checks and clamps into a full 1.0 sub-score via
+    # min/max (a false maximal signal) — it must be treated as missing on BOTH
+    # the buy side and the froth side.
+    nan = float("nan")
+    assert scoring.score_indicators({"mvrv_z": nan})["mvrv_z"] is None
+    out = scoring.froth_score({"mvrv_z": nan})
+    assert out["score"] is None and out["in_zone"] == [] and out["active"] == 0
+    # mixed: NaN renormalizes away, finite values still score
+    mixed = scoring.froth_score({"mvrv_z": nan, "fng": 90.0})
+    assert mixed["score"] == pytest.approx(100.0) and mixed["active"] == 1
+    # non-numeric garbage is also missing, not a crash
+    assert scoring.score_indicators({"mvrv_z": "n/a"})["mvrv_z"] is None
+
+
 # --- flash + decide_alerts ---------------------------------------------------
 
 def _cfg(**over) -> Config:

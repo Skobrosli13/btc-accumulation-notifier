@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import bisect
 import json
+import math
 from datetime import date
 from pathlib import Path
 
@@ -263,6 +264,21 @@ def category_agreement(category_scores: dict[str, float | None]) -> dict | None:
 
 # --- Built on top of the reference helpers -----------------------------------
 
+def _finite(value) -> float | None:
+    """A reading is usable only if it's a finite number. NaN must map to None,
+    not flow into the scorers: ``min(1.0, nan)`` silently returns the bound, so
+    a NaN reading would otherwise clamp into a full 1.0 sub-score (a false
+    maximal signal). pandas-derived readings can carry NaN through the stored
+    JSON (Python's json emits/accepts bare ``NaN``)."""
+    if value is None:
+        return None
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    return v if math.isfinite(v) else None
+
+
 def score_indicators(readings: dict[str, float | None]) -> dict[str, float | None]:
     """Map raw indicator readings to [0,1] sub-scores.
 
@@ -277,7 +293,7 @@ def score_indicators(readings: dict[str, float | None]) -> dict[str, float | Non
 
     out: dict[str, float | None] = {}
     for name, th in THRESHOLDS.items():
-        value = readings.get(name)
+        value = _finite(readings.get(name))
         if value is None:
             out[name] = None
             continue
@@ -285,10 +301,10 @@ def score_indicators(readings: dict[str, float | None]) -> dict[str, float | Non
         probs = (c.get("probs") if c else None) or default_probs
         if c and probs:
             out[name] = percentile_score(
-                float(value), c["breakpoints"], probs,
+                value, c["breakpoints"], probs,
                 c.get("direction", DIRECTION.get(name, "higher_bullish")))
         else:
-            out[name] = linear_score(float(value), th["neutral"], th["extreme"])
+            out[name] = linear_score(value, th["neutral"], th["extreme"])
     return out
 
 
@@ -375,11 +391,11 @@ _TOP_GROUPS: list[list[str]] = [
 
 def froth_subscores(readings: dict[str, float | None]) -> dict[str, float | None]:
     """[0,1] overheat sub-scores via TOP_THRESHOLDS (no calibration on this side)."""
-    return {
-        name: (None if readings.get(name) is None
-               else linear_score(float(readings[name]), th["neutral"], th["extreme"]))
-        for name, th in TOP_THRESHOLDS.items()
-    }
+    out: dict[str, float | None] = {}
+    for name, th in TOP_THRESHOLDS.items():
+        value = _finite(readings.get(name))
+        out[name] = None if value is None else linear_score(value, th["neutral"], th["extreme"])
+    return out
 
 
 def froth_score(readings: dict[str, float | None]) -> dict:
