@@ -259,9 +259,34 @@ def _lt_breakdown(latest: dict, cfg: Config) -> dict:
         "multiplier": readings.get("cycle_multiplier"),
     }
 
+    # Sell-side overheat read (request-time, from the stored raw readings; the
+    # price-structure fields fall back to ps for runs recorded before they were
+    # mirrored into raw).
+    froth_input = dict(raw)
+    if froth_input.get("price_to_wma200") is None:
+        froth_input["price_to_wma200"] = ps.get("price_to_wma200")
+    if froth_input.get("mayer") is None:
+        froth_input["mayer"] = ps.get("mayer_multiple")
+    fr = scoring.froth_score(froth_input)
+    froth = {
+        "score": fr["score"],
+        "active": fr["active"],
+        "in_zone": fr["in_zone"],
+        "indicators": [{
+            "key": k,
+            "label": scoring.INDICATOR_LABELS.get(k, k),
+            "subscore": fr["subscores"].get(k),
+            "raw": froth_input.get(k),
+            "in_zone": (fr["subscores"].get(k) is not None
+                        and fr["subscores"][k] >= scoring.IN_ZONE_THRESHOLD),
+        } for k in scoring.TOP_THRESHOLDS],
+        "note": "heuristic top-signal — thresholds are not backtested/calibrated",
+    }
+
     return {
         "categories": categories,
         "in_zone": scoring.indicators_in_zone(subs),
+        "froth": froth,
         "levels": levels,
         "cycle": cycle,
         "tiers": {"watch": cfg.tier_watch, "accumulate": cfg.tier_accumulate,
@@ -284,6 +309,19 @@ def longterm_latest(cfg: Config = Depends(get_config), _=Depends(require_token))
     if latest:
         latest["breakdown"] = _lt_breakdown(latest, cfg)
     return {"latest": latest}
+
+
+@app.get("/api/longterm/history")
+def longterm_history(limit: int = Query(0, ge=0, le=5000),
+                     cfg: Config = Depends(get_config), _=Depends(require_token)) -> dict:
+    """Composite/tier per long-term run, oldest->newest — the score-over-time
+    series for the dashboard (streaks, cycle-best, trajectory). limit=0 -> all."""
+    conn = _conn(cfg)
+    try:
+        rows = store.run_history(conn, limit)
+    finally:
+        conn.close()
+    return {"runs": rows}
 
 
 @app.get("/api/playbook")

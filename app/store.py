@@ -453,6 +453,17 @@ def all_runs(conn: sqlite3.Connection) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def run_history(conn: sqlite3.Connection, limit: int = 0) -> list[dict]:
+    """(run_ts, composite, tier, price) oldest->newest — the dashboard's
+    score-over-time series. limit takes the most recent N; 0 = all (runs are a
+    6h cadence, so even years of history stay small)."""
+    sql = "SELECT run_ts, composite, tier, price FROM runs ORDER BY run_ts DESC"
+    rows = conn.execute(
+        sql + (" LIMIT ?" if limit else ""), ((limit,) if limit else ())
+    ).fetchall()
+    return [dict(r) for r in reversed(rows)]
+
+
 def last_alerted_run(conn: sqlite3.Connection) -> dict | None:
     """Most recent run that fired a tier/flash alert, parsed — for the 'what changed
     since the last alert' diff. None if no alert has ever fired."""

@@ -344,3 +344,63 @@ def indicators_in_zone(subscores: dict[str, float | None],
         for name, s in subscores.items()
         if s is not None and s >= threshold
     ]
+
+
+# --- Sell-side "froth" (overheat) score ---------------------------------------
+# Mirror of the buy-side mapping: the same VALUE indicators read at their
+# cycle-top extremes. Thresholds are heuristic cycle-top levels — the percentile
+# calibration covers the bottom side only, so this side is NOT calibrated or
+# backtested; any display must label it as such.
+TOP_THRESHOLDS: dict[str, dict[str, float]] = {
+    # On-chain valuation (higher = more frothy)
+    "mvrv_z":          {"neutral": 3.0,  "extreme": 7.0},
+    "realized_ratio":  {"neutral": 2.0,  "extreme": 3.5},
+    "nupl":            {"neutral": 0.5,  "extreme": 0.75},
+    "sopr":            {"neutral": 1.05, "extreme": 1.15},
+    "puell":           {"neutral": 1.5,  "extreme": 4.0},
+    # Price structure
+    "price_to_wma200": {"neutral": 1.5,  "extreme": 3.0},
+    "mayer":           {"neutral": 1.5,  "extreme": 2.4},
+    # Sentiment
+    "fng":             {"neutral": 60.0, "extreme": 90.0},
+}
+
+# Correlated families collapsed to one term in the froth mean — same families as
+# REDUNDANCY_GROUPS, listed flat because froth has no category layer.
+_TOP_GROUPS: list[list[str]] = [
+    ["mvrv_z", "nupl", "realized_ratio"],
+    ["price_to_wma200", "mayer"],
+]
+
+
+def froth_subscores(readings: dict[str, float | None]) -> dict[str, float | None]:
+    """[0,1] overheat sub-scores via TOP_THRESHOLDS (no calibration on this side)."""
+    return {
+        name: (None if readings.get(name) is None
+               else linear_score(float(readings[name]), th["neutral"], th["extreme"]))
+        for name, th in TOP_THRESHOLDS.items()
+    }
+
+
+def froth_score(readings: dict[str, float | None]) -> dict:
+    """Sell-side overheat read: 0 = no froth, 100 = historic-top conditions.
+
+    Flat mean over available sub-scores with each correlated family collapsed to
+    one term (same de-duplication as the buy-side category means). Returns
+    {"score": 0-100|None, "subscores", "in_zone" labels, "active" term count}.
+    """
+    subs = froth_subscores(readings)
+    grouped = {m for g in _TOP_GROUPS for m in g}
+    terms: list[float] = []
+    for g in _TOP_GROUPS:
+        vals = [subs[m] for m in g if subs.get(m) is not None]
+        if vals:
+            terms.append(sum(vals) / len(vals))
+    terms += [s for name, s in subs.items() if name not in grouped and s is not None]
+    score = max(0.0, min(100.0, (sum(terms) / len(terms)) * 100)) if terms else None
+    return {
+        "score": score,
+        "subscores": subs,
+        "in_zone": indicators_in_zone(subs),
+        "active": len(terms),
+    }

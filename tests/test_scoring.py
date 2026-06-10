@@ -174,6 +174,47 @@ def test_indicators_in_zone_uses_labels():
     assert "Fear & Greed" not in labels
 
 
+# --- froth (sell-side overheat) ------------------------------------------------
+
+def test_froth_subscores_neutral_and_extreme():
+    # at/below neutral -> 0; at/above extreme -> 1; midpoint -> 0.5
+    subs = scoring.froth_subscores({"mvrv_z": 3.0, "mayer": 2.4, "fng": 75.0})
+    assert subs["mvrv_z"] == pytest.approx(0.0)
+    assert subs["mayer"] == pytest.approx(1.0)
+    assert subs["fng"] == pytest.approx(0.5)
+    assert subs["nupl"] is None  # not provided
+
+
+def test_froth_monotonic_in_raw_value():
+    cold = scoring.froth_score({"mvrv_z": 1.0})["score"]
+    warm = scoring.froth_score({"mvrv_z": 5.0})["score"]
+    hot = scoring.froth_score({"mvrv_z": 9.0})["score"]
+    assert cold < warm < hot
+    assert cold == pytest.approx(0.0) and hot == pytest.approx(100.0)
+
+
+def test_froth_collapses_correlated_families():
+    # mvrv_z/nupl/realized_ratio are one family: maxing all three must score the
+    # same as maxing one (no triple-counting), with fng pulling the mean down.
+    one = scoring.froth_score({"mvrv_z": 9.0, "fng": 60.0})
+    three = scoring.froth_score({"mvrv_z": 9.0, "nupl": 0.9, "realized_ratio": 4.0, "fng": 60.0})
+    assert one["score"] == pytest.approx(three["score"]) == pytest.approx(50.0)
+    assert one["active"] == three["active"] == 2
+
+
+def test_froth_none_tolerant_and_empty():
+    out = scoring.froth_score({})
+    assert out["score"] is None and out["active"] == 0 and out["in_zone"] == []
+    # missing indicators renormalize away rather than dragging the mean down
+    assert scoring.froth_score({"fng": 90.0})["score"] == pytest.approx(100.0)
+
+
+def test_froth_in_zone_uses_labels():
+    out = scoring.froth_score({"mayer": 2.4, "fng": 60.0})
+    assert "Mayer Multiple" in out["in_zone"]
+    assert "Fear & Greed" not in out["in_zone"]
+
+
 # --- flash + decide_alerts ---------------------------------------------------
 
 def _cfg(**over) -> Config:
