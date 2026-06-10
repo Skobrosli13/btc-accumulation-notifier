@@ -362,23 +362,82 @@ def indicators_in_zone(subscores: dict[str, float | None],
     ]
 
 
+# --- Zone boundaries (inverse mapping, for "what flips this badge" display) ---
+
+def _linear_boundary(th: dict[str, float], threshold: float) -> float:
+    """Raw value where linear_score(value, neutral, extreme) == threshold."""
+    lo, hi = sorted((th["neutral"], th["extreme"]))
+    if lo == hi:
+        return lo
+    t = threshold if th["extreme"] > th["neutral"] else 1.0 - threshold
+    return lo + t * (hi - lo)
+
+
+def zone_boundary_raw(name: str, threshold: float = IN_ZONE_THRESHOLD) -> float | None:
+    """Raw value at which ``name`` crosses into its BOTTOM zone (sub-score ==
+    threshold), inverting the SAME mapping ``score_indicators`` would use — the
+    calibrated percentile when calibration.json carries breakpoints for it, else
+    the fixed linear threshold band. The dashboard shows this as "lights at X";
+    a boundary derived from the wrong mapping would promise a delta the real
+    scorer never honors.
+    """
+    calib = _load_calibration()
+    c = calib.get("indicators", {}).get(name)
+    probs = (c.get("probs") if c else None) or calib.get("probs")
+    if c and probs and len(probs) == len(c.get("breakpoints", [])):
+        d = c.get("direction", DIRECTION.get(name, "higher_bullish"))
+        # Invert percentile_score: find the value whose quantile p yields the
+        # threshold score (score = 1-p for lower_bullish, p otherwise).
+        p = (1.0 - threshold) if d == "lower_bullish" else threshold
+        bps, ps = c["breakpoints"], probs
+        if p <= ps[0]:
+            return float(bps[0])
+        if p >= ps[-1]:
+            return float(bps[-1])
+        i = bisect.bisect_right(ps, p)
+        lo_p, hi_p = ps[i - 1], ps[i]
+        lo_v, hi_v = bps[i - 1], bps[i]
+        frac = (p - lo_p) / (hi_p - lo_p) if hi_p > lo_p else 0.0
+        return float(lo_v + frac * (hi_v - lo_v))
+    th = THRESHOLDS.get(name)
+    return _linear_boundary(th, threshold) if th else None
+
+
+def top_zone_boundary_raw(name: str, threshold: float = IN_ZONE_THRESHOLD) -> float | None:
+    """Raw value at which ``name`` crosses into its TOP (froth) zone. The froth
+    side is never calibrated, so this is always the linear inversion."""
+    th = TOP_THRESHOLDS.get(name)
+    return _linear_boundary(th, threshold) if th else None
+
+
 # --- Sell-side "froth" (overheat) score ---------------------------------------
 # Mirror of the buy-side mapping: the same VALUE indicators read at their
-# cycle-top extremes. Thresholds are heuristic cycle-top levels — the percentile
-# calibration covers the bottom side only, so this side is NOT calibrated or
-# backtested; any display must label it as such.
+# cycle-top extremes, plus crowded-positive funding. Thresholds were revised
+# against history via ``scripts/backtest_tops.py`` (Coinbase daily 2015+,
+# alternative.me F&G 2018+, bitcoin-data on-chain 2022+): cycle extremes
+# COMPRESS every cycle (Mayer top 3.66 in 2017 -> 2.46 in 2021 -> 1.53 in 2025),
+# so "extreme" anchors near the MOST RECENT cycle-top window's p95/max — values
+# the older, hotter tops still saturate. With these levels the Oct-2025 top
+# window reads frothy/overheated, the 2017/2021 tops max out, and the
+# 2018/2020/2022 bottoms (and post-top today) read 0. Still a small-sample
+# heuristic (1-3 cycles per indicator), not a proven edge — keep it labeled.
 TOP_THRESHOLDS: dict[str, dict[str, float]] = {
-    # On-chain valuation (higher = more frothy)
-    "mvrv_z":          {"neutral": 3.0,  "extreme": 7.0},
-    "realized_ratio":  {"neutral": 2.0,  "extreme": 3.5},
-    "nupl":            {"neutral": 0.5,  "extreme": 0.75},
-    "sopr":            {"neutral": 1.05, "extreme": 1.15},
-    "puell":           {"neutral": 1.5,  "extreme": 4.0},
-    # Price structure
-    "price_to_wma200": {"neutral": 1.5,  "extreme": 3.0},
-    "mayer":           {"neutral": 1.5,  "extreme": 2.4},
-    # Sentiment
-    "fng":             {"neutral": 60.0, "extreme": 90.0},
+    # On-chain valuation (higher = more frothy); free history starts 2022-06,
+    # so these are anchored on the 2024-2025 top window only.
+    "mvrv_z":          {"neutral": 2.0,   "extreme": 3.2},
+    "realized_ratio":  {"neutral": 1.7,   "extreme": 2.6},
+    "nupl":            {"neutral": 0.45,  "extreme": 0.62},
+    "sopr":            {"neutral": 1.005, "extreme": 1.04},
+    "puell":           {"neutral": 1.0,   "extreme": 1.6},
+    # Price structure (multi-cycle history)
+    "price_to_wma200": {"neutral": 1.6,   "extreme": 2.4},
+    "mayer":           {"neutral": 1.2,   "extreme": 1.55},
+    # Sentiment (2018+)
+    "fng":             {"neutral": 60.0,  "extreme": 85.0},
+    # Derivatives: sustained positive 7d funding = crowded longs. No free deep
+    # history, so this one stays an economic-logic level (0.01%/8h baseline ->
+    # 0.04%/8h heavily crowded), excluded from the backtest.
+    "funding":         {"neutral": 0.0001, "extreme": 0.0004},
 }
 
 # Correlated families collapsed to one term in the froth mean — same families as
@@ -396,6 +455,45 @@ def froth_subscores(readings: dict[str, float | None]) -> dict[str, float | None
         value = _finite(readings.get(name))
         out[name] = None if value is None else linear_score(value, th["neutral"], th["extreme"])
     return out
+
+
+# Overheat bands (floors). The label is computed server-side with a dead-band so
+# a froth score hovering on a cutoff can't whipsaw the label (and the alert)
+# every 6h run — same idea as tier_hysteresis.
+FROTH_BANDS: tuple[tuple[str, float], ...] = (
+    ("COOL", 0.0), ("WARMING", 25.0), ("FROTHY", 50.0), ("OVERHEATED", 75.0),
+)
+_BAND_ORDER = [name for name, _ in FROTH_BANDS]
+_BAND_FLOOR = dict(FROTH_BANDS)
+
+
+def froth_band(score: float | None, prev_band: str | None = None,
+               margin: float = 3.0) -> str | None:
+    """Overheat band with a ±``margin`` dead-band: moving UP requires clearing
+    the new band's floor by the margin; moving DOWN requires falling the margin
+    below the previous band's floor; inside the band the previous label holds.
+    ``prev_band=None`` (or margin<=0) returns the raw band."""
+    if score is None:
+        return None
+    raw = "COOL"
+    for name, floor in FROTH_BANDS:
+        if score >= floor:
+            raw = name
+    if prev_band not in _BAND_ORDER or margin <= 0 or raw == prev_band:
+        return raw
+    raw_i, prev_i = _BAND_ORDER.index(raw), _BAND_ORDER.index(prev_band)
+    if raw_i > prev_i:
+        # Upgrade: step to the HIGHEST band whose floor the score clears by the
+        # margin. A multi-band jump that lands inside the top band's dead-band
+        # must stop at the intermediate band it clearly cleared — falling all
+        # the way back to prev_band would let e.g. a 76 score keep a COOL label
+        # (and suppress the overheat alert) indefinitely.
+        for cand in reversed(_BAND_ORDER[prev_i + 1:raw_i + 1]):
+            if score >= _BAND_FLOOR[cand] + margin:
+                return cand
+        return prev_band
+    # downgrade: fall margin below the PREVIOUS band's floor
+    return raw if score <= _BAND_FLOOR[prev_band] - margin else prev_band
 
 
 def froth_score(readings: dict[str, float | None]) -> dict:

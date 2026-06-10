@@ -225,6 +225,11 @@ def _lt_breakdown(latest: dict, cfg: Config) -> dict:
                 "subscore": subs.get(k),
                 "raw": raw.get(k),
                 "in_zone": (subs.get(k) is not None and subs.get(k) >= scoring.IN_ZONE_THRESHOLD),
+                # The raw value at which this indicator's badge lights ("what
+                # flips this"), inverted through the same calibrated/linear
+                # mapping the scorer uses, plus which side of it lights (le/ge).
+                "zone_at": scoring.zone_boundary_raw(k),
+                "zone_dir": ("le" if scoring.DIRECTION.get(k) == "lower_bullish" else "ge"),
                 # representative key when k is part of a redundancy group (else None);
                 # members of the same group count once toward the category score.
                 "group": scoring.INDICATOR_GROUP.get(k),
@@ -259,19 +264,28 @@ def _lt_breakdown(latest: dict, cfg: Config) -> dict:
         "multiplier": readings.get("cycle_multiplier"),
     }
 
-    # Sell-side overheat read (request-time, from the stored raw readings; the
-    # price-structure fields fall back to ps for runs recorded before they were
-    # mirrored into raw).
+    # Sell-side overheat read. Prefer the froth block PERSISTED by run_once (the
+    # single source of truth — its band carries run-to-run hysteresis); fall back
+    # to a request-time compute for runs recorded before froth existed. The
+    # price-structure fields fall back to ps for runs predating their mirror
+    # into raw.
     froth_input = dict(raw)
     if froth_input.get("price_to_wma200") is None:
         froth_input["price_to_wma200"] = ps.get("price_to_wma200")
     if froth_input.get("mayer") is None:
         froth_input["mayer"] = ps.get("mayer_multiple")
-    fr = scoring.froth_score(froth_input)
+    # Known skew: stored subscores reflect the TOP_THRESHOLDS at run time while
+    # zone_at below is recomputed from the current constants — after a future
+    # threshold revision the latest run can disagree with its own "lights at"
+    # hints for up to one 6h cadence. Display-only and self-healing.
+    stored_fr = readings.get("froth")
+    fr = (stored_fr if isinstance(stored_fr, dict) and "subscores" in stored_fr
+          else scoring.froth_score(froth_input))
     froth = {
-        "score": fr["score"],
-        "active": fr["active"],
-        "in_zone": fr["in_zone"],
+        "score": fr.get("score"),
+        "band": fr.get("band") or scoring.froth_band(fr.get("score")),
+        "active": fr.get("active"),
+        "in_zone": fr.get("in_zone") or [],
         "indicators": [{
             "key": k,
             "label": scoring.INDICATOR_LABELS.get(k, k),
@@ -279,8 +293,13 @@ def _lt_breakdown(latest: dict, cfg: Config) -> dict:
             "raw": froth_input.get(k),
             "in_zone": (fr["subscores"].get(k) is not None
                         and fr["subscores"][k] >= scoring.IN_ZONE_THRESHOLD),
+            # Froth indicators all light on the HIGH side.
+            "zone_at": scoring.top_zone_boundary_raw(k),
+            "zone_dir": "ge",
         } for k in scoring.TOP_THRESHOLDS],
-        "note": "heuristic top-signal — thresholds are not backtested/calibrated",
+        "note": ("heuristic top-signal — thresholds anchored to the 2017/2021/2025 "
+                 "cycle tops via scripts/backtest_tops (1-3 cycles per indicator; "
+                 "not a proven edge)"),
     }
 
     return {

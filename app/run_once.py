@@ -106,6 +106,11 @@ def run(cfg: Config, *, dry_run: bool = False) -> dict:
     # Confidence proxy: how much the active categories agree.
     agreement = scoring.category_agreement(cat_scores)
 
+    # Sell-side overheat: score + hysteresis band (band continuity comes from the
+    # previous run's stored froth block, mirroring tier hysteresis).
+    froth = scoring.froth_score(readings)
+    froth["band"] = scoring.froth_band(froth["score"], store.last_froth_band(conn))
+
     # Decide (needs ledger state). The tier decision compares against the last
     # SUCCESSFULLY NOTIFIED tier so a failed send is retried, not lost.
     prev_notified_tier = store.last_notified_tier(conn)
@@ -187,6 +192,23 @@ def run(cfg: Config, *, dry_run: bool = False) -> dict:
         else:
             flash_send_ok = notify.send(cfg, title, body, conn=conn)
 
+    # Sell-side overheat crossing (OWNER-ONLY: no conn => no subscriber
+    # broadcast — the froth side is a small-sample heuristic, not the product).
+    prev_notified_froth = store.last_notified_froth_band(conn)
+    froth_alert = alerting.decide_froth_alert(froth["band"], prev_notified_froth)
+    froth_send_ok = True
+    if froth_alert:
+        title, body = alerting.build_froth_message(
+            froth=froth, band=froth["band"], price=price_struct.get("price"),
+            composite=composite_score, tier=current_tier)
+        if dry_run:
+            log.info("[dry-run] FROTH ALERT\n%s\n%s", title, body)
+        else:
+            froth_send_ok = notify.send(cfg, title, body)
+    # Cursor semantics (incl. the oscillation debounce) live in next_froth_cursor.
+    notified_froth_band = alerting.next_froth_cursor(
+        froth["band"], prev_notified_froth, froth_alert, froth_send_ok)
+
     # Alert cursors. notified_tier advances to the current tier only if any needed
     # tier/exit alert was delivered; otherwise it holds so the next run retries.
     tier_communicated = decisions["tier_alert"] or decisions["exit_alert"]
@@ -205,6 +227,7 @@ def run(cfg: Config, *, dry_run: bool = False) -> dict:
         "cycle_multiplier": mult,
         "conviction": conv,
         "agreement": agreement,
+        "froth": froth,
         "playbook": plan,
         "what_to_do": what_to_do,
         "changed": changed,
@@ -221,6 +244,8 @@ def run(cfg: Config, *, dry_run: bool = False) -> dict:
             tier_alerted=tier_recorded,
             flash_alerted=flash_recorded,
             notified_tier=notified_tier,
+            froth=froth.get("score"),
+            notified_froth_band=notified_froth_band,
         )
     conn.close()
 
@@ -232,6 +257,8 @@ def run(cfg: Config, *, dry_run: bool = False) -> dict:
         "active_cats": active_cats,
         "cycle_multiplier": mult,
         "flash_now": flash_now,
+        "froth": froth,
+        "froth_alert": froth_alert,
         "decisions": decisions,
         "subscores": subscores,
         "category_scores": cat_scores,

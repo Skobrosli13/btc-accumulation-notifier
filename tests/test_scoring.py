@@ -178,7 +178,8 @@ def test_indicators_in_zone_uses_labels():
 
 def test_froth_subscores_neutral_and_extreme():
     # at/below neutral -> 0; at/above extreme -> 1; midpoint -> 0.5
-    subs = scoring.froth_subscores({"mvrv_z": 3.0, "mayer": 2.4, "fng": 75.0})
+    # (anchors from the backtest-revised TOP_THRESHOLDS)
+    subs = scoring.froth_subscores({"mvrv_z": 2.0, "mayer": 1.55, "fng": 72.5})
     assert subs["mvrv_z"] == pytest.approx(0.0)
     assert subs["mayer"] == pytest.approx(1.0)
     assert subs["fng"] == pytest.approx(0.5)
@@ -187,8 +188,8 @@ def test_froth_subscores_neutral_and_extreme():
 
 def test_froth_monotonic_in_raw_value():
     cold = scoring.froth_score({"mvrv_z": 1.0})["score"]
-    warm = scoring.froth_score({"mvrv_z": 5.0})["score"]
-    hot = scoring.froth_score({"mvrv_z": 9.0})["score"]
+    warm = scoring.froth_score({"mvrv_z": 2.6})["score"]
+    hot = scoring.froth_score({"mvrv_z": 3.5})["score"]
     assert cold < warm < hot
     assert cold == pytest.approx(0.0) and hot == pytest.approx(100.0)
 
@@ -215,6 +216,36 @@ def test_froth_in_zone_uses_labels():
     assert "Fear & Greed" not in out["in_zone"]
 
 
+def test_zone_boundary_inverts_linear_mapping():
+    # lower_bullish (mvrv_z: neutral 2, extreme 0): score 0.6 at raw 0.8.
+    b = scoring.zone_boundary_raw("mvrv_z")
+    assert b == pytest.approx(0.8)
+    assert scoring.score_indicators({"mvrv_z": b})["mvrv_z"] == pytest.approx(0.6)
+    # top side (mayer: 1.2 -> 1.55, higher = frothy): score 0.6 at 1.2 + 0.6*0.35.
+    tb = scoring.top_zone_boundary_raw("mayer")
+    assert tb == pytest.approx(1.41)
+    assert scoring.froth_subscores({"mayer": tb})["mayer"] == pytest.approx(0.6)
+    assert scoring.zone_boundary_raw("nope") is None
+    assert scoring.top_zone_boundary_raw("m2_yoy") is None  # not a froth indicator
+
+
+def test_zone_boundary_inverts_calibrated_mapping():
+    # With calibration active the boundary must come from the SAME percentile
+    # mapping the scorer uses, not the linear fallback.
+    scoring.set_calibration({
+        "probs": [0.0, 1.0],
+        "indicators": {"price_to_wma200": {
+            "direction": "lower_bullish", "breakpoints": [1.0, 3.0]}},
+    })
+    try:
+        b = scoring.zone_boundary_raw("price_to_wma200")
+        # lower_bullish: score 0.6 <=> quantile 0.4 <=> 1.0 + 0.4*(3.0-1.0)
+        assert b == pytest.approx(1.8)
+        assert scoring.score_indicators({"price_to_wma200": b})["price_to_wma200"] == pytest.approx(0.6)
+    finally:
+        scoring.set_calibration({})
+
+
 def test_nan_readings_score_as_missing():
     # NaN survives `is None` checks and clamps into a full 1.0 sub-score via
     # min/max (a false maximal signal) — it must be treated as missing on BOTH
@@ -228,6 +259,58 @@ def test_nan_readings_score_as_missing():
     assert mixed["score"] == pytest.approx(100.0) and mixed["active"] == 1
     # non-numeric garbage is also missing, not a crash
     assert scoring.score_indicators({"mvrv_z": "n/a"})["mvrv_z"] is None
+
+
+def test_froth_band_hysteresis():
+    fb = scoring.froth_band
+    assert fb(None) is None
+    assert fb(10.0) == "COOL"
+    assert fb(60.0) == "FROTHY"
+    assert fb(80.0) == "OVERHEATED"
+    # upgrade requires clearing the new floor by the margin
+    assert fb(51.0, "WARMING") == "WARMING"   # inside the dead-band -> holds
+    assert fb(53.5, "WARMING") == "FROTHY"
+    # downgrade requires falling the margin below the previous floor
+    assert fb(48.0, "FROTHY") == "FROTHY"     # holds
+    assert fb(46.9, "FROTHY") == "WARMING"
+    # a two-band jump clears in one step when it beats the top floor + margin
+    assert fb(80.0, "COOL") == "OVERHEATED"
+    # a multi-band jump landing INSIDE the top band's dead-band steps to the
+    # highest intermediate band it cleared — it must not fall back to prev
+    # (a 76 score holding a COOL label would suppress the overheat alert).
+    assert fb(76.0, "COOL") == "FROTHY"
+    assert fb(51.0, "COOL") == "WARMING"
+    assert fb(76.0, "WARMING") == "FROTHY"
+
+
+def test_next_froth_cursor_debounce():
+    nc = alerting.next_froth_cursor
+    # advances upward freely; alert+ok advances too
+    assert nc("WARMING", "COOL", False, True) == "WARMING"
+    assert nc("FROTHY", "WARMING", True, True) == "FROTHY"
+    # failed send holds (retry next run)
+    assert nc("FROTHY", "WARMING", True, False) == "WARMING"
+    # downgrade holds unless a full cool-down to COOL — the oscillation debounce:
+    # 55 -> 47 -> 53 must NOT re-email; 55 -> 20 -> 53 must.
+    assert nc("WARMING", "FROTHY", False, True) == "FROTHY"
+    assert alerting.decide_froth_alert("FROTHY", "FROTHY") is False  # 47->53 re-entry: quiet
+    assert nc("COOL", "FROTHY", False, True) == "COOL"
+    assert alerting.decide_froth_alert("FROTHY", "COOL") is True     # full round trip: re-arms
+    # None band holds the cursor
+    assert nc(None, "FROTHY", False, True) == "FROTHY"
+
+
+def test_decide_froth_alert_crossings():
+    d = alerting.decide_froth_alert
+    assert d("FROTHY", None) is True             # first ever crossing
+    assert d("FROTHY", "WARMING") is True        # upward crossing
+    assert d("FROTHY", "FROTHY") is False        # no repeat at the same band
+    assert d("OVERHEATED", "FROTHY") is True     # escalation fires again
+    assert d("FROTHY", "OVERHEATED") is False    # de-escalation is silent
+    assert d("WARMING", "COOL") is False         # below the alert bands
+    assert d(None, None) is False
+    # cursor falls back quietly when the band cools, so a re-entry re-alerts
+    assert d("FROTHY", "WARMING") is True
 
 
 # --- flash + decide_alerts ---------------------------------------------------

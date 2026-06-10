@@ -104,6 +104,69 @@ def decide_alerts(current_tier: str, prev_notified_tier: str,
     return out
 
 
+# --- Sell-side overheat (froth) alert ------------------------------------------
+
+FROTH_ALERT_BANDS = ("FROTHY", "OVERHEATED")
+_FROTH_ORDER = ["COOL", "WARMING", "FROTHY", "OVERHEATED"]
+
+
+def decide_froth_alert(band: str | None, prev_notified_band: str | None) -> bool:
+    """Owner-only sell-side alert: fire when the overheat band crosses UP into
+    FROTHY/OVERHEATED relative to the last band we successfully communicated.
+    The cursor tracks every computed band (even quiet ones), so falling back
+    below FROTHY re-arms the alert for the next run-up. Pure function."""
+    if band not in FROTH_ALERT_BANDS:
+        return False
+    prev_i = (_FROTH_ORDER.index(prev_notified_band)
+              if prev_notified_band in _FROTH_ORDER else 0)
+    return _FROTH_ORDER.index(band) > prev_i
+
+
+def next_froth_cursor(band: str | None, prev_notified: str | None,
+                      alert_fired: bool, send_ok: bool) -> str | None:
+    """Advance the notified-froth-band cursor. Pure function.
+
+    Semantics: hold on a failed send (retry next run); advance upward freely;
+    fall DOWN only on a full cool-down to COOL. The sticky downgrade is the
+    oscillation debounce — without it a score wobbling across a band floor
+    (e.g. 47<->53 around FROTHY's hysteresis window) would re-email on every
+    re-entry; requiring a genuine cool-down first caps it at one email per
+    excursion. A None band (no froth data) holds the cursor."""
+    if band is None:
+        return prev_notified
+    if alert_fired and not send_ok:
+        return prev_notified
+    if (prev_notified in _FROTH_ORDER
+            and _FROTH_ORDER.index(band) < _FROTH_ORDER.index(prev_notified)
+            and band != "COOL"):
+        return prev_notified
+    return band
+
+
+def build_froth_message(*, froth: dict, band: str, price: float | None,
+                        composite: float, tier: str) -> tuple[str, str]:
+    """Return (title, body) for an overheat band-crossing alert (owner-only)."""
+    score = froth.get("score") or 0.0
+    title = f"BTC overheat: {band} ({score:.0f}/100) - consider reviewing"
+    lines = [f"Sell-side overheat crossed into {band}.", "",
+             f"Overheat score: {score:.0f}/100 ({band})"]
+    if price is not None:
+        lines.append(f"BTC price: ${price:,.0f}")
+    lines.append(f"Long-term accumulation read (context): {composite:.0f}/100 "
+                 f"({TIER_LABELS.get(tier, tier)})")
+    lit = froth.get("in_zone") or []
+    lines.append("Top signals lit: " + (", ".join(lit) if lit else "none"))
+    lines += [
+        "",
+        "Heuristic top-signal: thresholds anchored to the 2017/2021/2025 cycle tops "
+        "(1-3 cycles per indicator) - a small sample, not a proven edge. This is the "
+        "sell-side mirror of the accumulation score: consider reviewing/trimming into "
+        "strength, sized to your own plan.",
+        "Not financial advice - alert only. You decide whether, how much, and where to sell.",
+    ]
+    return title, "\n".join(lines)
+
+
 # --- Message building --------------------------------------------------------
 
 def _data_tier_note(active_cats: list[str], onchain_active: bool) -> str:

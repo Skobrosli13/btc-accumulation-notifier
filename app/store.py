@@ -120,6 +120,10 @@ def init_db(conn: sqlite3.Connection) -> None:
     # Migrations for DBs created before these columns existed.
     _add_column_if_missing(conn, "runs", "notified_tier", "TEXT")
     _add_column_if_missing(conn, "candles", "source", "TEXT")
+    # Sell-side overheat: per-run froth score (chartable history) + the band
+    # alert cursor (mirrors notified_tier semantics).
+    _add_column_if_missing(conn, "runs", "froth", "REAL")
+    _add_column_if_missing(conn, "runs", "notified_froth_band", "TEXT")
     conn.commit()
 
 
@@ -150,6 +154,33 @@ def last_notified_tier(conn: sqlite3.Connection) -> str:
         "ORDER BY run_ts DESC LIMIT 1"
     ).fetchone()
     return row["notified_tier"] if row and row["notified_tier"] else "NEUTRAL"
+
+
+def last_notified_froth_band(conn: sqlite3.Connection) -> str | None:
+    """The overheat band we last successfully communicated (or quietly passed
+    through); None before the migration / first froth-aware run. Mirrors
+    ``last_notified_tier``: a failed send leaves it unchanged so the next run
+    retries the crossing alert."""
+    row = conn.execute(
+        "SELECT notified_froth_band FROM runs WHERE notified_froth_band IS NOT NULL "
+        "ORDER BY run_ts DESC LIMIT 1"
+    ).fetchone()
+    return row["notified_froth_band"] if row and row["notified_froth_band"] else None
+
+
+def last_froth_band(conn: sqlite3.Connection) -> str | None:
+    """The most recent run's computed overheat band (display/hysteresis state,
+    from the stored froth block) — None if the ledger is empty or pre-froth."""
+    row = conn.execute(
+        "SELECT readings_json FROM runs ORDER BY run_ts DESC LIMIT 1"
+    ).fetchone()
+    if not row or not row["readings_json"]:
+        return None
+    try:
+        froth = (json.loads(row["readings_json"]) or {}).get("froth") or {}
+        return froth.get("band")
+    except (json.JSONDecodeError, TypeError):
+        return None
 
 
 def last_active_cats(conn: sqlite3.Connection) -> list[str] | None:
@@ -207,19 +238,21 @@ def last_run_ts(conn: sqlite3.Connection) -> datetime | None:
 def record_run(conn: sqlite3.Connection, *, run_ts: str, price: float | None,
                composite: float, tier: str, active_cats: list[str],
                readings: dict, tier_alerted: bool, flash_alerted: bool,
-               notified_tier: str) -> None:
+               notified_tier: str, froth: float | None = None,
+               notified_froth_band: str | None = None) -> None:
     """Persist one run. ``readings`` should hold raw values AND sub-scores.
 
     ``notified_tier`` is the alert cursor: the tier we have successfully told the
     user about as of this run (== ``tier`` when no alert was needed or the alert
     sent OK; the *previous* notified tier when a needed alert failed to send).
+    ``notified_froth_band`` is the same cursor for the sell-side overheat band.
     """
     conn.execute(
         """
         INSERT OR REPLACE INTO runs
           (run_ts, price, composite, tier, active_cats, readings_json,
-           tier_alerted, flash_alerted, notified_tier)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+           tier_alerted, flash_alerted, notified_tier, froth, notified_froth_band)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             run_ts,
@@ -231,6 +264,8 @@ def record_run(conn: sqlite3.Connection, *, run_ts: str, price: float | None,
             int(tier_alerted),
             int(flash_alerted),
             notified_tier,
+            froth,
+            notified_froth_band,
         ),
     )
     conn.commit()
@@ -454,13 +489,24 @@ def all_runs(conn: sqlite3.Connection) -> list[dict]:
 
 
 def run_history(conn: sqlite3.Connection, limit: int = 0) -> list[dict]:
-    """(run_ts, composite, tier, price) oldest->newest — the dashboard's
+    """(run_ts, composite, tier, price, froth) oldest->newest — the dashboard's
     score-over-time series. limit takes the most recent N; 0 = all (runs are a
-    6h cadence, so even years of history stay small)."""
-    sql = "SELECT run_ts, composite, tier, price FROM runs ORDER BY run_ts DESC"
-    rows = conn.execute(
-        sql + (" LIMIT ?" if limit else ""), ((limit,) if limit else ())
-    ).fetchall()
+    6h cadence, so even years of history stay small). ``froth`` is NULL for runs
+    recorded before the sell-side score existed."""
+    tail = (" LIMIT ?" if limit else "")
+    args = ((limit,) if limit else ())
+    try:
+        rows = conn.execute(
+            "SELECT run_ts, composite, tier, price, froth FROM runs "
+            "ORDER BY run_ts DESC" + tail, args).fetchall()
+    except sqlite3.OperationalError:
+        # The read-only API can't run migrations; against a DB the collectors
+        # haven't migrated yet (no `froth` column) serve the pre-froth shape
+        # rather than 500ing.
+        rows = conn.execute(
+            "SELECT run_ts, composite, tier, price FROM runs "
+            "ORDER BY run_ts DESC" + tail, args).fetchall()
+        return [{**dict(r), "froth": None} for r in reversed(rows)]
     return [dict(r) for r in reversed(rows)]
 
 
