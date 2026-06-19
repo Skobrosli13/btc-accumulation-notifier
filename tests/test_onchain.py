@@ -68,6 +68,22 @@ def test_bg_last_skips_trailing_nulls(monkeypatch):
     assert onchain._bg_last("reserve_risk") == pytest.approx(0.002)
 
 
+def test_cohort_metrics_from_static_files(monkeypatch):
+    # LTH/STH-SOPR + LTH-MVRV come from the rate-cap-free static files.
+    files = {"lth_sopr": 0.73, "sth_sopr": 0.99, "lth_mvrv": 1.29}
+
+    def fake(url, *a, **k):
+        for name, val in files.items():
+            if f"files/{name}.json" in url:
+                return [[1, val]]
+        return None   # REST metrics absent -> None
+    monkeypatch.setattr(onchain, "get_json", fake)
+    out = onchain._from_bitcoin_data(price=60000.0)
+    assert out["lth_sopr"] == pytest.approx(0.73)
+    assert out["sth_sopr"] == pytest.approx(0.99)
+    assert out["lth_mvrv"] == pytest.approx(1.29)
+
+
 def test_realized_ratio_needs_price(monkeypatch):
     monkeypatch.setattr(onchain, "get_json", _fake_get_json(_BD))
     out = onchain._from_bitcoin_data(price=None)

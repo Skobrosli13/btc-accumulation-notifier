@@ -71,6 +71,34 @@ def test_macro_liquidity_and_stress_groups_collapse():
     assert cats["macro"] == pytest.approx(0.25)
 
 
+def test_cohort_sopr_and_mvrv_bands():
+    s = scoring.score_indicators
+    # LTH-SOPR lower_bullish: neutral 1.0 / extreme 0.6 (LTH capitulation)
+    assert s({"lth_sopr": 0.6})["lth_sopr"] == pytest.approx(1.0)
+    assert s({"lth_sopr": 1.0})["lth_sopr"] == pytest.approx(0.0)
+    # STH-SOPR neutral 1.0 / extreme 0.93
+    assert s({"sth_sopr": 0.93})["sth_sopr"] == pytest.approx(1.0)
+    assert s({"sth_sopr": 1.0})["sth_sopr"] == pytest.approx(0.0)
+    # LTH-MVRV neutral 2.4 / extreme 1.0
+    assert s({"lth_mvrv": 1.0})["lth_mvrv"] == pytest.approx(1.0)
+    assert s({"lth_mvrv": 2.4})["lth_mvrv"] == pytest.approx(0.0)
+
+
+def test_lth_mvrv_joins_valuation_group():
+    # mvrv_z deep (1.0) + lth_mvrv neutral (0.0) collapse to ONE valuation term (0.5);
+    # with a standalone puell (1.0) -> onchain = mean(0.5, 1.0) = 0.75. If lth_mvrv
+    # were its own term it would be mean(1.0, 0.0, 1.0) = 0.667.
+    sub = scoring.score_indicators({"mvrv_z": 0.0, "lth_mvrv": 2.4, "puell": 0.3})
+    assert scoring.category_scores(sub)["onchain"] == pytest.approx(0.75)
+
+
+def test_sth_sopr_groups_with_aggregate_sopr():
+    # sopr (1.0) + sth_sopr (0.0) collapse to ONE term (0.5); standalone puell (1.0)
+    # -> onchain = mean(0.5, 1.0) = 0.75 (not 0.667 from three separate terms).
+    sub = scoring.score_indicators({"sopr": 0.95, "sth_sopr": 1.0, "puell": 0.3})
+    assert scoring.category_scores(sub)["onchain"] == pytest.approx(0.75)
+
+
 def test_linear_score_clamps_and_degenerate():
     assert scoring.linear_score(-5.0, neutral=2.0, extreme=0.0) == 1.0  # beyond extreme
     assert scoring.linear_score(99.0, neutral=2.0, extreme=0.0) == 0.0  # beyond neutral

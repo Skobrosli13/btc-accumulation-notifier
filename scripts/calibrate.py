@@ -4,7 +4,8 @@ Percentile-rank only makes sense where we have deep, multi-cycle history. So thi
 calibrates the indicators that have it:
   * price_to_wma200 — deep weekly closes (Kraken ~2013) -> 200-week MA.
   * m2_yoy / hy_spread / real_yield / nfci — FRED full history.
-  * reserve_risk — BGeometrics static file (free, no rate limit, back to 2012).
+  * reserve_risk / lth_sopr / sth_sopr / lth_mvrv — BGeometrics static files
+    (free, no rate limit, back to 2012).
 It then backtests that price+macro backbone with EXPANDING-window percentiles
 (no look-ahead) and reports a forward-return hit-rate vs the base rate.
 
@@ -132,10 +133,10 @@ def _fng_history() -> pd.DataFrame:
     return df.drop_duplicates("date").sort_values("date").reset_index(drop=True)[["date", "v"]]
 
 
-def _reserve_risk_history() -> pd.DataFrame:
-    """Full Reserve Risk history from the BGeometrics static file (free, no rate
-    limit, back to 2012) -> [date, v]. Multi-cycle, so it's calibratable."""
-    rows = onchain.bg_history("reserve_risk")
+def _bg_static_df(slug: str) -> pd.DataFrame:
+    """Full history from a BGeometrics static file (free, no rate limit, back to
+    2012) -> [date, v]. Multi-cycle, so these are calibratable."""
+    rows = onchain.bg_history(slug)
     if not rows:
         return pd.DataFrame(columns=["date", "v"])
     df = pd.DataFrame(rows, columns=["ts", "v"])
@@ -291,9 +292,11 @@ def main() -> int:
     fng = _fng_history()
     if not fng.empty:
         raw["fng"] = fng                      # Fear & Greed, percentile vs 2018+ history
-    rr = _reserve_risk_history()
-    if not rr.empty:
-        raw["reserve_risk"] = rr              # Reserve Risk, percentile vs 2012+ history
+    # BGeometrics static-file on-chain metrics (free, multi-cycle) -> percentile.
+    for ind in ("reserve_risk", "lth_sopr", "sth_sopr", "lth_mvrv"):
+        df = _bg_static_df(ind)
+        if not df.empty:
+            raw[ind] = df
     calib = _emit_calibration(raw)
     (APP_DIR / "calibration.json").write_text(json.dumps(calib, indent=2))
     print(f"  wrote app/calibration.json ({len(calib['indicators'])} indicators)")

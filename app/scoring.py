@@ -39,6 +39,11 @@ THRESHOLDS: dict[str, dict[str, float]] = {
     # Miner cycle (higher = more bullish). hash_ribbon is a cooked 0..1 recovery
     # score from app/sources/miner.py (identity band — see that module).
     "hash_ribbon":     {"neutral": 0.0,   "extreme": 1.0},
+    # Holder-cohort spending/valuation (lower = more bullish). Bands from the 2012+
+    # static-file distributions; calibration refines (these have fat right tails).
+    "lth_sopr":        {"neutral": 1.0,   "extreme": 0.6},   # LTH SOPR; <1 = LTH capitulation (rare bottom tell)
+    "sth_sopr":        {"neutral": 1.0,   "extreme": 0.93},  # STH SOPR; <1 = recent-buyer washout
+    "lth_mvrv":        {"neutral": 2.4,   "extreme": 1.0},   # LTH MVRV; low = LTH cost basis near price
     # Price structure (lower = more bullish)
     "price_to_wma200": {"neutral": 1.10,  "extreme": 0.85},
     "mayer":           {"neutral": 1.0,   "extreme": 0.5},
@@ -74,7 +79,7 @@ DIRECTION: dict[str, str] = {
 # Which indicators belong to which category.
 CATEGORY_INDICATORS: dict[str, list[str]] = {
     "onchain":   ["mvrv_z", "realized_ratio", "nupl", "sopr", "puell",
-                  "reserve_risk", "hash_ribbon"],
+                  "reserve_risk", "hash_ribbon", "lth_sopr", "sth_sopr", "lth_mvrv"],
     "price":     ["price_to_wma200", "mayer"],
     "macro":     ["m2_yoy", "hy_spread", "real_yield", "etf_flow",
                   "net_liq_yoy", "nfci"],
@@ -86,7 +91,9 @@ CATEGORY_INDICATORS: dict[str, list[str]] = {
 # to ONE term in its category mean (average-then-count-once) so the duplicated
 # signal isn't double-counted. Members stay individually visible in the breakdown.
 REDUNDANCY_GROUPS: dict[str, list[list[str]]] = {
-    "onchain": [["mvrv_z", "nupl", "realized_ratio"]],  # realized-value valuation (~0.9 corr)
+    # realized-value valuation (~0.9 corr) — lth_mvrv is the LTH-cohort version.
+    "onchain": [["mvrv_z", "nupl", "realized_ratio", "lth_mvrv"],
+                ["sopr", "sth_sopr"]],                   # spending-profit (STH dominates aggregate SOPR)
     "price":   [["price_to_wma200", "mayer"]],           # both price-vs-long-MA (~0.99 corr)
     "macro":   [["m2_yoy", "net_liq_yoy"],               # broad liquidity (M2 vs Fed net liquidity)
                 ["hy_spread", "nfci"]],                   # financial-stress gauges (credit/conditions)
@@ -109,6 +116,9 @@ INDICATOR_LABELS: dict[str, str] = {
     "puell": "Puell Multiple",
     "reserve_risk": "Reserve Risk",
     "hash_ribbon": "Hash Ribbon (miners)",
+    "lth_sopr": "LTH-SOPR",
+    "sth_sopr": "STH-SOPR",
+    "lth_mvrv": "LTH-MVRV",
     "price_to_wma200": "Price / 200-week MA",
     "mayer": "Mayer Multiple",
     "m2_yoy": "M2 YoY",

@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-06-19T20:54:10.280257+00:00",
+  "generated_at": "2026-06-19T21:17:11.897472+00:00",
   "method": "price+macro backbone, expanding-window percentile, timing-neutral",
   "days": 2939,
   "from": "2018-06-03",

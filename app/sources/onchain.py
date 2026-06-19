@@ -58,6 +58,9 @@ _BD_CONTEXT = {
 # so it graduates from context-only to a scored holder-conviction indicator.
 _BG_FILE_METRICS = {
     "reserve_risk": "reserve_risk",
+    "lth_sopr": "lth_sopr",      # long-term-holder SOPR (<1 = LTH realizing losses)
+    "sth_sopr": "sth_sopr",      # short-term-holder SOPR (<1 = recent-buyer washout)
+    "lth_mvrv": "lth_mvrv",      # long-term-holder MVRV (low = LTH cost basis near price)
 }
 
 
