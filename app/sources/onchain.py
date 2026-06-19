@@ -28,6 +28,13 @@ log = logging.getLogger(__name__)
 
 GLASSNODE_BASE = "https://api.glassnode.com/v1/metrics"
 BITCOIN_DATA_BASE = "https://bitcoin-data.com/v1"
+# BGeometrics static JSON files: the SAME series as the /v1 REST API but with NO
+# rate limit and full 2012+ history (the REST /last is hard-capped at ~10 req/hr).
+# Used to SCORE metrics without spending the REST budget — and as the offline
+# calibration history source. Format: [[unixMs, value], ...] oldest->newest.
+# NOTE: only some metrics are published as files; the core valuation set
+# (mvrv-zscore/nupl/sopr/puell) is NOT, so those stay on the REST API below.
+BG_FILES_BASE = "https://charts.bgeometrics.com/files"
 
 _NONE_READINGS = {"mvrv_z": None, "realized_ratio": None, "nupl": None,
                   "sopr": None, "puell": None}
@@ -43,8 +50,14 @@ _BD_METRICS = {
 # Context-only metrics (shown, NOT scored — only ~1 cycle of free history to
 # threshold against, so they inform rather than move the composite).
 _BD_CONTEXT = {
-    "reserve_risk": ("reserve-risk", "reserveRisk"),
     "rhodl":        ("rhodl-ratio", "rhodlRatio"),
+}
+
+# Scored metrics sourced from the rate-cap-free BGeometrics static files
+# (scorer key -> file basename). reserve_risk now has full 2012+ history this way,
+# so it graduates from context-only to a scored holder-conviction indicator.
+_BG_FILE_METRICS = {
+    "reserve_risk": "reserve_risk",
 }
 
 
@@ -99,6 +112,50 @@ def _bd_last(slug: str, field: str) -> float | None:
         return None
 
 
+def _bg_last(name: str) -> float | None:
+    """Latest value of a BGeometrics static-file metric, or None on any failure.
+
+    Reads ``{BG_FILES_BASE}/<name>.json`` ([[unixMs, value], ...] oldest->newest);
+    no rate limit, full history. Walks back from the end to the most recent NON-null
+    value — these files carry a trailing null for the current, not-yet-computed day.
+    """
+    data = get_json(f"{BG_FILES_BASE}/{name}.json")
+    if not isinstance(data, list):
+        return None
+    for row in reversed(data):
+        try:
+            v = row[1]
+        except (TypeError, IndexError):
+            continue
+        if v is None:
+            continue
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def bg_history(name: str) -> list[tuple[int, float]]:
+    """Full daily series for a BGeometrics static-file metric (OFFLINE calibration).
+
+    Unlike ``history()`` (the rate-limited /v1 REST path) this static file has no
+    rate limit and full 2012+ history, so it's the preferred calibration source for
+    file-backed metrics. Returns [(unixMs, value), ...] oldest->newest, or [].
+    """
+    data = get_json(f"{BG_FILES_BASE}/{name}.json")
+    if not isinstance(data, list):
+        return []
+    out: list[tuple[int, float]] = []
+    for row in data:
+        try:
+            if row and row[1] is not None:
+                out.append((int(row[0]), float(row[1])))
+        except (TypeError, ValueError, IndexError):
+            continue
+    return out
+
+
 def _from_bitcoin_data(price: float | None) -> dict:
     """Free on-chain readings (bitcoin-data.com / BGeometrics) keyed for the scorer.
 
@@ -108,6 +165,9 @@ def _from_bitcoin_data(price: float | None) -> dict:
     out = {key: _bd_last(slug, field) for key, (slug, field) in _BD_METRICS.items()}
     realized_price = _bd_last("realized-price", "realizedPrice")
     out["realized_ratio"] = (price / realized_price) if (price and realized_price) else None
+    # Scored, from the rate-cap-free static files (full history).
+    for key, name in _BG_FILE_METRICS.items():
+        out[key] = _bg_last(name)
     # Context-only metrics (not scored).
     for key, (slug, field) in _BD_CONTEXT.items():
         out[key] = _bd_last(slug, field)

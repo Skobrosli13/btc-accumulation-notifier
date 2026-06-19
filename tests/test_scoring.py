@@ -36,6 +36,41 @@ def test_m2_yoy_recalibrated_band():
     assert s({"m2_yoy": 10.0})["m2_yoy"] == pytest.approx(1.0)
 
 
+def test_reserve_risk_band():
+    # lower_bullish: deep value (p10 ~0.0012) -> 1.0, median (~0.0025) -> 0.0.
+    s = scoring.score_indicators
+    assert s({"reserve_risk": 0.0012})["reserve_risk"] == pytest.approx(1.0)
+    assert s({"reserve_risk": 0.0025})["reserve_risk"] == pytest.approx(0.0)
+    assert s({"reserve_risk": (0.0012 + 0.0025) / 2})["reserve_risk"] == pytest.approx(0.5)
+
+
+def test_net_liq_and_nfci_bands():
+    s = scoring.score_indicators
+    assert s({"net_liq_yoy": 10.0})["net_liq_yoy"] == pytest.approx(1.0)
+    assert s({"net_liq_yoy": 0.0})["net_liq_yoy"] == pytest.approx(0.0)
+    # NFCI higher_bullish: tight/stress (+0.6) -> 1.0; loose (<0) clamps to 0.
+    assert s({"nfci": 0.6})["nfci"] == pytest.approx(1.0)
+    assert s({"nfci": 0.0})["nfci"] == pytest.approx(0.0)
+    assert s({"nfci": -0.5})["nfci"] == pytest.approx(0.0)
+
+
+def test_hash_ribbon_identity_passthrough():
+    # The adapter emits a cooked 0..1; the threshold band is identity.
+    s = scoring.score_indicators
+    assert s({"hash_ribbon": 1.0})["hash_ribbon"] == pytest.approx(1.0)
+    assert s({"hash_ribbon": 0.3})["hash_ribbon"] == pytest.approx(0.3)
+    assert s({"hash_ribbon": 0.0})["hash_ribbon"] == pytest.approx(0.0)
+
+
+def test_macro_liquidity_and_stress_groups_collapse():
+    # m2_yoy+net_liq_yoy collapse to ONE liquidity term; hy_spread+nfci to ONE
+    # stress term — correlated macro inputs must not double-count.
+    sub = scoring.score_indicators({"m2_yoy": 10.0, "net_liq_yoy": 0.0, "hy_spread": 3.5})
+    # liquidity term = mean(1.0, 0.0) = 0.5 ; stress term = mean(hy=0.0) = 0.0
+    cats = scoring.category_scores(sub)
+    assert cats["macro"] == pytest.approx(0.25)
+
+
 def test_linear_score_clamps_and_degenerate():
     assert scoring.linear_score(-5.0, neutral=2.0, extreme=0.0) == 1.0  # beyond extreme
     assert scoring.linear_score(99.0, neutral=2.0, extreme=0.0) == 0.0  # beyond neutral

@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 
 from . import alerting, notify, playbook, scoring, store
 from .config import Config, load_config
-from .sources import derivatives, etf_flows, funding, macro, onchain, price, sentiment
+from .sources import derivatives, etf_flows, funding, macro, miner, onchain, price, sentiment
 
 log = logging.getLogger("btc-accum")
 
@@ -45,7 +45,8 @@ def gather_readings(cfg: Config) -> tuple[dict, dict]:
     readings.update(sentiment.fear_greed())               # fng
     readings.update(macro.macro())                        # m2_yoy, hy_spread, real_yield, (dgs10/dxy ctx)
     readings.update(etf_flows.etf_flows())                # etf_flow
-    readings.update(onchain.onchain(price_struct.get("price")))  # mvrv_z, realized_ratio, nupl, sopr, puell
+    readings.update(onchain.onchain(price_struct.get("price")))  # mvrv_z, realized_ratio, nupl, sopr, puell, reserve_risk
+    readings.update(miner.hash_ribbon())                  # hash_ribbon (miner capitulation->recovery)
     readings.update(derivatives.derivatives())            # liq_magnitude, oi_flush
     return readings, price_struct
 

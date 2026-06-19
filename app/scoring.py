@@ -32,6 +32,13 @@ THRESHOLDS: dict[str, dict[str, float]] = {
     "nupl":            {"neutral": 0.25,  "extreme": -0.1},
     "sopr":            {"neutral": 1.0,   "extreme": 0.95},
     "puell":           {"neutral": 0.6,   "extreme": 0.3},
+    # Holder conviction (lower = more bullish). Reserve Risk: low = strong-hand
+    # conviction at a low price = attractive risk/reward. Band from the 2012+
+    # static-file distribution: neutral≈median 0.0025, extreme≈p10 0.0012.
+    "reserve_risk":    {"neutral": 0.0025, "extreme": 0.0012},
+    # Miner cycle (higher = more bullish). hash_ribbon is a cooked 0..1 recovery
+    # score from app/sources/miner.py (identity band — see that module).
+    "hash_ribbon":     {"neutral": 0.0,   "extreme": 1.0},
     # Price structure (lower = more bullish)
     "price_to_wma200": {"neutral": 1.10,  "extreme": 0.85},
     "mayer":           {"neutral": 1.0,   "extreme": 0.5},
@@ -42,6 +49,12 @@ THRESHOLDS: dict[str, dict[str, float]] = {
     "hy_spread":       {"neutral": 3.5,   "extreme": 8.0},    # OAS %; wide risk-off -> capitulation (higher)
     "real_yield":      {"neutral": 2.0,   "extreme": 0.0},    # %; falling -> bullish (lower)
     "etf_flow":        {"neutral": 0.0,   "extreme": 5.0},    # $bn 30d net; persistent inflows -> bullish (higher)
+    # Fed net liquidity YoY %; expanding -> bullish (higher). Captures the TGA/RRP
+    # plumbing M2 misses; grouped with m2_yoy so the two don't double-count.
+    "net_liq_yoy":     {"neutral": 0.0,   "extreme": 10.0},
+    # NFCI financial conditions; positive = tighter/stress -> capitulation (higher).
+    # Asymmetric tails (GFC ~+5, COVID ~+1.5); +0.6 is a provisional extreme.
+    "nfci":            {"neutral": 0.0,   "extreme": 0.6},
     # Sentiment (lower = more bullish)
     "fng":             {"neutral": 40.0,  "extreme": 10.0},
     # Derivatives
@@ -60,9 +73,11 @@ DIRECTION: dict[str, str] = {
 
 # Which indicators belong to which category.
 CATEGORY_INDICATORS: dict[str, list[str]] = {
-    "onchain":   ["mvrv_z", "realized_ratio", "nupl", "sopr", "puell"],
+    "onchain":   ["mvrv_z", "realized_ratio", "nupl", "sopr", "puell",
+                  "reserve_risk", "hash_ribbon"],
     "price":     ["price_to_wma200", "mayer"],
-    "macro":     ["m2_yoy", "hy_spread", "real_yield", "etf_flow"],
+    "macro":     ["m2_yoy", "hy_spread", "real_yield", "etf_flow",
+                  "net_liq_yoy", "nfci"],
     "sentiment": ["fng"],
     "derivs":    ["funding", "oi_flush", "liq_magnitude"],
 }
@@ -73,6 +88,8 @@ CATEGORY_INDICATORS: dict[str, list[str]] = {
 REDUNDANCY_GROUPS: dict[str, list[list[str]]] = {
     "onchain": [["mvrv_z", "nupl", "realized_ratio"]],  # realized-value valuation (~0.9 corr)
     "price":   [["price_to_wma200", "mayer"]],           # both price-vs-long-MA (~0.99 corr)
+    "macro":   [["m2_yoy", "net_liq_yoy"],               # broad liquidity (M2 vs Fed net liquidity)
+                ["hy_spread", "nfci"]],                   # financial-stress gauges (credit/conditions)
 }
 
 # Reverse lookup: indicator -> its group's representative key (for breakdown tagging).
@@ -90,12 +107,16 @@ INDICATOR_LABELS: dict[str, str] = {
     "nupl": "NUPL",
     "sopr": "SOPR",
     "puell": "Puell Multiple",
+    "reserve_risk": "Reserve Risk",
+    "hash_ribbon": "Hash Ribbon (miners)",
     "price_to_wma200": "Price / 200-week MA",
     "mayer": "Mayer Multiple",
     "m2_yoy": "M2 YoY",
     "hy_spread": "HY credit spread",
     "real_yield": "10Y real yield",
     "etf_flow": "ETF net flows",
+    "net_liq_yoy": "Fed net liquidity (YoY)",
+    "nfci": "Financial conditions (NFCI)",
     "fng": "Fear & Greed",
     "funding": "Funding rate (7d)",
     "oi_flush": "OI deleveraging",

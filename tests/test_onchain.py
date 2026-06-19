@@ -44,6 +44,30 @@ def test_bitcoin_data_fails_soft(monkeypatch):
     assert all(v is None for v in out.values())
 
 
+def test_reserve_risk_from_static_file(monkeypatch):
+    # reserve_risk is sourced from the rate-cap-free BGeometrics static file
+    # ([[ts, value], ...]) and is now a SCORED key, not context-only.
+    responses = {**_BD, "files/reserve_risk.json": [[1_700_000_000_000, 0.0015]]}
+    monkeypatch.setattr(onchain, "get_json", _fake_get_json(responses))
+    out = onchain._from_bitcoin_data(price=60000.0)
+    assert out["reserve_risk"] == pytest.approx(0.0015)
+    assert out["rhodl"] is None   # REST context metric, absent here
+
+
+def test_bg_last_handles_malformed(monkeypatch):
+    monkeypatch.setattr(onchain, "get_json", lambda *a, **k: [])      # empty list
+    assert onchain._bg_last("reserve_risk") is None
+    monkeypatch.setattr(onchain, "get_json", lambda *a, **k: None)    # fetch failed
+    assert onchain._bg_last("reserve_risk") is None
+
+
+def test_bg_last_skips_trailing_nulls(monkeypatch):
+    # These files carry a trailing null for the current, not-yet-computed day.
+    monkeypatch.setattr(onchain, "get_json",
+                        lambda *a, **k: [[1, 0.001], [2, 0.002], [3, None]])
+    assert onchain._bg_last("reserve_risk") == pytest.approx(0.002)
+
+
 def test_realized_ratio_needs_price(monkeypatch):
     monkeypatch.setattr(onchain, "get_json", _fake_get_json(_BD))
     out = onchain._from_bitcoin_data(price=None)
