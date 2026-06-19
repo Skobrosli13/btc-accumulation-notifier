@@ -18,10 +18,11 @@ Three reads, all on CLOSED bars of the primary short-term timeframe:
   long-liq flush is capitulation (BUY the washout), a short-liq flush is a
   squeeze (SELL the exhaustion).
 
-Honesty: these are FORWARD-TEST grade. There is no free historical tick data to
-backtest CVD/liquidations against, so they earn trust through confluence (the
-existing ``st_require_confluence`` gate) and out-of-sample observation, not a
-prior hit-rate. See the established BTC short-term no-edge finding.
+Honesty: backtested over ~11 months of Coinalyze 4h history
+(``scripts/backtest_flow``) — every trigger's win-rate Wilson CI straddles the
+base rate, i.e. NO demonstrated edge, consistent with the established BTC
+short-term coin-flip finding. They are kept as confluence inputs / timing context
+(gated by ``st_require_confluence``), never as standalone edge.
 """
 from __future__ import annotations
 

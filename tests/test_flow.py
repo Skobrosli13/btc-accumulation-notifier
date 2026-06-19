@@ -159,19 +159,19 @@ def _item(trigger):
             "price": 50000.0, "indicators": {}, "regime": "bull"}
 
 
-def test_flow_trigger_carries_forward_test_caveat():
+def test_flow_trigger_carries_no_edge_caveat():
     # single flow trigger (build_st_message path)
     flow_trig = Trigger("cvd_bull_divergence", "BUY", "CVD bullish divergence", "x")
     _, body = alerting.build_st_batch_message([_item(flow_trig)], "BUY")
-    assert "forward-test" in body.lower()
-    # a swing trigger (has st_validation hit-rates) gets NO forward-test caveat
+    assert "no demonstrated edge" in body.lower()
+    # a swing trigger (has st_validation hit-rates) gets NO flow caveat
     swing = Trigger("rsi_oversold_bounce", "BUY", "RSI oversold bounce", "y")
     _, body2 = alerting.build_st_batch_message([_item(swing)], "BUY")
-    assert "forward-test" not in body2.lower()
+    assert "no demonstrated edge" not in body2.lower()
 
 
 def test_flow_caveat_in_batch_when_any_flow_trigger():
     items = [_item(Trigger("cvd_bull_divergence", "BUY", "CVD bull div", "x")),
              _item(Trigger("rsi_oversold_bounce", "BUY", "RSI bounce", "y"))]
     _, body = alerting.build_st_batch_message(items, "BUY")
-    assert "forward-test" in body.lower()
+    assert "no demonstrated edge" in body.lower()
