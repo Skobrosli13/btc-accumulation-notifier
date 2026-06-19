@@ -95,6 +95,13 @@ class Config:
     # Free data
     fred_api_key: str | None
 
+    # Order-flow layer (Coinalyze — free, aggregated derivs incl. Binance:
+    # OI / funding / liquidations / candle-CVD). Presence of the key activates it.
+    coinalyze_api_key: str | None
+    coinalyze_symbol: str          # Coinalyze market id (e.g. BTCUSDT_PERP.A = Binance perp)
+    flow_cvd_lookback: int         # bars for CVD/price divergence on the primary ST timeframe
+    flow_liq_spike_mult: float     # last-bar liquidations >= this x recent mean = a flush trigger
+
     # Paid drop-ins (presence toggles the layer)
     glassnode_api_key: str | None
     cryptoquant_api_key: str | None
@@ -183,6 +190,12 @@ class Config:
         return bool(self.coinglass_api_key)
 
     @property
+    def coinalyze_active(self) -> bool:
+        """The free order-flow layer (CVD / OI participant / liquidations) lights up
+        purely from the Coinalyze key being present, like every other layer."""
+        return bool(self.coinalyze_api_key)
+
+    @property
     def macro_active(self) -> bool:
         return bool(self.fred_api_key)
 
@@ -212,6 +225,10 @@ def load_config() -> Config:
         email_from=_get("EMAIL_FROM", "onboarding@resend.dev"),
         email_to=_opt("EMAIL_TO"),
         fred_api_key=_opt("FRED_API_KEY"),
+        coinalyze_api_key=_opt("COINALYZE_API_KEY"),
+        coinalyze_symbol=_get("COINALYZE_SYMBOL", "BTCUSDT_PERP.A"),
+        flow_cvd_lookback=_get_int("FLOW_CVD_LOOKBACK", 14),
+        flow_liq_spike_mult=_get_float("FLOW_LIQ_SPIKE_MULT", 3.0),
         glassnode_api_key=_opt("GLASSNODE_API_KEY"),
         cryptoquant_api_key=_opt("CRYPTOQUANT_API_KEY"),
         coinglass_api_key=_opt("COINGLASS_API_KEY"),

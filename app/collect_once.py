@@ -15,9 +15,9 @@ import logging
 import sys
 from datetime import datetime, timezone
 
-from . import alerting, notify, shortterm, store
+from . import alerting, flow, notify, shortterm, store
 from .config import Config, load_config
-from .sources import exchange, price
+from .sources import coinalyze, exchange, price
 
 log = logging.getLogger("btc-collect")
 
@@ -35,6 +35,59 @@ def _candle_rows(df) -> list[tuple]:
             float(r.open), float(r.high), float(r.low), float(r.close), float(r.volume),
         ))
     return rows
+
+
+def _closed(rows: list[dict]) -> list[dict]:
+    """Drop the last (possibly still-forming) Coinalyze history bar so flow signals
+    evaluate on CLOSED bars only — mirrors the candle path's closed-only doctrine.
+    Conservative: at worst this lags one already-closed bar."""
+    return rows[:-1] if len(rows) > 1 else rows
+
+
+def _collect_flow(cfg: Config) -> dict | None:
+    """Fetch the Coinalyze order-flow series for the PRIMARY short-term timeframe
+    and reduce them to (cvd frame, participant read, liquidation flush, readings).
+
+    Computed once per run on the first ST timeframe (order flow lives on the
+    shorter horizon); the triggers are attached to that timeframe so they share
+    the existing confluence/cooldown machinery. None when the layer is inactive or
+    every series came back empty (the collector then runs exactly as before).
+    """
+    if not cfg.coinalyze_active:
+        return None
+    tf = cfg.st_timeframes[0]
+    interval = coinalyze.INTERVAL_MAP.get(tf)
+    if interval is None:
+        return None
+    ih = coinalyze.INTERVAL_HOURS.get(interval, 4)
+    hours = (cfg.flow_cvd_lookback + 5) * ih  # +5 bars of slack over the divergence window
+    key, sym = cfg.coinalyze_api_key, cfg.coinalyze_symbol
+
+    cvd_rows = _closed(coinalyze.ohlcv_history(sym, interval, hours, key))
+    oi_rows = _closed(coinalyze.oi_history(sym, interval, hours, key))
+    liq_rows = _closed(coinalyze.liquidations_history(sym, interval, hours, key))
+    if not cvd_rows and not liq_rows:
+        log.warning("Coinalyze key set but flow series empty (check symbol %r / plan); "
+                    "layer dark this run", sym)
+        return None
+
+    cvd_df = flow.build_cvd(cvd_rows)
+    part = flow.participant_from_series([r["close"] for r in cvd_rows],
+                                        [r["oi"] for r in oi_rows], cfg.st_oi_surge_pct)
+    liq_flush = flow.liquidation_flush(liq_rows, cfg.flow_liq_spike_mult)
+    div = flow.cvd_divergence(cvd_df, cfg.flow_cvd_lookback)
+    readings = {
+        "source": "coinalyze", "symbol": sym, "interval": interval,
+        "cvd": float(cvd_df["cvd"].iloc[-1]) if not cvd_df.empty else None,
+        "cvd_delta_last": float(cvd_df["delta"].iloc[-1]) if not cvd_df.empty else None,
+        "cvd_divergence": div,
+        "participant": part,
+        "liq_long_usd": liq_rows[-1]["long"] if liq_rows else None,
+        "liq_short_usd": liq_rows[-1]["short"] if liq_rows else None,
+        "liq_flush": (liq_flush[0] if liq_flush else None),
+    }
+    return {"tf": tf, "cvd_df": cvd_df, "participant": part,
+            "liq_flush": liq_flush, "readings": readings}
 
 
 def run(cfg: Config, *, dry_run: bool = False) -> dict:
@@ -65,8 +118,14 @@ def run(cfg: Config, *, dry_run: bool = False) -> dict:
     if not dry_run:
         store.record_derivs(conn, ts=now_ms, funding=funding, oi=oi, oi_chg_pct=oi_chg_pct)
 
+    # Free aggregated order-flow layer (Coinalyze): CVD divergence, OI participant
+    # and liquidation flush on the primary ST timeframe. None when no key is set.
+    flow_data = _collect_flow(cfg)
+
     summary = {"now": now.isoformat(), "funding": funding, "oi": oi,
-               "oi_chg_pct": oi_chg_pct, "timeframes": {}, "alerts": []}
+               "oi_chg_pct": oi_chg_pct,
+               "flow": (flow_data["readings"] if flow_data else None),
+               "timeframes": {}, "alerts": []}
 
     # Collect every eligible (passes suppression + confluence + cooldown) trigger
     # across all timeframes, then send ONE batched email per direction below.
@@ -81,6 +140,15 @@ def run(cfg: Config, *, dry_run: bool = False) -> dict:
         if ev_ts is None:
             log.info("%s: insufficient candles for a signal yet", tf)
             continue
+
+        # Attach the Coinalyze order-flow layer to its (primary) timeframe: merge
+        # the readings into the stored indicators and fold the flow triggers into
+        # the same confluence/cooldown loop the candle triggers already use.
+        if flow_data and tf == flow_data["tf"]:
+            ev["indicators"]["flow"] = flow_data["readings"]
+            ev["triggers"] = list(ev["triggers"]) + flow.detect_flow_triggers(
+                flow_data["cvd_df"], flow_data["participant"],
+                flow_data["liq_flush"], cfg)
 
         if not dry_run:
             store.record_st_signal(conn, ts=ev_ts, timeframe=tf, price=ev["price"],

@@ -46,3 +46,16 @@ def test_onchain_source_glassnode(monkeypatch):
     cfg = config.load_config()
     assert cfg.onchain_active is True
     assert cfg.onchain_source == "glassnode"
+
+
+def test_coinalyze_layer_toggle_and_defaults(monkeypatch):
+    monkeypatch.delenv("COINALYZE_API_KEY", raising=False)
+    cfg = config.load_config()
+    assert cfg.coinalyze_active is False
+    # Sensible defaults so the flow layer is configured the moment a key appears.
+    assert cfg.coinalyze_symbol == "BTCUSDT_PERP.A"
+    assert cfg.flow_cvd_lookback == 14
+    assert cfg.flow_liq_spike_mult == 3.0
+
+    monkeypatch.setenv("COINALYZE_API_KEY", "ca-key")
+    assert config.load_config().coinalyze_active is True

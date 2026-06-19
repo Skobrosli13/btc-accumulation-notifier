@@ -120,6 +120,7 @@ def health(cfg: Config = Depends(get_config), _=Depends(require_token)) -> dict:
             "onchain": cfg.onchain_active,
             "macro": cfg.macro_active,
             "derivs_paid": cfg.derivs_paid_active,
+            "flow": cfg.coinalyze_active,   # free Coinalyze order-flow layer (CVD/OI/liq)
             "email": cfg.email_active,
         },
         "onchain_source": cfg.onchain_source,
