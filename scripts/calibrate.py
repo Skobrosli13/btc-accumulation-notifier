@@ -3,7 +3,8 @@
 Percentile-rank only makes sense where we have deep, multi-cycle history. So this
 calibrates the indicators that have it:
   * price_to_wma200 — deep weekly closes (Kraken ~2013) -> 200-week MA.
-  * m2_yoy / hy_spread / real_yield — FRED full history.
+  * m2_yoy / hy_spread / real_yield / nfci — FRED full history.
+  * reserve_risk — BGeometrics static file (free, no rate limit, back to 2012).
 It then backtests that price+macro backbone with EXPANDING-window percentiles
 (no look-ahead) and reports a forward-return hit-rate vs the base rate.
 
@@ -32,7 +33,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app import scoring                      # noqa: E402
 from app.config import load_config           # noqa: E402
-from app.sources import exchange, macro      # noqa: E402
+from app.sources import exchange, macro, onchain  # noqa: E402
 
 COINBASE = "https://api.exchange.coinbase.com/products/BTC-USD/candles"
 
@@ -131,6 +132,18 @@ def _fng_history() -> pd.DataFrame:
     return df.drop_duplicates("date").sort_values("date").reset_index(drop=True)[["date", "v"]]
 
 
+def _reserve_risk_history() -> pd.DataFrame:
+    """Full Reserve Risk history from the BGeometrics static file (free, no rate
+    limit, back to 2012) -> [date, v]. Multi-cycle, so it's calibratable."""
+    rows = onchain.bg_history("reserve_risk")
+    if not rows:
+        return pd.DataFrame(columns=["date", "v"])
+    df = pd.DataFrame(rows, columns=["ts", "v"])
+    df["date"] = (pd.to_datetime(df["ts"], unit="ms", utc=True).dt.tz_localize(None)
+                  .dt.normalize().astype("datetime64[ns]"))
+    return df.drop_duplicates("date").sort_values("date").reset_index(drop=True)[["date", "v"]]
+
+
 def _macro_history(cfg) -> dict[str, pd.DataFrame]:
     """Per-indicator [date, value] frames (empty dict if no FRED key). Merged onto
     the weekly spine separately so daily spikes (e.g. HY blowouts) aren't resampled away."""
@@ -149,6 +162,9 @@ def _macro_history(cfg) -> dict[str, pd.DataFrame]:
     ry = _fred_series("DFII10", key)
     if not ry.empty:
         out["real_yield"] = ry.rename(columns={"DFII10": "real_yield"})
+    nfci = _fred_series("NFCI", key)
+    if not nfci.empty:
+        out["nfci"] = nfci.rename(columns={"NFCI": "nfci"})
     return out
 
 
@@ -275,6 +291,9 @@ def main() -> int:
     fng = _fng_history()
     if not fng.empty:
         raw["fng"] = fng                      # Fear & Greed, percentile vs 2018+ history
+    rr = _reserve_risk_history()
+    if not rr.empty:
+        raw["reserve_risk"] = rr              # Reserve Risk, percentile vs 2012+ history
     calib = _emit_calibration(raw)
     (APP_DIR / "calibration.json").write_text(json.dumps(calib, indent=2))
     print(f"  wrote app/calibration.json ({len(calib['indicators'])} indicators)")

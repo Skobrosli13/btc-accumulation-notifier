@@ -1,37 +1,37 @@
 {
-  "generated_at": "2026-06-09T18:00:52.901032+00:00",
+  "generated_at": "2026-06-19T20:54:10.280257+00:00",
   "method": "price+macro backbone, expanding-window percentile, timing-neutral",
-  "days": 2929,
+  "days": 2939,
   "from": "2018-06-03",
-  "to": "2026-06-09",
-  "signal_days": 752,
-  "signal_episodes": 29,
+  "to": "2026-06-19",
+  "signal_days": 792,
+  "signal_episodes": 19,
   "horizons": {
     "90d": {
-      "signal_hit_rate": 0.689,
-      "base_rate": 0.561,
-      "episode_hit_rate": 0.444,
+      "signal_hit_rate": 0.553,
+      "base_rate": 0.559,
+      "episode_hit_rate": 0.5,
       "ci": [
-        0.296,
-        0.593
+        0.312,
+        0.688
       ]
     },
     "180d": {
-      "signal_hit_rate": 0.726,
-      "base_rate": 0.608,
-      "episode_hit_rate": 0.44,
+      "signal_hit_rate": 0.668,
+      "base_rate": 0.606,
+      "episode_hit_rate": 0.429,
       "ci": [
-        0.28,
-        0.6
+        0.214,
+        0.643
       ]
     },
     "365d": {
-      "signal_hit_rate": 0.861,
-      "base_rate": 0.711,
-      "episode_hit_rate": 0.52,
+      "signal_hit_rate": 0.837,
+      "base_rate": 0.708,
+      "episode_hit_rate": 0.714,
       "ci": [
-        0.36,
-        0.68
+        0.5,
+        0.929
       ]
     }
   },
