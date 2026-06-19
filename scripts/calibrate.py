@@ -260,7 +260,7 @@ def _track_record(weekly: pd.DataFrame, cfg, calibrated: list[str]) -> dict:
         }
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "method": "price+macro backbone, expanding-window percentile, timing-neutral",
+        "method": "expanding-window percentile composite (price + macro + multi-cycle on-chain), timing-neutral",
         "days": len(closes),
         "from": str(rows["date"].iloc[0].date()) if len(rows) else None,
         "to": str(rows["date"].iloc[-1].date()) if len(rows) else None,
@@ -268,10 +268,10 @@ def _track_record(weekly: pd.DataFrame, cfg, calibrated: list[str]) -> dict:
         "signal_episodes": len(episodes),
         "horizons": horizons,
         "caveats": [
-            "Backbone only: price-structure (200WMA/Mayer) + macro — the deep multi-cycle indicators.",
-            "On-chain, sentiment and derivatives are scored live but are NOT part of this backbone test.",
+            "Composite over the deep multi-cycle indicators: price-structure (200WMA/Mayer), macro (FRED), and on-chain (realized ratio, reserve risk, LTH/STH-SOPR, LTH-MVRV).",
+            "Excludes one-free-cycle on-chain (MVRV-Z/NUPL/SOPR/Puell), sentiment, and derivatives.",
             "Timing multiplier neutralized; cycle context excluded.",
-            "Past behavior is not a forecast.",
+            "One asset, ~2-3 cycles. Past behavior is not a forecast.",
         ],
     }
 
@@ -301,14 +301,28 @@ def main() -> int:
     (APP_DIR / "calibration.json").write_text(json.dumps(calib, indent=2))
     print(f"  wrote app/calibration.json ({len(calib['indicators'])} indicators)")
 
-    # Track record uses ONLY the calibrated price/macro backbone.
+    # Track record over the price/macro backbone PLUS the multi-cycle ON-CHAIN
+    # layer (static files) — so the headline reflects the on-chain lever, not just
+    # price+macro. (Still excludes mvrv_z/nupl/sopr/puell: one free cycle, no static.)
     px = px.sort_values("date").reset_index(drop=True)
     for name, df in macro.items():
         px = pd.merge_asof(px, df.sort_values("date"), on="date", direction="backward")
-    calibrated = [k for k in calib["indicators"] if k in px.columns]
+    for slug in ("reserve_risk", "lth_sopr", "sth_sopr", "lth_mvrv"):
+        df = _bg_static_df(slug)
+        if not df.empty:
+            px = pd.merge_asof(px, df.rename(columns={"v": slug}).sort_values("date"),
+                               on="date", direction="backward")
+    rp = _bg_static_df("realized_price")
+    if not rp.empty:
+        px = pd.merge_asof(px, rp.rename(columns={"v": "realized_price"}).sort_values("date"),
+                           on="date", direction="backward")
+        px["realized_ratio"] = px["close"] / px["realized_price"]
+    track_inds = ["price_to_wma200", "mayer", "m2_yoy", "hy_spread", "real_yield",
+                  "nfci", "realized_ratio", "reserve_risk", "lth_sopr", "sth_sopr", "lth_mvrv"]
+    calibrated = [k for k in track_inds if k in px.columns]
     track = _track_record(px, cfg, calibrated)
     (APP_DIR / "track_record.json").write_text(json.dumps(track, indent=2))
-    print(f"  wrote app/track_record.json: {track['horizons']}")
+    print(f"  wrote app/track_record.json ({len(calibrated)} inds): {track['horizons']}")
     return 0
 
 

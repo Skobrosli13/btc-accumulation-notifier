@@ -1,44 +1,44 @@
 {
-  "generated_at": "2026-06-19T21:17:11.897472+00:00",
-  "method": "price+macro backbone, expanding-window percentile, timing-neutral",
+  "generated_at": "2026-06-19T22:40:26.495771+00:00",
+  "method": "expanding-window percentile composite (price + macro + multi-cycle on-chain), timing-neutral",
   "days": 2939,
   "from": "2018-06-03",
   "to": "2026-06-19",
-  "signal_days": 792,
-  "signal_episodes": 19,
+  "signal_days": 703,
+  "signal_episodes": 63,
   "horizons": {
     "90d": {
-      "signal_hit_rate": 0.553,
+      "signal_hit_rate": 0.555,
       "base_rate": 0.559,
-      "episode_hit_rate": 0.5,
+      "episode_hit_rate": 0.673,
       "ci": [
-        0.312,
-        0.688
+        0.564,
+        0.782
       ]
     },
     "180d": {
-      "signal_hit_rate": 0.668,
+      "signal_hit_rate": 0.673,
       "base_rate": 0.606,
-      "episode_hit_rate": 0.429,
+      "episode_hit_rate": 0.556,
       "ci": [
-        0.214,
-        0.643
+        0.444,
+        0.667
       ]
     },
     "365d": {
-      "signal_hit_rate": 0.837,
+      "signal_hit_rate": 0.849,
       "base_rate": 0.708,
-      "episode_hit_rate": 0.714,
+      "episode_hit_rate": 0.808,
       "ci": [
-        0.5,
-        0.929
+        0.712,
+        0.885
       ]
     }
   },
   "caveats": [
-    "Backbone only: price-structure (200WMA/Mayer) + macro \u2014 the deep multi-cycle indicators.",
-    "On-chain, sentiment and derivatives are scored live but are NOT part of this backbone test.",
+    "Composite over the deep multi-cycle indicators: price-structure (200WMA/Mayer), macro (FRED), and on-chain (realized ratio, reserve risk, LTH/STH-SOPR, LTH-MVRV).",
+    "Excludes one-free-cycle on-chain (MVRV-Z/NUPL/SOPR/Puell), sentiment, and derivatives.",
     "Timing multiplier neutralized; cycle context excluded.",
-    "Past behavior is not a forecast."
+    "One asset, ~2-3 cycles. Past behavior is not a forecast."
   ]
 }
