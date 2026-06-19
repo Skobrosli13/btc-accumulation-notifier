@@ -60,6 +60,10 @@ THRESHOLDS: dict[str, dict[str, float]] = {
     # NFCI financial conditions; positive = tighter/stress -> capitulation (higher).
     # Asymmetric tails (GFC ~+5, COVID ~+1.5); +0.6 is a provisional extreme.
     "nfci":            {"neutral": 0.0,   "extreme": 0.6},
+    # Stablecoin Supply Ratio = BTC mcap / major-USD-stablecoin mcap; LOW = lots of
+    # sidelined dry powder relative to BTC -> bullish (lower). Short/regime-shifting
+    # history, so a fixed band (not calibrated) and modest weight.
+    "ssr":             {"neutral": 6.0,   "extreme": 3.0},
     # Sentiment (lower = more bullish)
     "fng":             {"neutral": 40.0,  "extreme": 10.0},
     # Derivatives
@@ -82,7 +86,7 @@ CATEGORY_INDICATORS: dict[str, list[str]] = {
                   "reserve_risk", "hash_ribbon", "lth_sopr", "sth_sopr", "lth_mvrv"],
     "price":     ["price_to_wma200", "mayer"],
     "macro":     ["m2_yoy", "hy_spread", "real_yield", "etf_flow",
-                  "net_liq_yoy", "nfci"],
+                  "net_liq_yoy", "nfci", "ssr"],
     "sentiment": ["fng"],
     "derivs":    ["funding", "oi_flush", "liq_magnitude"],
 }
@@ -127,6 +131,7 @@ INDICATOR_LABELS: dict[str, str] = {
     "etf_flow": "ETF net flows",
     "net_liq_yoy": "Fed net liquidity (YoY)",
     "nfci": "Financial conditions (NFCI)",
+    "ssr": "Stablecoin Supply Ratio",
     "fng": "Fear & Greed",
     "funding": "Funding rate (7d)",
     "oi_flush": "OI deleveraging",

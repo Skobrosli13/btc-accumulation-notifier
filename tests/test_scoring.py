@@ -99,6 +99,14 @@ def test_sth_sopr_groups_with_aggregate_sopr():
     assert scoring.category_scores(sub)["onchain"] == pytest.approx(0.75)
 
 
+def test_ssr_band():
+    # lower_bullish: max dry powder (SSR 3) -> 1.0; little dry powder (SSR 6) -> 0.0.
+    s = scoring.score_indicators
+    assert s({"ssr": 3.0})["ssr"] == pytest.approx(1.0)
+    assert s({"ssr": 6.0})["ssr"] == pytest.approx(0.0)
+    assert s({"ssr": 4.5})["ssr"] == pytest.approx(0.5)
+
+
 def test_linear_score_clamps_and_degenerate():
     assert scoring.linear_score(-5.0, neutral=2.0, extreme=0.0) == 1.0  # beyond extreme
     assert scoring.linear_score(99.0, neutral=2.0, extreme=0.0) == 0.0  # beyond neutral
