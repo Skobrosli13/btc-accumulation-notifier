@@ -30,6 +30,15 @@ import pandas as pd
 from .config import Config
 from .shortterm import Trigger
 
+# Stable keys of the order-flow triggers. Used by alerting to caveat them as
+# FORWARD-TEST (unbacktested) — distinct from the swing triggers that carry
+# st_validation hit-rates.
+FLOW_TRIGGER_KEYS = frozenset({
+    "cvd_bull_divergence", "cvd_bear_divergence",
+    "oi_new_longs", "oi_new_shorts",
+    "liq_long_flush", "liq_short_flush",
+})
+
 
 def build_cvd(ohlcv_rows: list[dict]) -> pd.DataFrame:
     """Coinalyze OHLCV rows (oldest->newest) -> frame with per-bar ``delta`` and
@@ -55,7 +64,7 @@ def cvd_divergence(df: pd.DataFrame, lookback: int = 14) -> str | None:
     lower (buyers can't lift the tape → distribution / hidden selling).
     None when there is insufficient history or no divergence.
     """
-    if df is None or df.empty or "cvd" not in df.columns:
+    if df is None or df.empty or not {"cvd", "low", "high"}.issubset(df.columns):
         return None
     w = df.tail(lookback).reset_index(drop=True)
     if len(w) < 4:
@@ -96,7 +105,10 @@ def participant(price_chg_pct: float | None, oi_chg_pct: float | None,
 def participant_from_series(closes: list[float], ois: list[float],
                             oi_surge_pct: float) -> dict | None:
     """Convenience wrapper: derive the last-bar price% and OI% change from two
-    closed series and classify. None if either series is too short / zero-based."""
+    closed series and classify. None if either series is too short / zero-based.
+
+    NOTE: pairs by POSITION — only safe when both series are known to be aligned.
+    The production collector uses ``participant_aligned`` (joins by timestamp)."""
     if len(closes) < 2 or len(ois) < 2:
         return None
     pc = (closes[-1] / closes[-2] - 1.0) * 100.0 if closes[-2] else None
@@ -104,13 +116,40 @@ def participant_from_series(closes: list[float], ois: list[float],
     return participant(pc, oc, oi_surge_pct)
 
 
-def liquidation_flush(liq_rows: list[dict], mult: float = 3.0) -> tuple[str, float] | None:
+def participant_aligned(cvd_rows: list[dict], oi_rows: list[dict],
+                        oi_surge_pct: float) -> dict | None:
+    """Classify the last closed bar's price-vs-OI quadrant, joining the OHLCV and
+    OI series BY TIMESTAMP (not by position).
+
+    The two series are fetched in independent Coinalyze calls and trimmed for
+    closed bars separately, so they can differ in length / trailing bar. Pairing
+    positionally (closes[-1] vs ois[-1]) would then compare bars from different
+    times and emit a bogus new_longs/new_shorts trigger. This uses the last two
+    bars present in BOTH series. None if fewer than two common bars."""
+    oi_by_ts = {r["ts"]: r["oi"] for r in oi_rows
+                if r.get("ts") is not None and r.get("oi") is not None}
+    common = [(r["ts"], r["close"]) for r in cvd_rows
+              if r.get("ts") in oi_by_ts and r.get("close") is not None]
+    if len(common) < 2:
+        return None
+    common.sort(key=lambda x: x[0])
+    (ts_prev, c_prev), (ts_last, c_last) = common[-2], common[-1]
+    oi_prev, oi_last = oi_by_ts[ts_prev], oi_by_ts[ts_last]
+    pc = (c_last / c_prev - 1.0) * 100.0 if c_prev else None
+    oc = (oi_last / oi_prev - 1.0) * 100.0 if oi_prev else None
+    return participant(pc, oc, oi_surge_pct)
+
+
+def liquidation_flush(liq_rows: list[dict], mult: float = 3.0,
+                      min_usd: float = 0.0) -> tuple[str, float] | None:
     """Detect a liquidation flush on the last closed bar.
 
     Returns ('long'|'short', usd) when the dominant side of the last bar is at
     least ``mult`` x the mean of the prior bars (self-calibrating, so no brittle
-    absolute USD threshold). None otherwise. Long-liq flush = capitulation (BUY);
-    short-liq flush = squeeze exhaustion (SELL).
+    absolute USD threshold). ``min_usd`` is an absolute floor so a near-zero
+    baseline during a quiet/sparse-liquidation stretch can't let a tiny bar clear
+    the multiple and manufacture a phantom flush. None otherwise. Long-liq flush =
+    capitulation (BUY); short-liq flush = squeeze exhaustion (SELL).
     """
     if not liq_rows or len(liq_rows) < 4:
         return None
@@ -118,9 +157,11 @@ def liquidation_flush(liq_rows: list[dict], mult: float = 3.0) -> tuple[str, flo
     prior = liq_rows[:-1]
     mean_long = sum(r["long"] for r in prior) / len(prior)
     mean_short = sum(r["short"] for r in prior) / len(prior)
-    if mean_long > 0 and last["long"] >= mult * mean_long and last["long"] >= last["short"]:
+    if (mean_long > 0 and last["long"] >= mult * mean_long
+            and last["long"] >= last["short"] and last["long"] >= min_usd):
         return ("long", last["long"])
-    if mean_short > 0 and last["short"] >= mult * mean_short and last["short"] > last["long"]:
+    if (mean_short > 0 and last["short"] >= mult * mean_short
+            and last["short"] > last["long"] and last["short"] >= min_usd):
         return ("short", last["short"])
     return None
 

@@ -71,10 +71,21 @@ def _collect_flow(cfg: Config) -> dict | None:
                     "layer dark this run", sym)
         return None
 
+    # Staleness gate: if the latest closed bar is far older than the interval, the
+    # feed gapped — every read (divergence / participant / flush) would be
+    # unreliable, so the whole layer goes dark. Mirrors the OI-baseline recency
+    # doctrine that stops a gap from reading as a phantom flush.
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    interval_ms = int(ih * 3600_000)
+    last_tss = [rows[-1]["ts"] for rows in (cvd_rows, oi_rows, liq_rows) if rows]
+    if last_tss and now_ms - max(last_tss) > 3 * interval_ms:
+        log.warning("Coinalyze flow data stale (last bar %.1fh old); layer dark this run",
+                    (now_ms - max(last_tss)) / 3600_000)
+        return None
+
     cvd_df = flow.build_cvd(cvd_rows)
-    part = flow.participant_from_series([r["close"] for r in cvd_rows],
-                                        [r["oi"] for r in oi_rows], cfg.st_oi_surge_pct)
-    liq_flush = flow.liquidation_flush(liq_rows, cfg.flow_liq_spike_mult)
+    part = flow.participant_aligned(cvd_rows, oi_rows, cfg.flow_oi_bar_surge_pct)
+    liq_flush = flow.liquidation_flush(liq_rows, cfg.flow_liq_spike_mult, cfg.flow_liq_min_usd)
     div = flow.cvd_divergence(cvd_df, cfg.flow_cvd_lookback)
     readings = {
         "source": "coinalyze", "symbol": sym, "interval": interval,

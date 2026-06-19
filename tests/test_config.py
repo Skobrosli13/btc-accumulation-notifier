@@ -56,6 +56,8 @@ def test_coinalyze_layer_toggle_and_defaults(monkeypatch):
     assert cfg.coinalyze_symbol == "BTCUSDT_PERP.A"
     assert cfg.flow_cvd_lookback == 14
     assert cfg.flow_liq_spike_mult == 3.0
+    assert cfg.flow_oi_bar_surge_pct == 3.0     # per-bar OI gate (decoupled from st_oi_surge_pct)
+    assert cfg.flow_liq_min_usd == 500_000.0
 
     monkeypatch.setenv("COINALYZE_API_KEY", "ca-key")
     assert config.load_config().coinalyze_active is True

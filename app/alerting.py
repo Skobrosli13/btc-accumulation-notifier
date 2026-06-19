@@ -402,6 +402,9 @@ def build_st_message(*, trigger, timeframe: str, score: float, state: str,
                      f"target ${lv['target']:,.0f}" + (f" (~{lv['rr']}R)" if lv["rr"] else ""))
 
     lines.append("")
+    from .flow import FLOW_TRIGGER_KEYS
+    if trigger.key in FLOW_TRIGGER_KEYS:
+        lines.append("Order-flow read (CVD / OI / liquidation) is forward-test only - not backtested.")
     lines.append("Short-term swing timing - separate from the long-term accumulation thesis.")
     lines.append("Not financial advice - alert only. You decide whether, how much, and where to trade.")
     return title, "\n".join(lines)
@@ -451,6 +454,9 @@ def build_st_batch_message(items: list[dict], direction: str) -> tuple[str, str]
             lines.append(f"    risk frame: stop ${lv['stop']:,.0f} / target ${lv['target']:,.0f}"
                          + (f" (~{lv['rr']}R)" if lv["rr"] else ""))
     lines.append("")
+    from .flow import FLOW_TRIGGER_KEYS
+    if any(it["trigger"].key in FLOW_TRIGGER_KEYS for it in items):
+        lines.append("Order-flow reads (CVD / OI / liquidation) are forward-test only - not backtested.")
     lines.append("Short-term swing timing - separate from the long-term accumulation thesis.")
     lines.append("Not financial advice - alert only. You decide whether, how much, and where to trade.")
     return title, "\n".join(lines)

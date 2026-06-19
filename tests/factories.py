@@ -12,6 +12,7 @@ _BASE = dict(
     fred_api_key=None,
     coinalyze_api_key=None, coinalyze_symbol="BTCUSDT_PERP.A",
     flow_cvd_lookback=14, flow_liq_spike_mult=3.0,
+    flow_oi_bar_surge_pct=3.0, flow_liq_min_usd=500_000.0,
     glassnode_api_key=None, cryptoquant_api_key=None,
     coinglass_api_key=None, sosovalue_api_key=None,
     onchain_free_enabled=True, oi_flush_window_hours=24.0,

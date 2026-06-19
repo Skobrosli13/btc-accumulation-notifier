@@ -101,6 +101,8 @@ class Config:
     coinalyze_symbol: str          # Coinalyze market id (e.g. BTCUSDT_PERP.A = Binance perp)
     flow_cvd_lookback: int         # bars for CVD/price divergence on the primary ST timeframe
     flow_liq_spike_mult: float     # last-bar liquidations >= this x recent mean = a flush trigger
+    flow_oi_bar_surge_pct: float   # abs SINGLE-BAR OI %change for the participant trigger (per-bar, not per-window)
+    flow_liq_min_usd: float        # absolute $ floor for a flush (guards a near-zero quiet baseline)
 
     # Paid drop-ins (presence toggles the layer)
     glassnode_api_key: str | None
@@ -229,6 +231,8 @@ def load_config() -> Config:
         coinalyze_symbol=_get("COINALYZE_SYMBOL", "BTCUSDT_PERP.A"),
         flow_cvd_lookback=_get_int("FLOW_CVD_LOOKBACK", 14),
         flow_liq_spike_mult=_get_float("FLOW_LIQ_SPIKE_MULT", 3.0),
+        flow_oi_bar_surge_pct=_get_float("FLOW_OI_BAR_SURGE_PCT", 3.0),
+        flow_liq_min_usd=_get_float("FLOW_LIQ_MIN_USD", 500_000.0),
         glassnode_api_key=_opt("GLASSNODE_API_KEY"),
         cryptoquant_api_key=_opt("CRYPTOQUANT_API_KEY"),
         coinglass_api_key=_opt("COINGLASS_API_KEY"),
