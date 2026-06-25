@@ -15,8 +15,8 @@ from datetime import datetime, timezone
 
 from . import alerting, notify, playbook, scoring, store
 from .config import Config, load_config
-from .sources import (derivatives, etf_flows, funding, macro, miner, onchain,
-                      price, sentiment, stablecoins)
+from .sources import (coindesk, derivatives, etf_flows, funding, macro, miner,
+                      onchain, price, sentiment, stablecoins)
 
 log = logging.getLogger("btc-accum")
 
@@ -50,6 +50,10 @@ def gather_readings(cfg: Config) -> tuple[dict, dict]:
     readings.update(onchain.onchain(price_struct.get("price")))  # mvrv_z, realized_ratio, nupl, sopr, puell, reserve_risk
     readings.update(miner.hash_ribbon())                  # hash_ribbon (miner capitulation->recovery)
     readings.update(derivatives.derivatives())            # liq_magnitude, oi_flush
+    # CoinDesk/CryptoCompare network-activity + social context (cd_* keys).
+    # FORWARD-TEST ONLY: stored & displayed but absent from scoring.CATEGORY_INDICATORS,
+    # so composite() never sees them — the live score is provably unaffected.
+    readings.update(coindesk.coindesk())
     return readings, price_struct
 
 
