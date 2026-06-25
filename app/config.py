@@ -149,7 +149,7 @@ class Config:
     st_strong_buy_threshold: float
     st_sell_threshold: float         # st_composite <= this => SELL state (negative)
     st_strong_sell_threshold: float
-    st_regime_suppress: bool         # if true, drop alerts that fight the 200-day regime
+    st_regime_suppress: bool         # if true (default), drop alerts that fight the 200-day regime — also prevents opposing BUY+SELL alerts in the same run
     st_require_confluence: bool       # if true, a lone unaligned trigger won't alert
 
     # Dashboard read-only API
@@ -270,7 +270,11 @@ def load_config() -> Config:
         st_strong_buy_threshold=_get_float("ST_STRONG_BUY_THRESHOLD", 60),
         st_sell_threshold=_get_float("ST_SELL_THRESHOLD", -30),
         st_strong_sell_threshold=_get_float("ST_STRONG_SELL_THRESHOLD", -60),
-        st_regime_suppress=_get_bool("ST_REGIME_SUPPRESS", False),
+        # Default ON: don't fight the 200-day regime, and (the reason this is the
+        # default) it stops the collector from emitting an opposing BUY and SELL in
+        # the same run — counter-regime triggers are dropped. Set =false to re-enable
+        # two-sided swing alerts.
+        st_regime_suppress=_get_bool("ST_REGIME_SUPPRESS", True),
         st_require_confluence=_get_bool("ST_REQUIRE_CONFLUENCE", True),
         api_token=_opt("API_TOKEN"),
         api_cors_origin=_opt("API_CORS_ORIGIN"),
