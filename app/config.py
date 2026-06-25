@@ -110,10 +110,6 @@ class Config:
     coinglass_api_key: str | None
     sosovalue_api_key: str | None
 
-    # CoinDesk / CryptoCompare (legacy min-api) — free key, network-activity +
-    # social context reads. FORWARD-TEST only: stored & displayed, never scored.
-    coindesk_api_key: str | None
-
     # Free on-chain default (bitcoin-data.com / BGeometrics) — on unless disabled.
     onchain_free_enabled: bool
     # Window for the free OKX-OI-derived oi_flush (long-term derivs), in hours.
@@ -205,12 +201,6 @@ class Config:
     def macro_active(self) -> bool:
         return bool(self.fred_api_key)
 
-    @property
-    def coindesk_active(self) -> bool:
-        """CoinDesk/CryptoCompare context layer (network-activity + social),
-        forward-test only — lit purely by the key's presence, like every layer."""
-        return bool(self.coindesk_api_key)
-
     def notifications_configured(self) -> bool:
         return bool(
             self.email_active
@@ -247,7 +237,6 @@ def load_config() -> Config:
         cryptoquant_api_key=_opt("CRYPTOQUANT_API_KEY"),
         coinglass_api_key=_opt("COINGLASS_API_KEY"),
         sosovalue_api_key=_opt("SOSOVALUE_API_KEY"),
-        coindesk_api_key=_opt("COINDESK_API_KEY"),
         onchain_free_enabled=_get_bool("ONCHAIN_FREE", True),
         oi_flush_window_hours=_get_float("OI_FLUSH_WINDOW_HOURS", 24.0),
         exchange=_get("EXCHANGE", "okx").lower(),

@@ -121,7 +121,6 @@ def health(cfg: Config = Depends(get_config), _=Depends(require_token)) -> dict:
             "macro": cfg.macro_active,
             "derivs_paid": cfg.derivs_paid_active,
             "flow": cfg.coinalyze_active,   # free Coinalyze order-flow layer (CVD/OI/liq)
-            "coindesk": cfg.coindesk_active,  # CoinDesk/CryptoCompare context (forward-test, not scored)
             "email": cfg.email_active,
         },
         "onchain_source": cfg.onchain_source,
@@ -318,14 +317,13 @@ def _lt_breakdown(latest: dict, cfg: Config) -> dict:
         # context-only metrics (shown, not scored)
         "context": {
             "reserve_risk": raw.get("reserve_risk"), "rhodl": raw.get("rhodl"),
-            # CoinDesk/CryptoCompare network-activity + social — FORWARD-TEST, not
-            # in the score. Each carries the latest value + a trailing-90d z-score.
-            "coindesk": {
-                "active_addr": raw.get("cd_active_addr"), "active_addr_z": raw.get("cd_active_addr_z"),
-                "large_tx": raw.get("cd_large_tx"), "large_tx_z": raw.get("cd_large_tx_z"),
-                "new_addr": raw.get("cd_new_addr"), "new_addr_z": raw.get("cd_new_addr_z"),
-                "tx_count": raw.get("cd_tx_count"), "tx_count_z": raw.get("cd_tx_count_z"),
-                "social_z": raw.get("cd_social_z"), "reddit_active": raw.get("cd_reddit_active"),
+            # Free on-chain network-activity reads — FORWARD-TEST, not in the score.
+            # Each carries the latest value + a trailing-90d z-score.
+            "netactivity": {
+                "active_addr": raw.get("na_active_addr"), "active_addr_z": raw.get("na_active_addr_z"),
+                "tx_count": raw.get("na_tx_count"), "tx_count_z": raw.get("na_tx_count_z"),
+                "transfers": raw.get("na_transfers"), "transfers_z": raw.get("na_transfers_z"),
+                "addr_balance": raw.get("na_addr_balance"), "addr_balance_z": raw.get("na_addr_balance_z"),
             },
         },
     }
