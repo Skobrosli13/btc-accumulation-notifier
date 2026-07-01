@@ -162,6 +162,33 @@ class Config:
     # Watchdog (dead-man's-switch)
     watchdog_stale_hours: float
 
+    # --- Stock swing tracker (second asset class) -----------------------
+    # Optional with defaults so any external Config construction stays valid.
+    # Free-tier by default: Yahoo/Stooq (prices), SEC EDGAR (insider) and FINRA
+    # (short-vol) are keyless; Finnhub (a free key) lights up the scored PEAD
+    # edge; Alpaca/Tiingo are optional price upgrades. Presence of a key toggles
+    # the layer, exactly like the BTC side.
+    finnhub_api_key: str | None = None
+    alpaca_api_key: str | None = None
+    alpaca_secret_key: str | None = None
+    tiingo_api_key: str | None = None
+    sec_user_agent: str = "riverviewweb-signal stock tracker admin@riverviewweb.com"
+    stock_insider_enabled: bool = True
+    stock_shortvol_enabled: bool = True
+    stock_congress_enabled: bool = False
+    stock_universe_path: str = "app/stock_universe.json"
+    stock_top_n: int = 15
+    stock_pead_lookback_days: int = 10
+    stock_pead_min_surprise: float = 3.0
+    stock_min_price: float = 5.0
+    stock_min_dollar_vol: float = 5_000_000.0
+    stock_atr_k_stop: float = 1.5
+    stock_atr_k_t1: float = 1.5
+    stock_atr_k_t2: float = 2.5
+    stock_time_stop_days: int = 12
+    stock_cooldown_days: float = 5.0
+    stock_allow_shorts: bool = False   # Phase 1 = long-only; flip on for Phase 2 (negative-PEAD/short setups)
+
     # --- Derived helpers -------------------------------------------------
 
     @property
@@ -200,6 +227,41 @@ class Config:
     @property
     def macro_active(self) -> bool:
         return bool(self.fred_api_key)
+
+    # --- Stock layer toggles (drive /api/stock/health messaging only; scoring
+    # lights up purely from a source returning real numbers, like the BTC side) --
+
+    @property
+    def finnhub_active(self) -> bool:
+        """The scored PEAD edge needs Finnhub (earnings surprises). Free key."""
+        return bool(self.finnhub_api_key)
+
+    @property
+    def alpaca_active(self) -> bool:
+        return bool(self.alpaca_api_key and self.alpaca_secret_key)
+
+    @property
+    def stock_price_source(self) -> str:
+        """Which venue prices() will prefer — kept aligned with sources/stocks/prices.py.
+        Keyless default is the (fragile) Yahoo chart endpoint; a free Alpaca/Tiingo
+        key upgrades to a robust, documented feed."""
+        if self.alpaca_active:
+            return "alpaca"
+        if self.tiingo_api_key:
+            return "tiingo"
+        return "yahoo"  # keyless free default (best-effort)
+
+    @property
+    def stock_insider_active(self) -> bool:
+        return self.stock_insider_enabled  # keyless
+
+    @property
+    def stock_shortvol_active(self) -> bool:
+        return self.stock_shortvol_enabled  # keyless
+
+    @property
+    def stock_congress_active(self) -> bool:
+        return self.stock_congress_enabled  # keyless (Phase 3 forward-test)
 
     def notifications_configured(self) -> bool:
         return bool(
@@ -276,6 +338,28 @@ def load_config() -> Config:
         # two-sided swing alerts.
         st_regime_suppress=_get_bool("ST_REGIME_SUPPRESS", True),
         st_require_confluence=_get_bool("ST_REQUIRE_CONFLUENCE", True),
+        # --- Stock swing tracker ---
+        finnhub_api_key=_opt("FINNHUB_API_KEY"),
+        alpaca_api_key=_opt("ALPACA_API_KEY"),
+        alpaca_secret_key=_opt("ALPACA_SECRET_KEY"),
+        tiingo_api_key=_opt("TIINGO_API_KEY"),
+        sec_user_agent=_get("SEC_USER_AGENT",
+                            "riverviewweb-signal stock tracker admin@riverviewweb.com"),
+        stock_insider_enabled=_get_bool("STOCK_INSIDER", True),
+        stock_shortvol_enabled=_get_bool("STOCK_SHORTVOL", True),
+        stock_congress_enabled=_get_bool("STOCK_CONGRESS", False),
+        stock_universe_path=_get("STOCK_UNIVERSE_PATH", "app/stock_universe.json"),
+        stock_top_n=_get_int("STOCK_TOP_N", 15),
+        stock_pead_lookback_days=_get_int("STOCK_PEAD_LOOKBACK_DAYS", 10),
+        stock_pead_min_surprise=_get_float("STOCK_PEAD_MIN_SURPRISE", 3.0),
+        stock_min_price=_get_float("STOCK_MIN_PRICE", 5.0),
+        stock_min_dollar_vol=_get_float("STOCK_MIN_DOLLAR_VOL", 5_000_000.0),
+        stock_atr_k_stop=_get_float("STOCK_ATR_K_STOP", 1.5),
+        stock_atr_k_t1=_get_float("STOCK_ATR_K_T1", 1.5),
+        stock_atr_k_t2=_get_float("STOCK_ATR_K_T2", 2.5),
+        stock_time_stop_days=_get_int("STOCK_TIME_STOP_DAYS", 12),
+        stock_cooldown_days=_get_float("STOCK_COOLDOWN_DAYS", 5),
+        stock_allow_shorts=_get_bool("STOCK_ALLOW_SHORTS", False),
         api_token=_opt("API_TOKEN"),
         api_cors_origin=_opt("API_CORS_ORIGIN"),
         public_base_url=_get("PUBLIC_BASE_URL", "https://btc.riverviewweb.com").rstrip("/"),
