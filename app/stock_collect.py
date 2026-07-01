@@ -234,7 +234,11 @@ def run(cfg: Config, *, dry_run: bool = False, limit: int | None = None,
     earnings_by = _fetch_earnings(conn, cfg, tset, dry_run)
     shortvol_by = _fetch_shortvol(conn, cfg, tset, dry_run)
     insider_by = {} if skip_insider else _fetch_insider(conn, cfg, universe_rows, dry_run)
-    revision_by = {} if (skip_estimates or dry_run) else _snapshot_estimates(conn, cfg, tickers)
+    # Estimate snapshots are 1 Finnhub call/ticker -> only snapshot names that just
+    # REPORTED (revision-confirmation matters most post-earnings) so the free 60/min
+    # limit isn't blown by the full universe.
+    revision_by = {} if (skip_estimates or dry_run) else _snapshot_estimates(
+        conn, cfg, list(earnings_by.keys()))
     regime = _market_regime(cfg)
 
     if cfg.stock_congress_active and not skip_congress and not dry_run:
