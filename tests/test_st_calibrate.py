@@ -7,7 +7,11 @@ All deterministic, over SYNTHETIC frames — no network. Covers:
     and mark-to-market of trades that resolve neither way within the horizon.
   * cell_stats significance flags.
   * The alerted-population replay applies cooldown + same-candle dedup, and the
-    regime/confluence gates, exactly as app/collect_once does.
+    regime/confluence gates, exactly as app/collect_once does. (Gate tests pass
+    full_warm=False so short synthetic frames can fire; warm-up behavior has its
+    own test.)
+  * The 200DMA regime tag sees only CLOSED daily candles (no look-ahead).
+  * st_calibrate._score_population de-correlates overlapping fires to episodes.
 """
 from __future__ import annotations
 
@@ -193,7 +197,7 @@ def test_replay_two_fires_same_candle_count_once():
     for i in range(40):
         closes.append(100.0 + (3.0 if i % 2 == 0 else -3.0))
     df = _candles(closes, tf="4h")
-    res = stv.replay_alerts(df, cfg, "4h", regime_series=None, maxh=0)
+    res = stv.replay_alerts(df, cfg, "4h", regime_series=None, maxh=0, full_warm=False)
     # No two ALERTED events share the same (key, candle_ts) — same-candle dedup.
     seen = set()
     for e in res.alerted:
@@ -210,7 +214,7 @@ def test_replay_cooldown_excludes_within_window():
     for i in range(40):
         closes.append(100.0 + (3.0 if i % 2 == 0 else -3.0))
     df = _candles(closes, tf="4h")
-    res = stv.replay_alerts(df, cfg, "4h", regime_series=None, maxh=0)
+    res = stv.replay_alerts(df, cfg, "4h", regime_series=None, maxh=0, full_warm=False)
     # With a near-infinite cooldown, each trigger key alerts at most once.
     per_key: dict[str, int] = {}
     for e in res.alerted:
@@ -232,7 +236,7 @@ def test_replay_confluence_gate_filters_lone_unaligned_triggers():
     cfg = make_config(st_require_confluence=True, st_regime_suppress=False)
     up = [100.0 + i * 0.5 for i in range(41)]
     df = _candles(up, tf="4h", volumes=[1.0] * 40 + [5.0])
-    res = stv.replay_alerts(df, cfg, "4h", regime_series=None, maxh=0)
+    res = stv.replay_alerts(df, cfg, "4h", regime_series=None, maxh=0, full_warm=False)
     last = [e for e in res.raw if e.index == 40]
     assert len(last) == 1 and last[0].key == "vol_flush_up"  # exactly one lone fire
     assert all(e.index != 40 for e in res.alerted)  # the lone fire didn't alert
@@ -246,7 +250,7 @@ def test_replay_regime_suppression_drops_counter_regime():
                       index=pd.date_range("2025-01-01", periods=260, freq="1D", tz="UTC"))
     closes = [100.0] * 40 + [101.0]   # an EMA bull cross (BUY) on the last candle
     df = _candles(closes, tf="4h", start="2026-06-01")
-    res = stv.replay_alerts(df, cfg, "4h", regime_series=daily, maxh=0)
+    res = stv.replay_alerts(df, cfg, "4h", regime_series=daily, maxh=0, full_warm=False)
     buys_alerted = [e for e in res.alerted if e.direction == "BUY"]
     assert any(e.direction == "BUY" for e in res.raw)  # raw had the BUY
     assert buys_alerted == []  # suppressed against the bear regime
@@ -261,9 +265,38 @@ def test_replay_uses_fixed_live_window_not_expanding():
     n = stv.LIVE_WINDOW + 100
     closes = [100.0 + (i % 5) for i in range(n)]
     df = _candles(closes, tf="4h")
-    res = stv.replay_alerts(df, cfg, "4h", regime_series=None, maxh=0)
+    res = stv.replay_alerts(df, cfg, "4h", regime_series=None, maxh=0, full_warm=False)
     assert all(e.index >= stv.MIN_LOOKBACK for e in res.raw)
     assert all(e.index < n for e in res.raw)
+
+
+def test_replay_default_drops_unwarmed_events():
+    # By default, no event is scored on a window shorter than the live ~300 bars:
+    # live always recomputes EWM indicators on LIVE_WINDOW candles, so events fired
+    # off shorter warm-up windows are events production would never emit.
+    cfg = make_config(st_require_confluence=False, st_regime_suppress=False)
+    n = stv.LIVE_WINDOW + 100
+    closes = [100.0 + (3.0 if i % 2 == 0 else -3.0) for i in range(n)]  # fires throughout
+    df = _candles(closes, tf="4h")
+    warmed = stv.replay_alerts(df, cfg, "4h", regime_series=None, maxh=0)
+    assert warmed.raw, "expected fires on the sawtooth"
+    assert all(e.index >= stv.LIVE_WINDOW - 1 for e in warmed.raw)
+    # Opting out (synthetic gate tests) scores the short-window head too.
+    unwarmed = stv.replay_alerts(df, cfg, "4h", regime_series=None, maxh=0,
+                                 full_warm=False)
+    assert any(e.index < stv.LIVE_WINDOW - 1 for e in unwarmed.raw)
+
+
+def test_regime_at_no_lookahead_into_forming_daily_candle():
+    # Daily index = candle OPEN time; day D's close is unknown until D+1 00:00.
+    idx = pd.date_range("2025-01-01", periods=261, freq="1D", tz="UTC")
+    vals = [100.0] * 260 + [1.0]     # day 260 crashes far below the 200DMA
+    daily = pd.Series(vals, index=idx)
+    # A 4h candle opened 08:00 on day 260 evaluates at 12:00 — the day-260 daily
+    # candle is still forming and must NOT be visible: regime stays bull.
+    assert stv._regime_at(daily, idx[260] + pd.Timedelta(hours=12)) == "bull"
+    # Once day 260's candle HAS closed (evaluating at day-261 00:00) it counts.
+    assert stv._regime_at(daily, idx[260] + pd.Timedelta(days=1)) == "bear"
 
 
 def test_collapse_episodes_merges_adjacent_same_key():
@@ -280,3 +313,28 @@ def test_collapse_episodes_merges_adjacent_same_key():
     assert ("ema_cross_bull", 12) not in keys_idx   # merged into the 10
     assert ("ema_cross_bull", 40) in keys_idx       # separate episode
     assert ("macd_bull_cross", 11) in keys_idx
+
+
+# --- st_calibrate cell construction -------------------------------------------
+
+def test_score_population_decorrelates_to_episodes_and_stamps_horizon():
+    # Two same-key fires 2 bars apart with a 10-bar horizon overlap ~80% — they
+    # must count as ONE episode; a third fire 30 bars later is a separate episode.
+    from scripts.st_calibrate import _score_population
+    from scripts.st_validation import AlertEvent
+
+    closes = [100.0 + i * 0.1 for i in range(60)]
+    frame = _candles(closes, tf="4h")
+    events = [
+        AlertEvent("ema_cross_bull", "BUY", "4h", 10, 1000),
+        AlertEvent("ema_cross_bull", "BUY", "4h", 12, 2000),   # inside the horizon gap
+        AlertEvent("ema_cross_bull", "BUY", "4h", 40, 3000),
+    ]
+    cells = _score_population(events, frame, fwd=10)
+    cell = cells["ema_cross_bull"]
+    assert cell["n"] == 2                    # episodes, not fires
+    assert cell["fires"] == 3                # pre-collapse count preserved
+    assert cell["horizon_bars"] == 10        # horizon carried per cell
+    # Opting out of collapse scores every fire (the old, overlap-inflated n).
+    raw_cells = _score_population(events, frame, fwd=10, collapse=False)
+    assert raw_cells["ema_cross_bull"]["n"] == 3

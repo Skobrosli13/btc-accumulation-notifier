@@ -115,22 +115,27 @@ CREATE TABLE IF NOT EXISTS stock_positions (
   id            INTEGER PRIMARY KEY AUTOINCREMENT,
   ticker        TEXT,
   opened_run_ts TEXT,
-  opened_ts     INTEGER,          -- entry bar ts, epoch ms
+  opened_ts     INTEGER,          -- SIGNAL bar ts, epoch ms (fill happens on the next bar)
   direction     TEXT,
   archetype     TEXT,
   confidence    REAL,
   entry         REAL, stop REAL, t1 REAL, t2 REAL, atr REAL,
   time_stop_days INTEGER,         -- per-archetype hard time-exit (from stock_levels)
-  status        TEXT,             -- OPEN | CLOSED
+  status        TEXT,             -- PENDING | OPEN | CLOSED | EXPIRED
   closed_run_ts TEXT,
   closed_ts     INTEGER,
   exit_price    REAL,
   realized_r    REAL,             -- NET (exit-entry)/risk minus costs, signed by direction
   gross_r       REAL,             -- realized R before costs
   cost_r        REAL,             -- round-trip cost charged, in R
-  exit_reason   TEXT,             -- stop | t1 | t2 | time | reversal
+  exit_reason   TEXT,             -- stop | t1 | t2 | time | reversal | rebased | unfilled
   mfe_r         REAL,             -- max favorable excursion in R (running)
-  mae_r         REAL              -- max adverse excursion in R (running)
+  mae_r         REAL,             -- max adverse excursion in R (running)
+  filled_ts     INTEGER,          -- ENTRY bar ts (the bar whose open filled the position)
+  entry_venue   TEXT,             -- price venue that served the entry bar (pinned for repricing)
+  entry_bar_close REAL,           -- entry bar's close (split/adjustment re-base detection)
+  structure_stop REAL,            -- thesis-invalidation level captured at signal time
+  last_reprice_ts INTEGER         -- wall-clock ms of the last successful reprice
 );
 CREATE INDEX IF NOT EXISTS ix_stock_positions_status ON stock_positions(status, ticker);
 
@@ -144,7 +149,8 @@ CREATE TABLE IF NOT EXISTS stock_alerts (
   entry      REAL, stop REAL, t1 REAL, t2 REAL,
   confidence REAL,
   message    TEXT,
-  sent       INTEGER DEFAULT 0
+  sent       INTEGER DEFAULT 0,
+  retried    INTEGER DEFAULT 0    -- failed sends are retried exactly once next run
 );
 CREATE INDEX IF NOT EXISTS ix_stock_alerts_key ON stock_alerts(ticker, archetype, ts DESC);
 """
@@ -158,6 +164,12 @@ def init_stock_db(conn: sqlite3.Connection) -> None:
     _add_column_if_missing(conn, "stock_positions", "time_stop_days", "INTEGER")
     _add_column_if_missing(conn, "stock_positions", "gross_r", "REAL")
     _add_column_if_missing(conn, "stock_positions", "cost_r", "REAL")
+    _add_column_if_missing(conn, "stock_positions", "filled_ts", "INTEGER")
+    _add_column_if_missing(conn, "stock_positions", "entry_venue", "TEXT")
+    _add_column_if_missing(conn, "stock_positions", "entry_bar_close", "REAL")
+    _add_column_if_missing(conn, "stock_positions", "structure_stop", "REAL")
+    _add_column_if_missing(conn, "stock_positions", "last_reprice_ts", "INTEGER")
+    _add_column_if_missing(conn, "stock_alerts", "retried", "INTEGER DEFAULT 0")
     _add_column_if_missing(conn, "stock_earnings", "rev_actual", "REAL")
     _add_column_if_missing(conn, "stock_earnings", "rev_estimate", "REAL")
     _add_column_if_missing(conn, "stock_earnings", "rev_surprise_pct", "REAL")
@@ -241,6 +253,16 @@ def prices_after(conn: sqlite3.Connection, ticker: str, ts_ms: int) -> list[dict
         (ticker, ts_ms),
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+def close_at(conn: sqlite3.Connection, ticker: str, ts_ms: int) -> float | None:
+    """The stored close for one exact bar date — the series is kept on the venue's
+    CURRENT adjustment basis by the daily collector, so this re-expresses an old
+    price (e.g. a holding's entry) in today's basis after a split."""
+    row = conn.execute(
+        "SELECT close FROM stock_prices WHERE ticker = ? AND ts = ?", (ticker, ts_ms)
+    ).fetchone()
+    return row["close"] if row and row["close"] is not None else None
 
 
 def last_price_ts(conn: sqlite3.Connection, ticker: str) -> int | None:
@@ -415,6 +437,23 @@ def latest_stock_run(conn: sqlite3.Connection) -> dict | None:
     return out
 
 
+def recent_stock_runs(conn: sqlite3.Connection, limit: int = 3) -> list[dict]:
+    """Most recent runs (newest first) with parsed readings — the health endpoint
+    reads per-layer outcome counts across these to spot a dead-but-configured source."""
+    rows = conn.execute(
+        "SELECT * FROM stock_runs ORDER BY run_ts DESC LIMIT ?", (limit,)
+    ).fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        try:
+            d["readings"] = json.loads(d.pop("readings_json") or "{}")
+        except (json.JSONDecodeError, TypeError):
+            d["readings"] = {}
+        out.append(d)
+    return out
+
+
 def latest_stock_signals(conn: sqlite3.Connection) -> list[dict]:
     """Ranked signals of the most recent run, best-rank first, detail parsed."""
     latest = conn.execute("SELECT run_ts FROM stock_runs ORDER BY run_ts DESC LIMIT 1").fetchone()
@@ -449,38 +488,109 @@ def last_stock_run_ts(conn: sqlite3.Connection) -> datetime | None:
 def insert_position(conn: sqlite3.Connection, *, ticker: str, opened_run_ts: str,
                     opened_ts: int, direction: str, archetype: str, confidence: float,
                     entry: float, stop: float, t1: float, t2: float, atr: float,
-                    time_stop_days: int) -> int:
+                    time_stop_days: int, status: str = "OPEN",
+                    structure_stop: float | None = None,
+                    entry_venue: str | None = None) -> int:
+    """``status='PENDING'`` inserts an unfilled setup: levels are provisional (the
+    signal close) until the next run fills at the following bar's open."""
     cur = conn.execute(
         """
         INSERT INTO stock_positions
           (ticker, opened_run_ts, opened_ts, direction, archetype, confidence,
-           entry, stop, t1, t2, atr, time_stop_days, status, mfe_r, mae_r)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', 0, 0)
+           entry, stop, t1, t2, atr, time_stop_days, status, mfe_r, mae_r,
+           structure_stop, entry_venue)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?)
         """,
         (ticker, opened_run_ts, opened_ts, direction, archetype, confidence,
-         entry, stop, t1, t2, atr, time_stop_days),
+         entry, stop, t1, t2, atr, time_stop_days, status, structure_stop, entry_venue),
     )
     conn.commit()
     return int(cur.lastrowid)
 
 
 def open_positions(conn: sqlite3.Connection) -> list[dict]:
+    """Filled positions only — PENDING setups carry no open risk yet."""
     rows = conn.execute("SELECT * FROM stock_positions WHERE status = 'OPEN'").fetchall()
     return [dict(r) for r in rows]
 
 
+def pending_positions(conn: sqlite3.Connection) -> list[dict]:
+    rows = conn.execute("SELECT * FROM stock_positions WHERE status = 'PENDING'").fetchall()
+    return [dict(r) for r in rows]
+
+
 def has_open_position(conn: sqlite3.Connection, ticker: str, archetype: str) -> bool:
+    """True while a position is live OR still pending fill (dedup gate)."""
     row = conn.execute(
-        "SELECT 1 FROM stock_positions WHERE ticker = ? AND archetype = ? AND status = 'OPEN' LIMIT 1",
+        "SELECT 1 FROM stock_positions WHERE ticker = ? AND archetype = ? "
+        "AND status IN ('OPEN', 'PENDING') LIMIT 1",
         (ticker, archetype),
     ).fetchone()
     return row is not None
 
 
+def fill_position(conn: sqlite3.Connection, pos_id: int, *, filled_ts: int, entry: float,
+                  stop: float, t1: float, t2: float, entry_venue: str | None,
+                  entry_bar_close: float, last_reprice_ts: int) -> None:
+    """PENDING -> OPEN at the next bar's open; levels are recomputed at the fill."""
+    conn.execute(
+        """
+        UPDATE stock_positions SET status='OPEN', filled_ts=?, entry=?, stop=?, t1=?, t2=?,
+          entry_venue=?, entry_bar_close=?, last_reprice_ts=?
+        WHERE id=?
+        """,
+        (filled_ts, entry, stop, t1, t2, entry_venue, entry_bar_close,
+         last_reprice_ts, pos_id),
+    )
+    conn.commit()
+
+
+def expire_position(conn: sqlite3.Connection, pos_id: int, *, closed_run_ts: str,
+                    closed_ts: int) -> None:
+    """A PENDING setup that never filled — never entered, never part of the record."""
+    conn.execute(
+        "UPDATE stock_positions SET status='EXPIRED', closed_run_ts=?, closed_ts=?, "
+        "exit_reason='unfilled' WHERE id=?",
+        (closed_run_ts, closed_ts, pos_id),
+    )
+    conn.commit()
+
+
+def rebase_position(conn: sqlite3.Connection, pos_id: int, *, entry: float, stop: float,
+                    t1: float, t2: float, atr: float | None,
+                    entry_bar_close: float) -> None:
+    """Rescale stored levels after a detected split/adjustment re-base of the series."""
+    conn.execute(
+        "UPDATE stock_positions SET entry=?, stop=?, t1=?, t2=?, atr=?, entry_bar_close=? "
+        "WHERE id=?",
+        (entry, stop, t1, t2, atr, entry_bar_close, pos_id),
+    )
+    conn.commit()
+
+
+def void_position(conn: sqlite3.Connection, pos_id: int, *, closed_run_ts: str,
+                  closed_ts: int) -> None:
+    """Void a position whose price basis can't be verified (entry bar vanished from
+    the re-fetched series). exit_reason='rebased' rows are excluded from win-rate
+    aggregation — a corrupted basis must never pollute the track record."""
+    conn.execute(
+        "UPDATE stock_positions SET status='CLOSED', closed_run_ts=?, closed_ts=?, "
+        "exit_reason='rebased', realized_r=NULL, gross_r=NULL, cost_r=NULL WHERE id=?",
+        (closed_run_ts, closed_ts, pos_id),
+    )
+    conn.commit()
+
+
 def update_position_excursion(conn: sqlite3.Connection, pos_id: int,
-                              mfe_r: float, mae_r: float) -> None:
-    conn.execute("UPDATE stock_positions SET mfe_r = ?, mae_r = ? WHERE id = ?",
-                 (mfe_r, mae_r, pos_id))
+                              mfe_r: float, mae_r: float,
+                              last_reprice_ts: int | None = None) -> None:
+    if last_reprice_ts is not None:
+        conn.execute(
+            "UPDATE stock_positions SET mfe_r = ?, mae_r = ?, last_reprice_ts = ? WHERE id = ?",
+            (mfe_r, mae_r, last_reprice_ts, pos_id))
+    else:
+        conn.execute("UPDATE stock_positions SET mfe_r = ?, mae_r = ? WHERE id = ?",
+                     (mfe_r, mae_r, pos_id))
     conn.commit()
 
 
@@ -547,6 +657,22 @@ def recent_stock_alerts(conn: sqlite3.Connection, limit: int = 50) -> list[dict]
         "SELECT * FROM stock_alerts ORDER BY ts DESC LIMIT ?", (limit,)
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+def unsent_stock_alerts(conn: sqlite3.Connection) -> list[dict]:
+    """Alert rows whose send failed and that haven't been retried yet (retry-once)."""
+    rows = conn.execute(
+        "SELECT * FROM stock_alerts WHERE sent = 0 AND COALESCE(retried, 0) = 0 "
+        "ORDER BY id ASC"
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def mark_stock_alert_retry(conn: sqlite3.Connection, alert_id: int, sent: bool) -> None:
+    """Record the single retry attempt; ``sent=1`` also (re)arms the cooldown."""
+    conn.execute("UPDATE stock_alerts SET retried = 1, sent = ? WHERE id = ?",
+                 (int(sent), alert_id))
+    conn.commit()
 
 
 # --- Retention ---------------------------------------------------------------

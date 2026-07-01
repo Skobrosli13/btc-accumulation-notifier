@@ -16,6 +16,7 @@ Funding/OI use the OKX perpetual swap and degrade to None on any failure.
 from __future__ import annotations
 
 import logging
+import time
 
 import pandas as pd
 
@@ -29,6 +30,14 @@ COINBASE_BASE = "https://api.exchange.coinbase.com"
 
 # timeframe -> venue-specific interval codes
 _OKX_BAR = {"4h": "4H", "1d": "1Dutc", "1w": "1Wutc"}
+# NOTE on weekly anchors: OKX "1Wutc" weeks are Monday-anchored UTC; Kraken's
+# interval=10080 weeks are epoch-aligned (Thursday 00:00 UTC boundary); and the
+# Coinbase/CoinGecko fallbacks resample daily closes with pandas "1W" (Sunday-
+# ending) in price.py. A venue fallback can therefore shift the weekly close
+# boundary by several days — a ~0.1%-of-value nudge to the 200-week MA and the
+# derived cycle ATH date, well inside the tier thresholds' tolerance. Any future
+# indicator with tighter weekly-boundary sensitivity must resample all venues'
+# DAILY closes to one shared anchor instead of trusting native weekly bars.
 _KRAKEN_MIN = {"4h": 240, "1d": 1440, "1w": 10080}
 # Coinbase only offers a fixed granularity set (seconds); 4h and 1w are NOT in it,
 # so Coinbase serves as a daily/6h fallback only (still fixes the long-term ATH /
@@ -91,7 +100,8 @@ def _okx_klines(timeframe: str, limit: int, symbol: str) -> pd.DataFrame | None:
 
 # --- Kraken -------------------------------------------------------------------
 
-def _kraken_klines(timeframe: str, symbol: str) -> pd.DataFrame | None:
+def _kraken_klines(timeframe: str, symbol: str,
+                   limit: int | None = None) -> pd.DataFrame | None:
     interval = _KRAKEN_MIN.get(timeframe)
     pair = _kraken_pair(symbol)
     if interval is None or pair is None:
@@ -110,6 +120,11 @@ def _kraken_klines(timeframe: str, symbol: str) -> pd.DataFrame | None:
     for i, c in enumerate(raw):
         confirmed = i < n - 1  # Kraken's last candle is the in-progress one
         rows.append([int(c[0]) * 1000, c[1], c[2], c[3], c[4], c[6], confirmed])
+    # Kraken ignores any count param and returns ~720 rows; cap to the newest
+    # ``limit`` so a fallback batch never writes a WIDER window than the OKX
+    # primary would have (persisted candles stay comparable across venues).
+    if limit is not None and limit > 0:
+        rows = rows[-limit:]
     return _df_from_rows(rows)
 
 
@@ -119,6 +134,10 @@ def _coinbase_klines(timeframe: str, symbol: str) -> pd.DataFrame | None:
     """Coinbase Exchange candles (free, no key, US-reachable). Daily/6h only.
 
     Row format: [time(s), low, high, open, close, volume], newest-first, max 300.
+    Coinbase doesn't flag the forming candle, so any bucket whose period hasn't
+    closed yet (open_time + granularity > now) is marked unconfirmed — keeping
+    ``closed_only`` correct on this double-fallback path too (OKX flags it via
+    ``confirm``, Kraken via the last-row rule).
     """
     gran = _COINBASE_GRAN.get(timeframe)
     product = _coinbase_product(symbol)
@@ -128,26 +147,32 @@ def _coinbase_klines(timeframe: str, symbol: str) -> pd.DataFrame | None:
                     params={"granularity": gran})
     if not data or not isinstance(data, list):
         return None
+    now = int(time.time())
     rows = []
     for c in data:  # [time, low, high, open, close, volume]
         try:
-            rows.append([int(c[0]) * 1000, c[3], c[2], c[1], c[4], c[5], True])
+            ts = int(c[0])
+            rows.append([ts * 1000, c[3], c[2], c[1], c[4], c[5], ts + gran <= now])
         except (IndexError, TypeError, ValueError):
             continue
     if not rows:
         return None
     rows.sort(key=lambda r: r[0])  # -> oldest-first
-    # Coinbase doesn't flag the forming candle; mark the last bar unconfirmed if it
-    # is the current period so closed_only stays correct.
     return _df_from_rows(rows)
 
 
-def coinbase_daily_history(total: int, symbol: str = "BTC-USDT") -> pd.DataFrame | None:
+def coinbase_daily_history(total: int, symbol: str = "BTC-USDT",
+                           include_forming: bool = True) -> pd.DataFrame | None:
     """Paginate Coinbase daily candles backward to assemble ~``total`` days.
 
     Used as the price-structure fallback ahead of CoinGecko: CoinGecko's free tier
     caps at 365 days, which yields a bogus 1-year "ATH" and no real 200-week MA.
     Coinbase reaches back years (300 candles/request via start/end).
+
+    The still-open UTC day is marked unconfirmed. The long-term price-structure
+    consumer wants that live snapshot (``include_forming=True``, the default —
+    its headline "price" is the latest close, forming or not); pass False to
+    drop unclosed buckets for closed-candle consumers.
     """
     product = _coinbase_product(symbol)
     if product is None:
@@ -172,13 +197,17 @@ def coinbase_daily_history(total: int, symbol: str = "BTC-USDT") -> pd.DataFrame
             break
     if not frames:
         return None
+    now = int(time.time())
     seen = {}
     for c in frames:  # dedup by ts; [time, low, high, open, close, volume]
         try:
-            seen[int(c[0])] = [int(c[0]) * 1000, c[3], c[2], c[1], c[4], c[5], True]
+            ts = int(c[0])
+            seen[ts] = [ts * 1000, c[3], c[2], c[1], c[4], c[5], ts + gran <= now]
         except (IndexError, TypeError, ValueError):
             continue
     rows = [seen[k] for k in sorted(seen)]
+    if not include_forming:
+        rows = [r for r in rows if r[6]]
     if not rows:
         return None
     return _df_from_rows(rows).tail(total).reset_index(drop=True)
@@ -198,7 +227,7 @@ def _iso(end_epoch: int) -> str:
 
 _KLINE_VENUES = {
     "okx": _okx_klines,
-    "kraken": lambda tf, limit, sym: _kraken_klines(tf, sym),
+    "kraken": lambda tf, limit, sym: _kraken_klines(tf, sym, limit=limit),
     "coinbase": lambda tf, limit, sym: _coinbase_klines(tf, sym),
 }
 
@@ -254,9 +283,9 @@ def klines_history(timeframe: str, total: int, symbol: str = "BTC-USDT") -> pd.D
         df = pd.concat(frames, ignore_index=True).drop_duplicates("open_time")
         return df.sort_values("open_time").reset_index(drop=True).tail(total)
     # fallback: whatever Kraken can give in one shot
-    kdf = _kraken_klines(timeframe, symbol)
+    kdf = _kraken_klines(timeframe, symbol, limit=total)
     if kdf is not None:
-        return kdf.tail(total)
+        return kdf
     raise RuntimeError(f"klines_history failed for {timeframe}")
 
 
@@ -276,16 +305,39 @@ def funding_history(limit: int = 100, symbol: str = "BTC-USDT") -> list[tuple[in
     return out
 
 
+_EIGHT_HOURS_MS = 8 * 3600_000
+# Plausible funding-interval bounds (OKX runs 8h normally, 4h in volatile
+# regimes); a spacing outside this range is a garbage payload — don't scale.
+_MIN_FUNDING_GAP_MS = 3600_000           # 1h
+_MAX_FUNDING_GAP_MS = 24 * 3600_000      # 24h
+
+
 def funding_latest(symbol: str = "BTC-USDT") -> float | None:
-    """Latest 8h funding fraction for the OKX perp, or None."""
+    """Latest OKX perp funding, normalized to a per-8h fraction, or None.
+
+    OKX switches some instruments to 4h funding in volatile regimes; the raw
+    per-settlement rate would then read ~half its 8h-equivalent exactly when the
+    spike triggers and the acute-capitulation flash care most. Mirrors
+    ``funding.funding_7d_avg``'s normalization: scale the rate by
+    8h / (nextFundingTime - fundingTime). Falls back to the raw rate when the
+    spacing fields are missing or implausible.
+    """
     data = get_json(f"{OKX_BASE}/api/v5/public/funding-rate",
                     params={"instId": _swap_inst(symbol)})
     if not data or data.get("code") != "0" or not data.get("data"):
         return None
     try:
-        return float(data["data"][0]["fundingRate"])
+        row = data["data"][0]
+        rate = float(row["fundingRate"])
     except (KeyError, IndexError, TypeError, ValueError):
         return None
+    try:
+        gap = int(row["nextFundingTime"]) - int(row["fundingTime"])
+    except (KeyError, TypeError, ValueError):
+        return rate
+    if _MIN_FUNDING_GAP_MS <= gap <= _MAX_FUNDING_GAP_MS:
+        rate *= _EIGHT_HOURS_MS / gap
+    return rate
 
 
 def open_interest(symbol: str = "BTC-USDT") -> float | None:

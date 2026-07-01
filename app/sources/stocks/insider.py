@@ -37,7 +37,9 @@ def _date_ms(s: str) -> int | None:
 
 
 def _recent_filings(cik: str, user_agent: str, count: int) -> list[dict]:
-    """[{cikdir, acc_nodash, filed_ts, index_href}] from the owner-only Form-4 feed."""
+    """[{cikdir, acc_nodash, acc_dashed, form, filed_ts}] from the owner-only Form-4
+    feed (newest first). EDGAR's ``type=4`` filter is prefix-based, so 4/A
+    amendments ride along — the ``form`` field lets the caller supersede originals."""
     txt = get_text(BROWSE, params={"action": "getcompany", "CIK": cik, "type": "4",
                                    "owner": "only", "count": count, "output": "atom"},
                    headers={"User-Agent": user_agent})
@@ -55,8 +57,10 @@ def _recent_filings(cik: str, user_agent: str, count: int) -> list[dict]:
         if not m:
             continue
         filed = entry.find("a:updated", _ATOM_NS)
+        cat = entry.find("a:category", _ATOM_NS)
+        form = (cat.get("term") or "").strip() if cat is not None else ""
         out.append({"cikdir": m.group(1), "acc_nodash": m.group(2),
-                    "acc_dashed": m.group(3),
+                    "acc_dashed": m.group(3), "form": form,
                     "filed_ts": _date_ms(filed.text) if filed is not None else None})
     return out
 
@@ -123,10 +127,40 @@ def _parse_form4(xml_text: str) -> dict | None:
             "is_officer": is_officer, "is_director": is_director, "txns": txns}
 
 
+def _dedupe_amendments(rows: list[dict]) -> list[dict]:
+    """Collapse Form 4/A refilings: an amendment refiles the same transactions
+    under a NEW accession number, which would double-count the buy cluster. Rows
+    sharing (insider, txn_code, txn_ts, shares, price) keep a single copy — the
+    amendment (form contains ``/A``) supersedes the original; ties fall back to
+    the later ``filed_ts``. Order of first appearance is preserved."""
+    def _wins(new: dict, cur: dict) -> bool:
+        new_a = "/A" in (new.get("form") or "")
+        cur_a = "/A" in (cur.get("form") or "")
+        if new_a != cur_a:
+            return new_a
+        return (new.get("filed_ts") or 0) > (cur.get("filed_ts") or 0)
+
+    best: dict[tuple, dict] = {}
+    order: list[tuple] = []
+    for r in rows:
+        key = (r.get("insider"), r.get("txn_code"), r.get("txn_ts"),
+               r.get("shares"), r.get("price"))
+        cur = best.get(key)
+        if cur is None:
+            best[key] = r
+            order.append(key)
+        elif _wins(r, cur):
+            best[key] = r
+    return [best[k] for k in order]
+
+
 def insider_transactions(cik: str, ticker: str, user_agent: str, since_ts: int,
-                         max_filings: int = 12) -> list[dict]:
+                         max_filings: int = 40) -> list[dict]:
     """Recent Form-4 transactions for a CIK filed since ``since_ts`` -> stock_insider rows.
-    Bounded to ``max_filings`` recent filings; [] on any failure / no CIK."""
+
+    Bounded to ``max_filings`` recent filings (default sized so chatty mega-cap
+    filers still cover the whole lookback window rather than a few days of it);
+    4/A amendments supersede the originals they refile. [] on failure / no CIK."""
     if not cik:
         return []
     rows: list[dict] = []
@@ -151,5 +185,6 @@ def insider_transactions(cik: str, ticker: str, user_agent: str, since_ts: int,
                 "is_director": parsed["is_director"], "txn_code": t["code"],
                 "txn_ts": t.get("txn_ts") or f.get("filed_ts"), "shares": t.get("shares"),
                 "price": t.get("price"), "value": t.get("value"), "filed_ts": f.get("filed_ts"),
+                "form": f.get("form") or "4",
             })
-    return rows
+    return _dedupe_amendments(rows)

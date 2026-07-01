@@ -1,17 +1,25 @@
 """On-chain valuation.
 
 The highest-signal layer for cycle bottoms. Provider precedence:
-  1. Glassnode (paid, ``GLASSNODE_API_KEY``) — richest, 7d-smoothed SOPR.
+  1. Glassnode (paid, ``GLASSNODE_API_KEY``) — a strict AUGMENT, not a swap:
+     the keyed path still merges the free BGeometrics static-file cohort
+     metrics (reserve_risk / lth_sopr / sth_sopr / lth_mvrv — the calibrated
+     multi-cycle indicators), and falls back to the free provider entirely if
+     the Glassnode fetch yields nothing, so keying up can never score FEWER
+     indicators than the free tier the track record certifies.
   2. bitcoin-data.com / BGeometrics (FREE, no key) — the default; lights the
      layer up end-to-end on the free tier. Disable with ``ONCHAIN_FREE=false``.
 Each metric fails soft to None and the whole category renormalizes away if the
-chosen provider is unreachable.
+chosen provider is unreachable. Dated payloads are checked against the config
+freshness budget — a frozen upstream reads as missing, not as current.
 
 Glassnode metrics used (header ``X-Api-Key``, params ``a=BTC&i=24h``):
   market/mvrv_z_score                     -> mvrv_z
   market/price_realized_usd               -> realized price (-> realized_ratio = price/realized)
   indicators/net_unrealized_profit_loss   -> nupl
-  indicators/sopr                         -> sopr (averaged over 7d)
+  indicators/sopr                         -> sopr (latest daily — the same raw-daily
+                                             definition as the free provider; the
+                                             committed thresholds were tuned on it)
   indicators/puell_multiple               -> puell
 
 bitcoin-data.com endpoints (GET ``/v1/<metric>/last`` -> ``{"d":..,"<field>":num}``):
@@ -21,8 +29,9 @@ bitcoin-data.com endpoints (GET ``/v1/<metric>/last`` -> ``{"d":..,"<field>":num
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 
-from ._http import get_json
+from ._http import get_json, is_stale
 
 log = logging.getLogger(__name__)
 
@@ -91,27 +100,56 @@ def _from_glassnode(api_key: str, price: float | None) -> dict:
     realized = _gn_latest("market/price_realized_usd", api_key)
     realized_ratio = (price / realized) if (price and realized) else None
 
-    sopr_series = _gn_series("indicators/sopr", api_key)
-    sopr_7d = (sum(sopr_series[-7:]) / len(sopr_series[-7:])) if sopr_series else None
-
     return {
         "mvrv_z": _gn_latest("market/mvrv_z_score", api_key),
         "realized_ratio": realized_ratio,
         "nupl": _gn_latest("indicators/net_unrealized_profit_loss", api_key),
-        "sopr": sopr_7d,
+        # RAW latest daily, deliberately NOT 7d-smoothed: the free provider is
+        # raw daily and the committed sopr/froth thresholds were tuned on raw
+        # daily — smoothing on one provider only is a train/serve skew.
+        "sopr": _gn_latest("indicators/sopr", api_key),
         "puell": _gn_latest("indicators/puell_multiple", api_key),
     }
 
 
+def _bd_ts_seconds(data: dict) -> float | None:
+    """Epoch seconds of a bitcoin-data.com payload (``unixTs`` or the ``d`` ISO
+    date), or None when no date field parses (then no freshness check applies)."""
+    ts = data.get("unixTs")
+    if ts is not None:
+        try:
+            ts_f = float(ts)
+            return ts_f / 1000.0 if ts_f > 1e12 else ts_f
+        except (TypeError, ValueError):
+            pass
+    d = data.get("d")
+    if isinstance(d, str):
+        try:
+            return datetime.strptime(d[:10], "%Y-%m-%d").replace(
+                tzinfo=timezone.utc).timestamp()
+        except ValueError:
+            return None
+    return None
+
+
 def _bd_last(slug: str, field: str) -> float | None:
-    """Latest value of one bitcoin-data.com metric, or None on any failure."""
+    """Latest value of one bitcoin-data.com metric, or None on any failure —
+    including a STALE latest point (older than the freshness budget): a frozen
+    upstream must renormalize away, not keep scoring its last value as current."""
     data = get_json(f"{BITCOIN_DATA_BASE}/{slug}/last")
-    if not data:
+    if not isinstance(data, dict):
+        # An error page / list / bare string must darken THIS metric only — an
+        # escaping AttributeError would take the whole layer down with it.
+        return None
+    ts = _bd_ts_seconds(data)
+    if ts is not None and is_stale(ts):
+        log.warning("bitcoin-data.com %s latest point is stale (%s); treated as missing",
+                    slug, data.get("d"))
         return None
     try:
         v = data.get(field)
         return float(v) if v is not None else None
-    except (TypeError, ValueError):
+    except (AttributeError, TypeError, ValueError):
         return None
 
 
@@ -121,6 +159,8 @@ def _bg_last(name: str) -> float | None:
     Reads ``{BG_FILES_BASE}/<name>.json`` ([[unixMs, value], ...] oldest->newest);
     no rate limit, full history. Walks back from the end to the most recent NON-null
     value — these files carry a trailing null for the current, not-yet-computed day.
+    A most-recent value older than the freshness budget means the file generator
+    has frozen: the metric reads as missing rather than stale-scored-as-current.
     """
     data = get_json(f"{BG_FILES_BASE}/{name}.json")
     if not isinstance(data, list):
@@ -133,9 +173,17 @@ def _bg_last(name: str) -> float | None:
         if v is None:
             continue
         try:
-            return float(v)
+            val = float(v)
         except (TypeError, ValueError):
             continue
+        try:
+            ts_s = float(row[0]) / 1000.0
+        except (TypeError, ValueError, IndexError):
+            ts_s = None  # undated row: no freshness check possible
+        if ts_s is not None and is_stale(ts_s):
+            log.warning("BGeometrics %s latest value is stale; treated as missing", name)
+            return None
+        return val
     return None
 
 
@@ -191,19 +239,39 @@ def history(slug: str) -> list[dict]:
 def onchain(price: float | None = None) -> dict:
     """On-chain readings keyed for the scorer.
 
-    Free by default (bitcoin-data.com); Glassnode if a key is set. All-None only
-    when the free feed is disabled and no paid key is set, or the chosen provider
-    is unreachable. ``price`` (current spot) is needed for the realized ratio.
+    Free by default (bitcoin-data.com); Glassnode augments when a key is set.
+    All-None only when the free feed is disabled and no usable paid data exists,
+    or the chosen provider is unreachable. ``price`` (current spot) is needed
+    for the realized ratio.
     """
     from ..config import load_config
 
     cfg = load_config()
     if cfg.glassnode_api_key:
+        readings = None
         try:
-            return _from_glassnode(cfg.glassnode_api_key, price)
+            readings = _from_glassnode(cfg.glassnode_api_key, price)
         except Exception as exc:  # noqa: BLE001
-            log.warning("Glassnode fetch failed (%s); on-chain layer skipped", exc)
-            return dict(_NONE_READINGS)
+            log.warning("Glassnode fetch failed (%s); falling back to the free provider", exc)
+        if readings is not None and any(v is not None for v in readings.values()):
+            # A paid key must strictly AUGMENT the free tier. The four calibrated
+            # multi-cycle cohort metrics (reserve_risk / lth_sopr / sth_sopr /
+            # lth_mvrv) live in the keyless, rate-cap-free BGeometrics static
+            # files, so merge them in — dropping them would silently remove
+            # scored indicators and step-change the composite away from the
+            # inputs the committed calibration/track record certify.
+            for key, name in _BG_FILE_METRICS.items():
+                readings[key] = _bg_last(name) if cfg.onchain_free_enabled else None
+            # Context-only REST metrics stay off the keyed path (display-only,
+            # and the free REST budget is ~10 req/hr); keys kept for a stable
+            # reading shape across providers.
+            readings.update({key: None for key in _BD_CONTEXT})
+            return readings
+        if readings is not None:
+            log.warning("Glassnode returned no usable values; "
+                        "falling back to the free provider")
+        # fall through: the keyed configuration must never be LESS resilient
+        # than the free one.
 
     if cfg.onchain_free_enabled:
         try:
@@ -215,5 +283,5 @@ def onchain(price: float | None = None) -> dict:
             log.warning("bitcoin-data.com returned no on-chain values; layer dark this run")
         return readings
 
-    log.info("On-chain layer disabled (ONCHAIN_FREE=false and no paid key); skipped")
+    log.info("On-chain layer dark (ONCHAIN_FREE=false and no usable paid source); skipped")
     return dict(_NONE_READINGS)

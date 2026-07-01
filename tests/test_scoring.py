@@ -175,6 +175,15 @@ def test_tier_hysteresis_dead_band():
     assert scoring.tier_hysteresis(61, 100, 200, "WATCH", 40, 60, 80, margin=0) == "ACCUMULATE"
 
 
+def test_composite_degraded_flag():
+    # flagged when the heaviest category (on-chain) returned no data — the
+    # renormalized composite can then shift by ~10+ points on the outage alone
+    assert scoring.composite_degraded(["price", "sentiment"]) is True
+    assert scoring.composite_degraded(["onchain", "price"]) is False
+    assert scoring.composite_degraded([]) is True
+    assert scoring.composite_degraded(None) is True
+
+
 def test_category_agreement():
     assert scoring.category_agreement({"a": 0.8, "b": 0.7}) == {
         "active": 2, "spread": 0.1, "agreement": 0.9, "confidence": "high"}

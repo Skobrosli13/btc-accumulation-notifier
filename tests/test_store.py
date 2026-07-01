@@ -104,10 +104,82 @@ def test_subscriber_lifecycle(conn):
     assert store.deactivate_subscriber(conn, "nope") is None
 
 
-def test_prune_drops_only_old_rows(conn):
+def test_prune_keeps_1d_and_st_signals_drops_intraday(conn):
     now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
     old = now_ms - 500 * 86400 * 1000
     store.upsert_candles(conn, "1d", [(old, 1, 1, 1, 1, 1), (now_ms, 2, 2, 2, 2, 2)])
+    store.upsert_candles(conn, "4h", [(old, 1, 1, 1, 1, 1), (now_ms, 2, 2, 2, 2, 2)])
+    store.record_derivs(conn, ts=old, funding=None, oi=1.0, oi_chg_pct=None)
+    store.record_st_signal(conn, ts=old, timeframe="4h", price=1.0, st_score=0.0,
+                           st_state="NEUTRAL", indicators={})
     store.prune(conn, days=400)
-    rows = store.recent_candles(conn, "1d")
-    assert len(rows) == 1 and rows[0]["ts"] == now_ms
+    # 1d candles are NEVER pruned (forward-test price basis)...
+    assert len(store.recent_candles(conn, "1d")) == 2
+    # ...intraday candles + derivs keep the retention window...
+    rows4h = store.recent_candles(conn, "4h")
+    assert len(rows4h) == 1 and rows4h[0]["ts"] == now_ms
+    assert store.recent_derivs(conn) == []
+    # ...and st_signals (the system's own signal history) are kept forever.
+    assert store.latest_st_signal(conn, "4h")["ts"] == old
+
+
+def test_upsert_candles_source_guard(conn):
+    store.upsert_candles(conn, "1d", [(_ms(1), 1, 1, 1, 100.0, 10)], source="okx")
+    # a fallback-venue batch must NOT rewrite an existing row (price basis of
+    # matured forward-test outcomes)
+    store.upsert_candles(conn, "1d", [(_ms(1), 1, 1, 1, 90.0, 99)], source="kraken")
+    row = store.recent_candles(conn, "1d")[0]
+    assert row["close"] == pytest.approx(100.0) and row["source"] == "okx"
+    # same-source re-upsert (the still-forming candle) still updates
+    store.upsert_candles(conn, "1d", [(_ms(1), 1, 1, 1, 101.0, 11)], source="okx")
+    assert store.recent_candles(conn, "1d")[0]["close"] == pytest.approx(101.0)
+    # a NULL-source row (pre-migration) adopts the first sourced write
+    store.upsert_candles(conn, "1d", [(_ms(2), 1, 1, 1, 50.0, 1)])
+    store.upsert_candles(conn, "1d", [(_ms(2), 1, 1, 1, 55.0, 1)], source="okx")
+    assert store.recent_candles(conn, "1d")[-1]["close"] == pytest.approx(55.0)
+
+
+def test_candles_since_and_alerts_since(conn):
+    store.upsert_candles(conn, "1d", [(_ms(d), 1, 1, 1, float(d), 1) for d in (1, 2, 3)])
+    assert [r["ts"] for r in store.candles_since(conn, "1d")] == [_ms(1), _ms(2), _ms(3)]
+    assert [r["ts"] for r in store.candles_since(conn, "1d", _ms(2))] == [_ms(2), _ms(3)]
+    store.record_st_alert(conn, ts=_ms(1), created_at="2026-01-01T00:00:00+00:00",
+                          trigger_key="a", timeframe="4h", direction="BUY",
+                          price=1.0, message="m", sent=True)
+    store.record_st_alert(conn, ts=_ms(2), created_at="2026-01-02T00:00:00+00:00",
+                          trigger_key="b", timeframe="4h", direction="BUY",
+                          price=1.0, message="m", sent=False)  # failed send -> excluded
+    assert [r["trigger_key"] for r in store.st_alerts_since(conn)] == ["a"]
+
+
+def test_candle_ath(conn):
+    assert store.candle_ath(conn, "1d") is None
+    store.upsert_candles(conn, "1d", [(_ms(1), 1, 1, 1, 100.0, 1),
+                                      (_ms(2), 1, 1, 1, 250.0, 1),
+                                      (_ms(3), 1, 1, 1, 200.0, 1)])
+    ath = store.candle_ath(conn, "1d")
+    assert ath["ts"] == _ms(2) and ath["close"] == pytest.approx(250.0)
+
+
+def test_overlap_lock(conn):
+    assert store.try_acquire_lock(conn, "L", 1000.0, ttl_seconds=600) is True
+    # a second claimant within the TTL is refused
+    assert store.try_acquire_lock(conn, "L", 1100.0, ttl_seconds=600) is False
+    # a crashed holder's claim is stolen once the TTL expires
+    assert store.try_acquire_lock(conn, "L", 1601.5, ttl_seconds=600) is True
+    # release frees it immediately
+    store.release_lock(conn, "L")
+    assert store.try_acquire_lock(conn, "L", 1602.0, ttl_seconds=600) is True
+
+
+def test_recent_run_readings(conn):
+    store.record_run(conn, run_ts="2026-01-01T00:00:00+00:00", price=1, composite=1.0,
+                     tier="NEUTRAL", active_cats=["price"], readings={"raw": {"fng": 20}},
+                     tier_alerted=False, flash_alerted=False, notified_tier="NEUTRAL")
+    store.record_run(conn, run_ts="2026-01-02T00:00:00+00:00", price=1, composite=1.0,
+                     tier="NEUTRAL", active_cats=["price"], readings={"raw": {"fng": None}},
+                     tier_alerted=False, flash_alerted=False, notified_tier="NEUTRAL")
+    rows = store.recent_run_readings(conn, 8)
+    assert [r["run_ts"] for r in rows] == ["2026-01-02T00:00:00+00:00",
+                                           "2026-01-01T00:00:00+00:00"]  # newest first
+    assert rows[0]["raw"]["fng"] is None and rows[1]["raw"]["fng"] == 20

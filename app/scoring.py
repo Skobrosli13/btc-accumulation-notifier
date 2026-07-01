@@ -286,6 +286,18 @@ def tier_hysteresis(score: float, price: float, wma200: float | None,
     return raw if score <= floor - margin else prev_tier
 
 
+def composite_degraded(active_cats: list[str] | None) -> bool:
+    """True when the heaviest category (on-chain, default weight 0.35) returned no
+    data this run. The composite renormalizes over whatever categories are
+    available (deliberately — see ``composite``), but with on-chain absent the
+    remaining weights scale by ~1/0.65, so the outage alone can move the score
+    10+ points — several times the tier hysteresis margin — and legitimately flip
+    the tier. This flag does NOT change the math; it travels with the run's
+    readings so alerting can annotate a tier-change email and downstream readers
+    can distinguish an outage artifact from a market move."""
+    return "onchain" not in (active_cats or [])
+
+
 def category_agreement(category_scores: dict[str, float | None]) -> dict | None:
     """Confidence proxy from how much the active categories AGREE. High spread
     (e.g. on-chain cheap but macro risk-off) = lower confidence. None if <2 active."""
@@ -457,6 +469,12 @@ def top_zone_boundary_raw(name: str, threshold: float = IN_ZONE_THRESHOLD) -> fl
 # window reads frothy/overheated, the 2017/2021 tops max out, and the
 # 2018/2020/2022 bottoms (and post-top today) read 0. Still a small-sample
 # heuristic (1-3 cycles per indicator), not a proven edge — keep it labeled.
+# PROVENANCE / circularity: these levels are tuned IN-SAMPLE on the very tops
+# scripts/backtest_tops.py then evaluates (n<=3 events; n=1 for the on-chain
+# members, whose free history starts 2022) — the "validation" set IS the tuning
+# set, and there is no out-of-sample holdout. Treat the bands as illustrative;
+# the compression trend also means a future top may never reach OVERHEATED
+# under thresholds pinned to the 2025 extremes.
 TOP_THRESHOLDS: dict[str, dict[str, float]] = {
     # On-chain valuation (higher = more frothy); free history starts 2022-06,
     # so these are anchored on the 2024-2025 top window only.
@@ -538,6 +556,11 @@ def froth_score(readings: dict[str, float | None]) -> dict:
     Flat mean over available sub-scores with each correlated family collapsed to
     one term (same de-duplication as the buy-side category means). Returns
     {"score": 0-100|None, "subscores", "in_zone" labels, "active" term count}.
+
+    Provenance caveat: TOP_THRESHOLDS are anchored IN-SAMPLE on the same 1-3
+    cycle tops scripts/backtest_tops.py evaluates (a circular fit with no
+    holdout; one cycle of history for the on-chain members) — every display of
+    this score must carry that label, not just this docstring.
     """
     subs = froth_subscores(readings)
     grouped = {m for g in _TOP_GROUPS for m in g}

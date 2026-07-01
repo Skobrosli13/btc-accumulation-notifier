@@ -17,16 +17,22 @@ behavior, which scored a different, larger, more flattering population).
 Small-sample caveat applies (a few years of one venue); a sanity check, not a
 promise. The live services only READ the committed st_winrates.json.
 
-JSON SCHEMA NOTE: this version changed the schema. Each cell now carries
-{direction, n, win_rate, wilson_lo, wilson_hi, base_rate, expectancy_R, resolved,
-low_n, not_significant}, and the top level carries "population":"alerted" so
-readers know the win-rates are the alerted (not raw) population. A "raw" mirror is
-included per timeframe for transparency.
+JSON SCHEMA NOTE: each cell carries {direction, n, fires, horizon_bars, win_rate,
+wilson_lo, wilson_hi, base_rate, expectancy_R, resolved, low_n, not_significant}.
+``n`` counts DE-CORRELATED EPISODES — same-key alerted fires closer together than
+the forward horizon are collapsed to the first (st_validation.collapse_episodes),
+because overlapping return windows counted as independent trials would tighten
+the Wilson CI dishonestly. ``fires`` keeps the pre-collapse alerted count. The top
+level carries "population":"alerted" plus "unmeasured_keys": alertable trigger
+types (funding/OI/flow) that have NO cell here — the API serves them as
+{"unmeasured": true} so the dashboard can label them instead of staying silent.
+A "raw" mirror is included per timeframe for transparency.
 """
 from __future__ import annotations
 
 import json
 import sys
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -40,7 +46,21 @@ from scripts.st_history import deep_klines, daily_regime_series  # noqa: E402
 
 APP_DIR = Path(__file__).resolve().parents[1] / "app"
 # candles to pull + forward horizon (candles) for win-rate / stop-target race.
-PLAN = {"4h": {"total": 14000, "fwd": 24}, "1d": {"total": 1200, "fwd": 10}}
+# totals include a LIVE_WINDOW warm-up head: the replay drops events that lack a
+# full live-sized window, so we fetch extra to keep the scored sample intact.
+PLAN = {"4h": {"total": 14000 + stv.LIVE_WINDOW, "fwd": 24},
+        "1d": {"total": 1200 + stv.LIVE_WINDOW, "fwd": 10}}
+
+# Alertable trigger types with NO cell in this artifact: the funding/OI candle
+# triggers need funding+OI history the replay doesn't have, and the flow.py
+# triggers ride Coinalyze series (~11 months free — see scripts.backtest_flow).
+# Served by the API as stats={"unmeasured": true}; alerts for them carry no
+# backtested win-rate whatsoever.
+UNMEASURED_KEYS = [
+    "funding_spike_bull", "funding_spike_bear", "oi_surge_long", "oi_surge_short",
+    "cvd_bull_divergence", "cvd_bear_divergence", "oi_new_longs", "oi_new_shorts",
+    "liq_long_flush", "liq_short_flush",
+]
 
 
 def _atr_at(frame, i: int) -> float | None:
@@ -49,8 +69,18 @@ def _atr_at(frame, i: int) -> float | None:
     return shortterm.compute_indicators(window).get("atr")
 
 
-def _score_population(events, frame, fwd: int) -> dict:
-    """Build the per-trigger cells for a population of alerted/raw events."""
+def _score_population(events, frame, fwd: int, *, collapse: bool = True) -> dict:
+    """Build the per-trigger cells for a population of alerted/raw events.
+
+    ``collapse=True`` first de-correlates the events via
+    ``stv.collapse_episodes(gap_bars=fwd)``: same-key fires closer than the forward
+    horizon (12h cooldown vs a 96h/240h horizon = up to ~8-10x window overlap)
+    would inflate n and dishonestly tighten the Wilson CI. Each cell's ``n``
+    therefore counts EPISODES; ``fires`` keeps the pre-collapse count and
+    ``horizon_bars`` records the horizon the win-rate races over."""
+    pre_counts = Counter(e.key for e in events)
+    if collapse:
+        events = stv.collapse_episodes(events, gap_bars=fwd)
     closes = frame["close"].tolist()
     highs = frame["high"].tolist()
     lows = frame["low"].tolist()
@@ -81,6 +111,8 @@ def _score_population(events, frame, fwd: int) -> dict:
         base = stv.base_rate(closes, direction, fwd)
         cell = stv.cell_stats(wins, scored, base)
         cell["direction"] = direction
+        cell["fires"] = pre_counts[key]     # pre-collapse events for this key
+        cell["horizon_bars"] = fwd          # the window the win-rate races over
         exp = round(sum(rs) / len(rs), 3) if rs else None
         cell["expectancy_R"] = exp
         # Back-compat alias: the live API/dashboard still read "atr_expectancy_R".
@@ -97,20 +129,34 @@ def main() -> int:
         "population": "alerted",
         "method": ("Replays the live alert path (regime+confluence+cooldown/same-candle "
                    "dedup) on the ~300-candle live window; win-rates are the ALERTED "
-                   "events only. Forward returns net of a "
+                   "events only, DE-CORRELATED to episodes (same-key fires within the "
+                   "forward horizon collapsed to the first — n counts episodes, 'fires' "
+                   "the pre-collapse count). Forward returns net of a "
                    f"{stv.ROUND_TRIP_COST*100:.1f}% round-trip cost; unresolved ATR "
                    "stop/target trades marked to market at the horizon close; "
                    "same-candle stop-before-target tie resolved against us."),
         "round_trip_cost": stv.ROUND_TRIP_COST,
         "min_n": stv.MIN_N,
         "live_window": stv.LIVE_WINDOW,
+        "unmeasured_keys": UNMEASURED_KEYS,
         "timeframes": {},
         "caveats": [
             "Win-rates are the ALERTED population (post regime+confluence+cooldown), "
             "not every raw trigger fire. The two differ; the alerted set is what users get.",
+            "n counts de-correlated episodes (gap >= horizon_bars); overlapping "
+            "forward windows are never counted as independent trials.",
             "Cells with n<min_n (low_n=true) are not statistically meaningful.",
             "Cells whose Wilson CI includes base_rate (not_significant=true) are "
             "indistinguishable from the unconditional move rate.",
+            "Horizons differ by timeframe (horizon_bars per cell: 4h races 24 bars "
+            "= 4 days, 1d races 10 bars = 10 days) and differ from the 7d "
+            "live-performance line — different measurements of different things.",
+            "Trigger thresholds and the confluence gate were TUNED on this same "
+            "sample (in-sample). A cell that ever turns significant must also hold "
+            "on a walk-forward holdout (scripts.backtest_shortterm splits at "
+            "2024-01-01) before being treated as edge.",
+            "funding/OI/flow trigger types (unmeasured_keys) have NO cells here — "
+            "no backtest coverage at all.",
             "One venue (OKX), a few years; past behavior is not a forecast.",
         ],
     }
@@ -143,17 +189,19 @@ def main() -> int:
             "to": str(df["open_time"].iloc[-1].date()),
             "raw_fires": len(replay.raw),
             "alerted_fires": len(replay.alerted),
+            "alerted_episodes": len(stv.collapse_episodes(replay.alerted, gap_bars=fwd)),
             "horizon_candles": fwd,
         }
         tf_block["_raw"] = raw_cells  # pre-gate cells, for comparison (NOT what users see)
         out["timeframes"][tf] = tf_block
         print(f"{tf} ({len(df)} candles, {len(replay.alerted)} alerted / "
-              f"{len(replay.raw)} raw):")
+              f"{len(replay.raw)} raw; horizon {fwd} bars):")
         for k, v in sorted(alerted_cells.items()):
             flag = " [low-n]" if v["low_n"] else (" [ns]" if v["not_significant"] else "")
-            print(f"  {k:<24} {v['direction']:<4} n={v['n']:<4} win={v['win_rate']} "
-                  f"CI=[{v['wilson_lo']},{v['wilson_hi']}] base={v['base_rate']} "
-                  f"R={v['expectancy_R']}{flag}")
+            print(f"  {k:<24} {v['direction']:<4} n={v['n']:<4} (ep of {v['fires']} fires) "
+                  f"win={v['win_rate']} CI=[{v['wilson_lo']},{v['wilson_hi']}] "
+                  f"base={v['base_rate']} R={v['expectancy_R']} "
+                  f"h={v['horizon_bars']}bars{flag}")
 
     (APP_DIR / "st_winrates.json").write_text(json.dumps(out, indent=2))
     print("wrote app/st_winrates.json")

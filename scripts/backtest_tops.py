@@ -2,6 +2,13 @@
 
 Run MANUALLY (like scripts.calibrate):  python -m scripts.backtest_tops
 
+The joined frame is cached in _tops_cache.csv because bitcoin-data.com allows
+~10 requests/hour and one build makes 5 — iterate on thresholds without burning
+the budget. The cache is validated on load: a build that ran into the rate cap
+produces a frame missing froth inputs (e.g. realized_ratio), and silently pinning
+that degraded frame would exclude those indicators from every threshold decision.
+Pass --refresh to refetch (mind the rate cap).
+
 For every historical day with data, computes the froth score exactly as the live
 path would (renormalizing over whatever indicators are present) and reports it
 at the known cycle tops and bottoms, plus the distribution, plus per-indicator
@@ -19,6 +26,7 @@ Honest about data depth:
 """
 from __future__ import annotations
 
+import argparse
 import sys
 from pathlib import Path
 
@@ -100,16 +108,47 @@ def froth_row(row: pd.Series) -> tuple[float | None, dict]:
 
 _CACHE = Path(__file__).with_name("_tops_cache.csv")
 
+# Every TOP_THRESHOLDS input build_frame can produce. funding is deliberately
+# absent (no free deep history — live froth renormalizes it away, and this
+# backtest mirrors that funding-less read).
+_EXPECTED_COLS = [k for k in _FROTH_KEYS if k != "funding"]
 
-def main() -> int:
+
+def _cache_missing(df: pd.DataFrame) -> list[str]:
+    """Expected froth inputs absent (or all-NaN) in a cached/built frame — the
+    signature of a build that hit the bitcoin-data.com rate cap partway through."""
+    return [c for c in _EXPECTED_COLS if c not in df.columns or not df[c].notna().any()]
+
+
+def _warn_missing(missing: list[str], cached: bool) -> None:
+    src = "cached frame" if cached else "freshly built frame"
+    print("!" * 72)
+    print(f"WARNING: {src} is DEGRADED — missing froth inputs: {', '.join(missing)}")
+    print("Every froth number below silently EXCLUDES them (the live score includes")
+    print("them). Rerun with --refresh once the bitcoin-data.com rate window")
+    print("(~10 req/hr; one build = 5 calls) has reset.")
+    print("!" * 72)
+
+
+def main(argv: list[str] | None = None) -> int:
     # bitcoin-data.com allows ~10 req/hr and one build costs 5 — cache the joined
-    # frame so threshold iteration doesn't burn the budget. Delete the file to refresh.
-    if _CACHE.exists():
-        print(f"Using cached frame {_CACHE.name} (delete to refetch)")
+    # frame so threshold iteration doesn't burn the budget. --refresh to refetch.
+    ap = argparse.ArgumentParser(description="Validate TOP_THRESHOLDS against history.")
+    ap.add_argument("--refresh", action="store_true",
+                    help="refetch even if a cache exists (5 bitcoin-data.com calls, ~10 req/hr cap)")
+    args = ap.parse_args(argv)
+    if _CACHE.exists() and not args.refresh:
+        print(f"Using cached frame {_CACHE.name} (--refresh to refetch)")
         df = pd.read_csv(_CACHE, parse_dates=["date"])
+        missing = _cache_missing(df)
+        if missing:
+            _warn_missing(missing, cached=True)
     else:
         print("Building joined history...")
         df = build_frame()
+        missing = _cache_missing(df)
+        if missing:
+            _warn_missing(missing, cached=False)
         df.to_csv(_CACHE, index=False)
     scores, subs_list = [], []
     for _, row in df.iterrows():

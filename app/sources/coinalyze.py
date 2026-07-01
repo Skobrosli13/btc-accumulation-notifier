@@ -1,11 +1,15 @@
-"""Coinalyze adapter — FREE aggregated derivatives (the order-flow layer source).
+"""Coinalyze adapter — free derivatives order-flow (SINGLE-VENUE by default).
 
-Coinalyze aggregates open interest, funding, liquidations and candle-CVD across
-futures venues — including **Binance**, which is HTTP-451 from US/AWS, so this is
-also our only window onto the deepest perp venue. Free API key, 40 req/min, auth
-via the ``api_key`` header. Activated by ``COINALYZE_API_KEY`` presence; every
-function degrades to ``None``/``[]`` so the collector falls back to the OKX path
-when this is dark.
+Coinalyze *can* aggregate open interest, funding, liquidations and candle-CVD
+across futures venues, but the default ``COINALYZE_SYMBOL`` (``BTCUSDT_PERP.A``)
+is ONE venue: the **Binance** USDT perp. Every CVD/OI/liquidation number this
+module returns is therefore that single market's, not market-wide — the draw is
+that Binance is HTTP-451 from US/AWS, so this is our only window onto the
+deepest perp venue. (Switching to a Coinalyze aggregate symbol code would
+genuinely aggregate, but also invalidates the committed single-venue order-flow
+backtest framing.) Free API key, 40 req/min, auth via the ``api_key`` header.
+Activated by ``COINALYZE_API_KEY`` presence; every function degrades to
+``None``/``[]`` so the collector falls back to the OKX path when this is dark.
 
 Endpoint contract (verified against api.coinalyze.net/v1/doc + the reference
 client). Base ``https://api.coinalyze.net/v1`` ::
@@ -78,7 +82,8 @@ def _history_rows(path: str, symbol: str, interval: str, hours: float,
 # --- Current values (drop-in alternatives to the OKX funding/OI) -------------
 
 def open_interest(symbol: str, api_key: str) -> float | None:
-    """Current aggregated open interest for ``symbol`` (contracts/coin units)."""
+    """Current open interest for ``symbol`` (contracts/coin units; the default
+    symbol is the single-venue Binance perp, not a cross-venue aggregate)."""
     return _current_value(get_json(f"{BASE}/open-interest",
                                    params={"symbols": symbol}, headers=_hdr(api_key)))
 

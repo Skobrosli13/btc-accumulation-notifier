@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 
 from . import alerting, flow, notify, shortterm, store
 from .config import Config, load_config
-from .sources import coinalyze, exchange, price
+from .sources import _http, coinalyze, exchange, price
 
 log = logging.getLogger("btc-collect")
 
@@ -25,6 +25,17 @@ log = logging.getLogger("btc-collect")
 # is rejected as stale (so a collector outage can't turn a slow bleed into a flush).
 _OI_BASELINE_MS = 3600_000
 _OI_BASELINE_MAX_AGE_MS = 2 * 3600_000
+
+# Cron-overlap guard (see store.try_acquire_lock): a hung invocation must not
+# interleave DB writes / duplicate sends with the next */10 cron. The TTL lets a
+# crashed holder self-heal after ~2 cadences.
+_LOCK_KEY = "collect_once_lock"
+_LOCK_TTL_S = 20 * 60.0
+
+# Aggregate network budget per run — well inside the */10 cadence so a venue
+# brown-out degrades THIS run (sources fail soft) instead of stacking into the
+# next invocation and tripping the overlap lock.
+_NET_BUDGET_S = 8 * 60.0
 
 
 def _candle_rows(df) -> list[tuple]:
@@ -66,21 +77,33 @@ def _collect_flow(cfg: Config) -> dict | None:
     cvd_rows = _closed(coinalyze.ohlcv_history(sym, interval, hours, key))
     oi_rows = _closed(coinalyze.oi_history(sym, interval, hours, key))
     liq_rows = _closed(coinalyze.liquidations_history(sym, interval, hours, key))
-    if not cvd_rows and not liq_rows:
-        log.warning("Coinalyze key set but flow series empty (check symbol %r / plan); "
-                    "layer dark this run", sym)
-        return None
 
-    # Staleness gate: if the latest closed bar is far older than the interval, the
-    # feed gapped — every read (divergence / participant / flush) would be
-    # unreliable, so the whole layer goes dark. Mirrors the OI-baseline recency
-    # doctrine that stops a gap from reading as a phantom flush.
+    # PER-SERIES staleness gate: the three series are fetched independently, so
+    # one can gap (partial provider outage) while another stays current. A
+    # max()-across-series check would let a stale OI/liq series ride a fresh
+    # OHLCV series into a phantom participant/flush read stamped with TODAY's
+    # candle — exactly the gap-as-signal failure the OI-baseline recency doctrine
+    # exists to prevent. A series is usable only when its own last closed bar is
+    # within 3 intervals of now; a stale (or empty) series darkens just the reads
+    # that depend on it (divergence needs ohlcv; participant needs ohlcv+oi;
+    # flush needs liq).
     now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
     interval_ms = int(ih * 3600_000)
-    last_tss = [rows[-1]["ts"] for rows in (cvd_rows, oi_rows, liq_rows) if rows]
-    if last_tss and now_ms - max(last_tss) > 3 * interval_ms:
-        log.warning("Coinalyze flow data stale (last bar %.1fh old); layer dark this run",
-                    (now_ms - max(last_tss)) / 3600_000)
+
+    def _fresh(rows: list[dict]) -> bool:
+        return bool(rows) and now_ms - rows[-1]["ts"] <= 3 * interval_ms
+
+    for name, rows in (("ohlcv", cvd_rows), ("oi", oi_rows), ("liq", liq_rows)):
+        if rows and not _fresh(rows):
+            log.warning("Coinalyze %s series stale (last bar %.1fh old); reads "
+                        "depending on it dark this run",
+                        name, (now_ms - rows[-1]["ts"]) / 3600_000)
+    cvd_rows = cvd_rows if _fresh(cvd_rows) else []
+    oi_rows = oi_rows if _fresh(oi_rows) else []
+    liq_rows = liq_rows if _fresh(liq_rows) else []
+    if not cvd_rows and not liq_rows:
+        log.warning("Coinalyze key set but no fresh flow series (check symbol %r / "
+                    "plan); layer dark this run", sym)
         return None
 
     cvd_df = flow.build_cvd(cvd_rows)
@@ -106,6 +129,27 @@ def run(cfg: Config, *, dry_run: bool = False) -> dict:
     conn = store.connect(cfg.db_path)
     store.init_db(conn)
 
+    # Overlap guard: cron fires every 10 minutes regardless of whether the last
+    # invocation (slow venue, hung HTTP call) is still in flight; two writers
+    # interleaving upserts and sends would double-alert and race the cooldown
+    # reads. Dry runs don't write, so they neither take nor steal the lock.
+    if not dry_run and not store.try_acquire_lock(conn, _LOCK_KEY, now.timestamp(),
+                                                  _LOCK_TTL_S):
+        log.warning("another collect_once invocation holds the lock; exiting early")
+        conn.close()
+        return {"now": now.isoformat(), "skipped": "overlap-lock",
+                "timeframes": {}, "alerts": []}
+    _http.set_deadline(_NET_BUDGET_S)
+    try:
+        return _run_locked(cfg, conn, now, dry_run=dry_run)
+    finally:
+        _http.set_deadline(None)
+        if not dry_run:
+            store.release_lock(conn, _LOCK_KEY)
+        conn.close()
+
+
+def _run_locked(cfg: Config, conn, now: datetime, *, dry_run: bool) -> dict:
     frames = price.get_intraday_frames(cfg.symbol, cfg.st_timeframes, prefer=cfg.exchange)
 
     # 200-day macro regime (price vs 200DMA) — context for triggers; optionally
@@ -129,8 +173,9 @@ def run(cfg: Config, *, dry_run: bool = False) -> dict:
     if not dry_run:
         store.record_derivs(conn, ts=now_ms, funding=funding, oi=oi, oi_chg_pct=oi_chg_pct)
 
-    # Free aggregated order-flow layer (Coinalyze): CVD divergence, OI participant
-    # and liquidation flush on the primary ST timeframe. None when no key is set.
+    # Order-flow layer (Coinalyze, single-venue Binance perp): CVD divergence,
+    # OI participant and liquidation flush on the primary ST timeframe.
+    # None when no key is set.
     flow_data = _collect_flow(cfg)
 
     summary = {"now": now.isoformat(), "funding": funding, "oi": oi,
@@ -154,7 +199,8 @@ def run(cfg: Config, *, dry_run: bool = False) -> dict:
 
         # Attach the Coinalyze order-flow layer to its (primary) timeframe: merge
         # the readings into the stored indicators and fold the flow triggers into
-        # the same confluence/cooldown loop the candle triggers already use.
+        # the same suppression/cooldown loop the candle triggers already use.
+        # (They are excluded from the confluence COUNT below — context-only.)
         if flow_data and tf == flow_data["tf"]:
             ev["indicators"]["flow"] = flow_data["readings"]
             ev["triggers"] = list(ev["triggers"]) + flow.detect_flow_triggers(
@@ -167,7 +213,13 @@ def run(cfg: Config, *, dry_run: bool = False) -> dict:
                                    indicators=ev["indicators"])
 
         passed = []
-        dirs = [t.direction for t in ev["triggers"]]
+        # Confluence counts CANDLE triggers only: flow + funding/OI triggers are
+        # context-only for the gate (they may still alert via the single-trigger
+        # regime-aligned path, but never promote another trigger). This keeps the
+        # live alerted population identical to the candle-only replay that
+        # produced st_winrates.json — an unvalidated fire must not manufacture
+        # alerts from a population the calibration never measured.
+        dirs = shortterm.confluence_directions(ev["triggers"], flow.FLOW_TRIGGER_KEYS)
         for trig in ev["triggers"]:
             if cfg.st_regime_suppress and shortterm.regime_aligned(trig.direction, regime) is False:
                 log.info("%s/%s suppressed (counter-%s-regime)", tf, trig.key, regime)
@@ -223,8 +275,10 @@ def run(cfg: Config, *, dry_run: bool = False) -> dict:
 
     summary["alerts"] = fired
     if not dry_run:
+        # Intraday candles + derivs only — 1d candles and st_signals are kept
+        # forever (see store.prune): they are the forward-test price basis and
+        # the system's own signal history.
         store.prune(conn, 400)
-    conn.close()
     return summary
 
 

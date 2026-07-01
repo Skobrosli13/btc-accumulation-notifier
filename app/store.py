@@ -276,19 +276,30 @@ def record_run(conn: sqlite3.Connection, *, run_ts: str, price: float | None,
 def upsert_candles(conn: sqlite3.Connection, timeframe: str,
                    rows: list[tuple[int, float, float, float, float, float]],
                    source: str | None = None) -> None:
-    """Insert/replace candles. ``rows`` = [(ts_ms, open, high, low, close, volume), ...].
+    """Insert/update candles. ``rows`` = [(ts_ms, open, high, low, close, volume), ...].
 
     ``source`` tags the venue so a fallback-venue batch (e.g. Kraken XBT/USD,
     different quote currency and ~10x lower volume than OKX BTC-USDT) is
     distinguishable downstream — recomputes that span a venue switch produce
     garbage volume-spike triggers and a price/volume seam in the chart.
+
+    An existing (timeframe, ts) row is never overwritten by a row from a
+    DIFFERENT source: stored candles are the price basis matured forward-test
+    outcomes are scored against, so a one-run venue fallback must not
+    retroactively rewrite history (and flip already-recorded win/losses).
+    Same-source re-upserts (the still-forming candle) still update, and rows
+    predating the ``source`` column (NULL) adopt the first sourced write.
     """
     if not rows:
         return
     conn.executemany(
         """
-        INSERT OR REPLACE INTO candles (timeframe, ts, open, high, low, close, volume, source)
+        INSERT INTO candles (timeframe, ts, open, high, low, close, volume, source)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(timeframe, ts) DO UPDATE SET
+          open = excluded.open, high = excluded.high, low = excluded.low,
+          close = excluded.close, volume = excluded.volume, source = excluded.source
+        WHERE candles.source IS excluded.source OR candles.source IS NULL
         """,
         [(timeframe, *r, source) for r in rows],
     )
@@ -324,6 +335,38 @@ def recent_candles(conn: sqlite3.Connection, timeframe: str, limit: int = 400,
                 break
         out = list(reversed(keep))
     return out
+
+
+def candles_since(conn: sqlite3.Connection, timeframe: str,
+                  since_ms: int = 0) -> list[dict]:
+    """ALL candles for a timeframe with ts >= ``since_ms``, OLDEST->NEWEST.
+
+    Unlike ``recent_candles`` there is no row cap: the live forward test must
+    price every matured run/alert against the full history, not a rolling
+    window. 1d candles are never pruned (see ``prune``), so even a decade stays
+    a few thousand rows.
+    """
+    rows = conn.execute(
+        "SELECT ts, open, high, low, close, volume, source FROM candles "
+        "WHERE timeframe = ? AND ts >= ? ORDER BY ts ASC",
+        (timeframe, since_ms),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def candle_ath(conn: sqlite3.Connection, timeframe: str = "1d") -> dict | None:
+    """Highest stored close for a timeframe as {ts, close}, or None if empty.
+
+    The stored 1d history is never pruned, so this is a persistent best-known
+    ATH that only moves forward — unlike the venue fetch window, which slides
+    and differs per venue (OKX ~5.75y weekly vs Kraken ~14y).
+    """
+    row = conn.execute(
+        "SELECT ts, close FROM candles WHERE timeframe = ? AND close IS NOT NULL "
+        "ORDER BY close DESC, ts ASC LIMIT 1",
+        (timeframe,),
+    ).fetchone()
+    return dict(row) if row else None
 
 
 def record_derivs(conn: sqlite3.Connection, *, ts: int, funding: float | None,
@@ -458,6 +501,20 @@ def recent_st_alerts(conn: sqlite3.Connection, limit: int = 50) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def st_alerts_since(conn: sqlite3.Connection, since_ms: int = 0) -> list[dict]:
+    """ALL successfully-sent swing alerts with ts >= ``since_ms``, OLDEST->NEWEST.
+
+    No row cap (unlike ``recent_st_alerts``): the live forward test must keep
+    every matured alert, not shed the oldest — the most informative — ones once
+    a cap fills. Only sent=1 rows count (a failed send was never an alert the
+    user could act on, and is retried on a later candle anyway)."""
+    rows = conn.execute(
+        "SELECT * FROM st_alerts WHERE ts >= ? AND sent = 1 ORDER BY ts ASC",
+        (since_ms,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
 def recent_run_alerts(conn: sqlite3.Connection, limit: int = 20) -> list[dict]:
     """Recent long-term runs that fired a tier or flash alert (for the merged feed).
     Includes parsed `readings` so the API can reconstruct the alert's reasoning."""
@@ -486,6 +543,28 @@ def all_runs(conn: sqlite3.Connection) -> list[dict]:
         "SELECT run_ts, price, tier FROM runs ORDER BY run_ts ASC"
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+def recent_run_readings(conn: sqlite3.Connection, limit: int = 8) -> list[dict]:
+    """[{run_ts, raw}] for the newest ``limit`` runs, NEWEST FIRST, where ``raw``
+    is the persisted raw indicator readings of that run.
+
+    Lets /api/health report per-indicator availability from what each source
+    actually RETURNED (a dead upstream fails soft to None forever and is
+    otherwise invisible behind category renormalization — the config layer
+    badges only say what is configured, not what is alive)."""
+    rows = conn.execute(
+        "SELECT run_ts, readings_json FROM runs ORDER BY run_ts DESC LIMIT ?",
+        (limit,),
+    ).fetchall()
+    out = []
+    for r in rows:
+        try:
+            readings = json.loads(r["readings_json"] or "{}") or {}
+        except (json.JSONDecodeError, TypeError):
+            readings = {}
+        out.append({"run_ts": r["run_ts"], "raw": readings.get("raw") or {}})
+    return out
 
 
 def run_history(conn: sqlite3.Connection, limit: int = 0) -> list[dict]:
@@ -601,13 +680,48 @@ def set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
     conn.commit()
 
 
+def try_acquire_lock(conn: sqlite3.Connection, key: str, now_ts: float,
+                     ttl_seconds: float) -> bool:
+    """Atomically claim a named single-instance lock in ``meta``. Returns True
+    when this caller now holds it.
+
+    Guards against overlapping cron invocations (a hung run interleaving writes
+    and duplicate sends with the next one). The stored value is the claim's
+    epoch-seconds timestamp; a claim older than ``ttl_seconds`` is treated as a
+    crashed holder and stolen, so there is no stale lockfile to clean up.
+    Atomic because the single UPSERT runs under SQLite's writer lock."""
+    cur = conn.execute(
+        "INSERT INTO meta (key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value "
+        "WHERE ? - CAST(meta.value AS REAL) > ?",
+        (key, repr(float(now_ts)), float(now_ts), float(ttl_seconds)),
+    )
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def release_lock(conn: sqlite3.Connection, key: str) -> None:
+    """Release a lock taken with ``try_acquire_lock``. Idempotent."""
+    conn.execute("DELETE FROM meta WHERE key = ?", (key,))
+    conn.commit()
+
+
 # --- Retention ---------------------------------------------------------------
 
 def prune(conn: sqlite3.Connection, days: int = 400) -> None:
-    """Drop high-volume time-series older than ``days``. Keeps `runs` and `st_alerts`
-    (low volume, valuable history)."""
+    """Drop bulky, recomputable time-series older than ``days``: INTRADAY candles
+    and `derivs` only.
+
+    NEVER pruned — the deletion would be irreversible and the rows are tiny:
+      * `1d` candles — the price basis every matured forward-test outcome is
+        scored against; deleting them silently turns the "grows over time" live
+        record into a rolling window (the oldest matured signals become
+        unpriceable forever).
+      * `st_signals` — the only stored history of the system's own scores /
+        indicators, needed for any future recalibration or promotion study.
+      * `runs` and `st_alerts` — the signal ledger itself.
+    """
     cutoff_ms = int((datetime.now(timezone.utc).timestamp() - days * 86400) * 1000)
-    conn.execute("DELETE FROM candles WHERE ts < ?", (cutoff_ms,))
+    conn.execute("DELETE FROM candles WHERE ts < ? AND timeframe <> '1d'", (cutoff_ms,))
     conn.execute("DELETE FROM derivs WHERE ts < ?", (cutoff_ms,))
-    conn.execute("DELETE FROM st_signals WHERE ts < ?", (cutoff_ms,))
     conn.commit()

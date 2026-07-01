@@ -142,3 +142,17 @@ def test_confluence_ok():
     assert st.confluence_ok(1, True, True) is False        # counter-trend
     assert st.confluence_ok(1, False, False) is False      # against regime
     assert st.confluence_ok(1, None, False) is False       # unknown regime
+
+
+def test_confluence_directions_excludes_context_triggers():
+    from app.flow import FLOW_TRIGGER_KEYS
+    trigs = [
+        st.Trigger("ema_cross_bull", "BUY", "x"),
+        st.Trigger("funding_spike_bull", "BUY", "x"),     # unvalidated -> excluded
+        st.Trigger("oi_surge_long", "SELL", "x"),         # unvalidated -> excluded
+        st.Trigger("cvd_bull_divergence", "BUY", "x"),    # flow -> excluded via extra set
+    ]
+    # collector call: flow keys passed as extra context — only the candle trigger counts
+    assert st.confluence_directions(trigs, FLOW_TRIGGER_KEYS) == ["BUY"]
+    # default (no flow triggers in the population): funding/OI still excluded
+    assert st.confluence_directions(trigs) == ["BUY", "BUY"]

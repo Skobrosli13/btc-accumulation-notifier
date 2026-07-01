@@ -13,6 +13,17 @@ HONEST FRAMING — read the CI and the base-rate comparison, not the point win-r
     the confluence / cooldown machinery, which can only REDUCE fires.
   * A sanity check / threshold-tuning aid, NOT a promise of edge — consistent with
     the established BTC short-term no-edge finding.
+  * MULTIPLICITY: 6 keys x 3 horizons = ~18 cells at 95% per-cell confidence means
+    ~60% odds of at least one spurious "edge?" under the null — and every rerun
+    after a flow_* threshold tweak re-evaluates on the SAME free-tier bars the
+    tweak was fitted to.
+
+PRE-REGISTERED PROMOTION RULE (a flow trigger may graduate from FORWARD-TEST only
+if ALL hold; a lone uncorrected "edge?" cell is expected noise):
+  1. the Bonferroni-adjusted Wilson CI low clears the base rate,
+  2. at EVERY horizon, not just one,
+  3. on data not used to tune flow_* thresholds (a fresh window after the tune
+     date, or a second venue).
 
     python -m scripts.backtest_flow
 """
@@ -21,6 +32,7 @@ from __future__ import annotations
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from statistics import NormalDist
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -28,11 +40,26 @@ from app import flow                                # noqa: E402
 from app.config import load_config                  # noqa: E402
 from app.sources import coinalyze                   # noqa: E402
 from scripts.st_validation import (                 # noqa: E402
-    ROUND_TRIP_COST, base_rate, cell_stats)
+    ROUND_TRIP_COST, base_rate, cell_stats, wilson_interval)
 
 TF = "4hour"
 REQUEST_HOURS = 4000 * 4          # request well past the free-tier cap (~2006 bars)
 HORIZONS = [1, 3, 6]              # forward bars on 4h => 4h / 12h / 24h
+
+
+def _drop_forming(rows: list[dict]) -> list[dict]:
+    """Mirror app.collect_once._closed: the trailing history bar can still be
+    forming — a partial close must not serve as a forward-return endpoint, nor its
+    partial volume enter the trailing windows."""
+    return rows[:-1] if len(rows) > 1 else rows
+
+
+def _bonferroni_z(cells: int, alpha: float = 0.05) -> float:
+    """Two-sided z for a family-wise ``alpha`` split evenly across ``cells`` tests
+    (Bonferroni). cells<=1 -> the plain 1.96."""
+    if cells <= 1:
+        return 1.96
+    return NormalDist().inv_cdf(1 - (alpha / cells) / 2)
 
 
 def _collapse(indices: list[int], gap: int) -> list[int]:
@@ -59,9 +86,9 @@ def main() -> int:
         print("COINALYZE_API_KEY not set — nothing to backtest.")
         return 1
     sym, key = cfg.coinalyze_symbol, cfg.coinalyze_api_key
-    ohlcv = coinalyze.ohlcv_history(sym, TF, REQUEST_HOURS, key)
-    oi = coinalyze.oi_history(sym, TF, REQUEST_HOURS, key)
-    liq = coinalyze.liquidations_history(sym, TF, REQUEST_HOURS, key)
+    ohlcv = _drop_forming(coinalyze.ohlcv_history(sym, TF, REQUEST_HOURS, key))
+    oi = _drop_forming(coinalyze.oi_history(sym, TF, REQUEST_HOURS, key))
+    liq = _drop_forming(coinalyze.liquidations_history(sym, TF, REQUEST_HOURS, key))
     if len(ohlcv) < 100:
         print(f"insufficient history ({len(ohlcv)} bars) — check symbol/plan.")
         return 1
@@ -69,7 +96,11 @@ def main() -> int:
     closes = [r["close"] for r in ohlcv]
     oi_by_ts = {r["ts"]: r["oi"] for r in oi}
     liq_by_ts = {r["ts"]: r for r in liq}
-    window_n = cfg.flow_cvd_lookback + 5         # the (lookback+5)-bar window the live collector fetches
+    # Live, _collect_flow fetches (lookback+5)*interval HOURS and then drops the
+    # trailing (forming) bar, so the collector evaluates on lookback+4 CLOSED bars.
+    # The replay must use the same count or liquidation_flush's baseline mean runs
+    # over one extra bar vs production.
+    window_n = cfg.flow_cvd_lookback + 4
     n = len(ohlcv)
 
     # Replay: at each closed bar t, reconstruct the EXACT inputs the live collector
@@ -95,6 +126,13 @@ def main() -> int:
         print("No flow triggers fired over the sample.")
         return 0
 
+    cells = len(fires) * len(HORIZONS)
+    z_adj = _bonferroni_z(cells)
+    print(f"{cells} cells tested ({len(fires)} keys x {len(HORIZONS)} horizons); the "
+          f"per-cell 95% CIs are UNCORRECTED. The promotion check uses a "
+          f"Bonferroni-adjusted z={z_adj:.2f} — and even that is in-sample (see the "
+          "pre-registered rule in the module docstring).\n")
+
     for key in sorted(fires):
         direction = fires[key]["direction"]
         total = len(fires[key]["idx"])
@@ -103,14 +141,25 @@ def main() -> int:
             idx = [i for i in _collapse(fires[key]["idx"], h) if i + h < n]
             wins = sum(1 for i in idx if _adj_return(closes, i, h, direction) > 0)
             s = cell_stats(wins, len(idx), base_rate(closes, direction, h))
-            flag = "LOW-N" if s["low_n"] else ("~base (no edge)" if s["not_significant"] else "edge?")
+            if s["low_n"]:
+                flag = "LOW-N"
+            elif s["not_significant"]:
+                flag = "~base (no edge)"
+            else:
+                adj_lo, _ = wilson_interval(wins, len(idx), z=z_adj)
+                bonf = s["base_rate"] is not None and adj_lo > s["base_rate"]
+                flag = ("edge? (in-sample, uncorrected; Bonferroni "
+                        f"{'PASS' if bonf else 'FAIL'})")
             wr = f"{s['win_rate']:.2f}" if s["win_rate"] is not None else "n/a"
             br = f"{s['base_rate']:.2f}" if s["base_rate"] is not None else "n/a"
             print(f"   h={h}bar  n={s['n']:>3}  win={wr}  base={br}  "
                   f"CI[{s['wilson_lo']:.2f},{s['wilson_hi']:.2f}]  {flag}")
         print()
     print("LOW-N = too few events to conclude. '~base' = CI straddles the base rate "
-          "(indistinguishable from drift). Past behavior is not a forecast.")
+          "(indistinguishable from drift). 'edge?' alone promotes NOTHING: the "
+          "pre-registered rule requires the Bonferroni-adjusted CI to clear base at "
+          "EVERY horizon on data the thresholds were not tuned on. Past behavior is "
+          "not a forecast.")
     return 0
 
 

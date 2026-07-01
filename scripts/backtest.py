@@ -69,10 +69,16 @@ def _coingecko_daily() -> pd.DataFrame:
 
 
 def _price_structure_series(daily: pd.DataFrame) -> pd.DataFrame:
-    """Add rolling 200DMA, 200WMA (1400d ~= 200w), Mayer, price/200WMA columns."""
+    """Add rolling 200DMA, 200WMA (1400d ~= 200w), Mayer, price/200WMA columns.
+
+    The 200WMA requires the FULL 1400-day window (min_periods=1400): the live path
+    (app/sources/price.py) returns None below 200 weekly closes, so a short-history
+    "200WMA" here would be a materially different indicator mislabeled as the one
+    the live scorer measures. Bottoms without the full window print
+    "(insufficient history)" instead — honest degradation over a fabricated read."""
     df = daily.copy().sort_values("date").reset_index(drop=True)
     df["dma200"] = df["close"].rolling(200, min_periods=200).mean()
-    df["wma200"] = df["close"].rolling(1400, min_periods=200).mean()  # ~200 weeks of daily
+    df["wma200"] = df["close"].rolling(1400, min_periods=1400).mean()  # full 200 weeks only
     df["mayer"] = df["close"] / df["dma200"]
     df["price_to_wma200"] = df["close"] / df["wma200"]
     return df

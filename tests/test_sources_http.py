@@ -1,10 +1,19 @@
-"""HTTP helpers: retry/backoff, 429 Retry-After handling, fail-soft, post_json."""
+"""HTTP helpers: retry/backoff, 429 Retry-After handling, fail-soft, post_json,
+the per-process deadline budget, and the daily-source freshness guard."""
 from __future__ import annotations
 
 import pytest
 import requests
 
 from app.sources import _http
+
+
+@pytest.fixture(autouse=True)
+def _no_deadline():
+    """Every test starts (and ends) with no per-process deadline armed."""
+    _http.set_deadline(None)
+    yield
+    _http.set_deadline(None)
 
 
 class _Resp:
@@ -140,3 +149,71 @@ def test_post_json_sends_body_and_returns(monkeypatch):
 def test_post_json_fails_soft(monkeypatch):
     _seq_request(monkeypatch, [requests.ConnectionError("down")])
     assert _http.post_json("http://x", json_body={}) is None
+
+
+# --- Per-process deadline budget -----------------------------------------------
+
+def test_no_deadline_keeps_default_timeout(monkeypatch):
+    captured = {}
+
+    def fake(method, url, **kwargs):
+        captured["timeout"] = kwargs.get("timeout")
+        return _Resp(200, {"ok": 1})
+
+    monkeypatch.setattr(_http.requests, "request", fake)
+    assert _http.get_json("http://x") == {"ok": 1}
+    assert captured["timeout"] == _http.DEFAULT_TIMEOUT
+
+
+def test_deadline_exhausted_skips_request(monkeypatch):
+    calls = _seq_request(monkeypatch, [_Resp(200, {"ok": 1})])
+    _http.set_deadline(0)
+    assert _http.get_json("http://x") is None   # fail-soft, no network
+    assert calls["n"] == 0
+
+
+def test_deadline_clamps_attempt_timeout(monkeypatch):
+    captured = {}
+
+    def fake(method, url, **kwargs):
+        captured["timeout"] = kwargs.get("timeout")
+        return _Resp(200, {"ok": 1})
+
+    monkeypatch.setattr(_http.requests, "request", fake)
+    _http.set_deadline(5)
+    assert _http.get_json("http://x") == {"ok": 1}
+    assert 0 < captured["timeout"] <= 5   # clamped below DEFAULT_TIMEOUT
+
+
+def test_deadline_stops_retries(monkeypatch):
+    # Fake monotonic clock: the backoff sleep consumes the remaining budget, so
+    # the second attempt is skipped instead of piling past the deadline.
+    clock = {"t": 0.0}
+    monkeypatch.setattr(_http.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(_http.time, "sleep",
+                        lambda s: clock.__setitem__("t", clock["t"] + s))
+    _http.set_deadline(0.4)   # backoff after attempt 1 is 0.5s (full jitter)
+    calls = _seq_request(monkeypatch, [requests.Timeout("slow"),
+                                       _Resp(200, {"ok": 1})])
+    assert _http.get_json("http://x") is None
+    assert calls["n"] == 1   # no second attempt once the deadline passed
+
+
+def test_set_deadline_none_clears(monkeypatch):
+    _http.set_deadline(0)
+    _http.set_deadline(None)
+    calls = _seq_request(monkeypatch, [_Resp(200, {"ok": 1})])
+    assert _http.get_json("http://x") == {"ok": 1}
+    assert calls["n"] == 1
+
+
+# --- Freshness guard -------------------------------------------------------------
+
+def test_is_stale_uses_config_budget(monkeypatch):
+    now = _http.time.time()
+    monkeypatch.delenv("FRESHNESS_BUDGET_DAYS", raising=False)
+    assert _http.is_stale(now - 4 * 86400) is True     # past the 3-day default
+    assert _http.is_stale(now - 2 * 86400) is False
+    monkeypatch.setenv("FRESHNESS_BUDGET_DAYS", "10")
+    assert _http.is_stale(now - 4 * 86400) is False    # widened budget
+    assert _http.is_stale(now - 4 * 86400, budget_days=3.0) is True  # explicit

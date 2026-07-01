@@ -164,10 +164,10 @@ def test_flow_trigger_carries_no_edge_caveat():
     flow_trig = Trigger("cvd_bull_divergence", "BUY", "CVD bullish divergence", "x")
     _, body = alerting.build_st_batch_message([_item(flow_trig)], "BUY")
     assert "no demonstrated edge" in body.lower()
-    # a swing trigger (has st_validation hit-rates) gets NO flow caveat
+    # the measured coin-flip result applies to ALL swing triggers, not just flow
     swing = Trigger("rsi_oversold_bounce", "BUY", "RSI oversold bounce", "y")
     _, body2 = alerting.build_st_batch_message([_item(swing)], "BUY")
-    assert "no demonstrated edge" not in body2.lower()
+    assert "no demonstrated edge" in body2.lower()
 
 
 def test_flow_caveat_in_batch_when_any_flow_trigger():

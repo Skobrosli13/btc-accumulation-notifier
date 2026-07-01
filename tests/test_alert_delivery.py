@@ -111,6 +111,27 @@ def test_tier_message_includes_cats_caveat_when_flagged():
     assert "categories changed" in body.lower()
 
 
+def test_tier_message_includes_degraded_caveat_when_flagged():
+    # A run scored without the heaviest category must say so in the alert.
+    _, body = alerting.build_tier_message(
+        composite=61.0, tier="ACCUMULATE", subscores={}, price_struct={"price": 50000.0},
+        readings={}, active_cats=["price"], onchain_active=False, degraded=True)
+    assert "on-chain category" in body and "data-outage artifact" in body
+    # and stays quiet when not degraded
+    _, body2 = alerting.build_tier_message(
+        composite=61.0, tier="ACCUMULATE", subscores={}, price_struct={"price": 50000.0},
+        readings={}, active_cats=["onchain", "price"], onchain_active=True, degraded=False)
+    assert "data-outage artifact" not in body2
+
+
+def test_exit_message_includes_degraded_caveat_when_flagged():
+    _, body = alerting.build_exit_message(
+        composite=35.0, tier="NEUTRAL", subscores={}, price_struct={"price": 50000.0},
+        readings={}, active_cats=["price"], onchain_active=False,
+        prev_tier="ACCUMULATE", degraded=True)
+    assert "data-outage artifact" in body
+
+
 # --- DEEP_VALUE gate-driven exit (hysteresis) --------------------------------
 
 def test_deep_value_exits_when_price_clears_band_despite_high_composite():

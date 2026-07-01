@@ -92,15 +92,43 @@ def run(cfg: Config, *, dry_run: bool = False) -> dict:
     # override the config date (that would mistime the cycle multiplier whenever the
     # real top is >365d old). Trust only multi-year sources (exchange/coinbase).
     ath = cfg.ath_date
+    ath_price = None
+    ath_source = "config"
     ath_iso = price_struct.get("ath_date")
     if ath_iso and price_struct.get("source") != "coingecko":
         try:
             ath = datetime.strptime(ath_iso, "%Y-%m-%d").date()
+            ath_price = price_struct.get("ath_price")
+            ath_source = "venue"
         except (ValueError, TypeError):
             pass
+    # The venue-derived ATH only spans that venue's fetch window (OKX ~5.75y of
+    # weekly bars vs Kraken ~14y), so which venue served the run can move the ATH
+    # — and in a long bear the true top slides out of the window entirely. The
+    # stored 1d history (never pruned) is a persistent best-known ATH that only
+    # moves forward; prefer it whenever it is the higher print. Only trusted
+    # against a known venue price: with no venue ATH to compare, a shallow stored
+    # history could mistake a local high for the cycle top.
+    stored_ath = store.candle_ath(conn, "1d")
+    if stored_ath and ath_price is not None and stored_ath["close"] >= ath_price:
+        ath = datetime.fromtimestamp(stored_ath["ts"] / 1000, tz=timezone.utc).date()
+        ath_price = stored_ath["close"]
+        ath_source = "stored"
     mult = scoring.cycle_multiplier(now.date(), ath, cfg.peak_to_trough_days,
                                     swing=cfg.cycle_mult_swing)
+    # Known discontinuity (recorded with the readings below): when a new ATH
+    # prints, days-since-peak resets to ~0 and the multiplier can snap to its
+    # floor in one run — bounded by the ±swing cap.
+    cycle_ath = {
+        "date": ath.isoformat(), "price": ath_price, "source": ath_source,
+        "note": ("days-since-ATH resets when a new ATH prints, so the cycle "
+                 "multiplier can step discontinuously across one run (bounded by "
+                 "the ±swing cap)"),
+    }
     composite_score, active_cats = scoring.composite(cat_scores, cfg.weights, mult)
+    # Renormalization guard flag (math unchanged): a run without the heaviest
+    # category is marked degraded so alerting/readers can caveat tier moves.
+    degraded = scoring.composite_degraded(active_cats)
     # Hysteresis: a tier change must clear the threshold by a margin so a composite
     # hovering on a cutoff doesn't whipsaw the tier (and spam alerts). Keyed off the
     # last *computed* tier (display/state continuity), not the alert cursor.
@@ -177,14 +205,16 @@ def run(cfg: Config, *, dry_run: bool = False) -> dict:
                       changed=changed, what_to_do=what_to_do, plan=plan)
     tier_send_ok = True   # True when nothing needed sending (cursor may advance freely)
     if decisions["tier_alert"]:
-        title, body = alerting.build_tier_message(cats_changed=decisions["cats_changed"], **msg_kwargs)
+        title, body = alerting.build_tier_message(cats_changed=decisions["cats_changed"],
+                                                  degraded=degraded, **msg_kwargs)
         if dry_run:
             log.info("[dry-run] TIER ALERT\n%s\n%s", title, body)
         else:
             tier_send_ok = notify.send(cfg, title, body, conn=conn)
     elif decisions["exit_alert"]:
         title, body = alerting.build_exit_message(prev_tier=prev_notified_tier,
-                                                  cats_changed=decisions["cats_changed"], **msg_kwargs)
+                                                  cats_changed=decisions["cats_changed"],
+                                                  degraded=degraded, **msg_kwargs)
         if dry_run:
             log.info("[dry-run] EXIT ALERT\n%s\n%s", title, body)
         else:
@@ -232,6 +262,8 @@ def run(cfg: Config, *, dry_run: bool = False) -> dict:
         "subscores": subscores,
         "category_scores": cat_scores,
         "cycle_multiplier": mult,
+        "cycle_ath": cycle_ath,
+        "degraded": degraded,
         "conviction": conv,
         "agreement": agreement,
         "froth": froth,
@@ -263,6 +295,8 @@ def run(cfg: Config, *, dry_run: bool = False) -> dict:
         "prev_tier": prev_tier,
         "active_cats": active_cats,
         "cycle_multiplier": mult,
+        "cycle_ath": cycle_ath,
+        "degraded": degraded,
         "flash_now": flash_now,
         "froth": froth,
         "froth_alert": froth_alert,

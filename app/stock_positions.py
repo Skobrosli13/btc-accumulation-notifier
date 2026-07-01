@@ -3,8 +3,11 @@
 Each fired setup becomes a ``stock_positions`` row; every EOD run walks the new
 bars since entry and resolves it (stop / t2 / time-stop) or updates its running
 excursion. The closed rows are the out-of-sample track record that ``stock_calibrate``
-turns into live win-rates. Intrabar convention is deliberately conservative: if a
-bar's range touches BOTH the stop and the target, the stop is assumed hit first.
+turns into live win-rates. Intrabar conventions are deliberately honest: if a
+bar's range touches BOTH the stop and the target, the stop is assumed hit first,
+and a bar that OPENS through the stop (a gap) fills at the open — not at the
+untouchable stop price — so gap-through losses are measured at what a subscriber
+could actually get.
 
 R accounting uses a single full-position exit at the stop, the runner target (t2),
 or the time-stop — t1 is shown as a scale-out suggestion but the tracker measures
@@ -24,10 +27,12 @@ def reprice(position: dict, new_bars: list[dict], run_ts: str,
             time_stop_days: int, cost_bps: float = 0.0) -> dict:
     """Resolve/advance one open position against bars AFTER its entry.
 
-    ``new_bars`` = [{ts,high,low,close}, ...] oldest->newest, ts > opened_ts.
+    ``new_bars`` = [{ts,open,high,low,close}, ...] oldest->newest, ts > entry bar.
     ``cost_bps`` is the round-trip commission+slippage charged in R terms (so the
     forward-test measures NET, not gross, expectancy — costs bite tight-stop setups
-    much harder than wide-stop ones). Returns either
+    much harder than wide-stop ones). A stop exit fills at min(open, stop) for longs
+    (max for shorts): a gap through the stop books the achievable open, not the stop.
+    Returns either
       {status:'CLOSED', exit_price, realized_r(net), gross_r, cost_r, exit_reason, closed_ts, mfe_r, mae_r}
     or {status:'OPEN', mfe_r, mae_r}."""
     direction = position["direction"]
@@ -47,17 +52,20 @@ def reprice(position: dict, new_bars: list[dict], run_ts: str,
 
     for i, b in enumerate(new_bars):
         hi, lo, close = b["high"], b["low"], b["close"]
+        opn = b.get("open")   # older bar dicts may lack it -> fall back to stop-price fill
         # running excursion in R
         if direction == "BUY":
             mfe = max(mfe, _r(direction, hi, entry, risk))
             mae = min(mae, _r(direction, lo, entry, risk))
             stop_hit, t2_hit = lo <= stop, hi >= t2
+            stop_fill = min(opn, stop) if opn is not None else stop
         else:
             mfe = max(mfe, _r(direction, lo, entry, risk))
             mae = min(mae, _r(direction, hi, entry, risk))
             stop_hit, t2_hit = hi >= stop, lo <= t2
+            stop_fill = max(opn, stop) if opn is not None else stop
         if stop_hit:   # conservative: stop wins a same-bar stop+target tie
-            return _close(stop, "stop", b["ts"])
+            return _close(stop_fill, "stop", b["ts"])
         if t2_hit:
             return _close(t2, "t2", b["ts"])
         if i + 1 >= time_stop_days:   # time-stop: exit at the close of the Nth bar
@@ -66,7 +74,14 @@ def reprice(position: dict, new_bars: list[dict], run_ts: str,
 
 
 def summarize(closed: list[dict]) -> dict:
-    """Aggregate closed positions into a track record (overall + per archetype)."""
+    """Aggregate closed positions into a track record (overall + per archetype).
+
+    Voided rows — ``exit_reason='rebased'`` (unverifiable price basis after a
+    split/adjustment) or a NULL realized_r — are excluded: they carry no honest
+    R and must never count as wins or losses."""
+    closed = [r for r in closed
+              if r.get("exit_reason") != "rebased" and r.get("realized_r") is not None]
+
     def agg(rows: list[dict]) -> dict:
         n = len(rows)
         if not n:

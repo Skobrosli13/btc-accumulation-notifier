@@ -255,6 +255,29 @@ def current_regime(daily_close: "pd.Series | None", period: int = 200) -> str:
     return "bull" if float(daily_close.iloc[-1]) >= ma else "bear"
 
 
+# Trigger keys that are CONTEXT-ONLY for the confluence gate. The replay that
+# produces st_winrates.json (scripts/st_validation) can only model triggers
+# derivable from candle history, so the funding/OI-driven triggers carry no
+# backtested cell; counting them toward the same-direction confluence tally
+# would let an unvalidated fire promote a lone near-coin-flip candle trigger
+# into an alert from a population the calibration never measured. They can
+# still alert on their own merits (the single-trigger regime-aligned path) —
+# they just never vouch for another trigger. The Coinalyze order-flow triggers
+# are excluded the same way (the collector passes flow.FLOW_TRIGGER_KEYS in).
+UNVALIDATED_TRIGGER_KEYS = frozenset({
+    "funding_spike_bull", "funding_spike_bear", "oi_surge_long", "oi_surge_short",
+})
+
+
+def confluence_directions(triggers: list[Trigger],
+                          extra_context_keys: frozenset = frozenset()) -> list[str]:
+    """Directions of the triggers that COUNT toward the confluence tally: candle
+    triggers with backtest coverage only. ``extra_context_keys`` adds further
+    context-only keys (the collector passes the order-flow trigger keys)."""
+    excluded = UNVALIDATED_TRIGGER_KEYS | extra_context_keys
+    return [t.direction for t in triggers if t.key not in excluded]
+
+
 def confluence_ok(same_direction_count: int, regime_aligned_: bool | None,
                   counter_trend: bool) -> bool:
     """Whether a swing trigger has enough confluence to alert. Single triggers are

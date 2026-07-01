@@ -69,8 +69,10 @@ def deep_klines(timeframe: str, total: int, symbol: str = "BTC-USDT") -> pd.Data
 
 def daily_regime_series(symbol: str = "BTC-USDT", total: int = 2600) -> pd.Series:
     """Deep daily closes as a Series indexed by open_time (UTC), for the 200DMA
-    regime. ``st_validation._regime_at`` slices this at each evaluation time so the
-    bull/bear tag has no look-ahead. Needs >=200 daily closes to ever leave 'unknown';
+    regime. ``st_validation._regime_at`` slices this by daily-candle CLOSE time at
+    each event's evaluation time, so the bull/bear tag has no look-ahead (an
+    intraday event never sees its own day's still-forming daily close).
+    Needs >=200 daily closes to ever leave 'unknown';
     the default ~7y span covers the full multi-year 4h history (with the 200d lead) so
     early-period events get a real bull/bear tag rather than 'unknown'."""
     df = exchange.closed_only(deep_klines("1d", total, symbol))

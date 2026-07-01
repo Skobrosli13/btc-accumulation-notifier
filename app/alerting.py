@@ -159,9 +159,10 @@ def build_froth_message(*, froth: dict, band: str, price: float | None,
     lines += [
         "",
         "Heuristic top-signal: thresholds anchored to the 2017/2021/2025 cycle tops "
-        "(1-3 cycles per indicator) - a small sample, not a proven edge. This is the "
-        "sell-side mirror of the accumulation score: consider reviewing/trimming into "
-        "strength, sized to your own plan.",
+        "(1-3 cycles per indicator) and tuned IN-SAMPLE on those same tops (no "
+        "out-of-sample holdout) - a small circular sample, not a proven edge. This is "
+        "the sell-side mirror of the accumulation score: consider reviewing/trimming "
+        "into strength, sized to your own plan.",
         "Not financial advice - alert only. You decide whether, how much, and where to sell.",
     ]
     return title, "\n".join(lines)
@@ -212,13 +213,22 @@ _CATS_CHANGED_CAVEAT = (
     "move. Confirm against the indicator breakdown before acting."
 )
 
+_DEGRADED_CAVEAT = (
+    "[!] Note: the on-chain category (the heaviest weight) returned no data this "
+    "run, so the composite is renormalized over the remaining categories — that "
+    "alone can shift it 10+ points, several times the tier hysteresis margin. A "
+    "tier move on a degraded run can be a data-outage artifact, not a market "
+    "move; confirm against the indicator breakdown before acting."
+)
+
 
 def build_tier_message(*, composite: float, tier: str, subscores: dict,
                        price_struct: dict, readings: dict, active_cats: list[str],
                        onchain_active: bool, changed: dict | None = None,
                        what_to_do: dict | None = None, plan: dict | None = None,
-                       cats_changed: bool = False) -> tuple[str, str]:
-    """Return (title, body) for a tier-transition alert."""
+                       cats_changed: bool = False, degraded: bool = False) -> tuple[str, str]:
+    """Return (title, body) for a tier-transition alert. ``degraded`` marks a run
+    whose on-chain category returned no data (see scoring.composite_degraded)."""
     label = TIER_LABELS.get(tier, tier)
     headline = TIER_HEADLINES.get(tier, "")
     title = f"BTC accumulation: {label} ({composite:.0f}/100)"
@@ -228,6 +238,8 @@ def build_tier_message(*, composite: float, tier: str, subscores: dict,
                                 active_cats=active_cats, onchain_active=onchain_active)
     if cats_changed:
         body_lines += ["", _CATS_CHANGED_CAVEAT]
+    if degraded:
+        body_lines += ["", _DEGRADED_CAVEAT]
     pb = _playbook_lines(changed, what_to_do, plan)
     if pb:
         body_lines += ["", *pb]
@@ -238,7 +250,8 @@ def build_exit_message(*, composite: float, tier: str, subscores: dict,
                        price_struct: dict, readings: dict, active_cats: list[str],
                        onchain_active: bool, prev_tier: str = "",
                        changed: dict | None = None, what_to_do: dict | None = None,
-                       plan: dict | None = None, cats_changed: bool = False) -> tuple[str, str]:
+                       plan: dict | None = None, cats_changed: bool = False,
+                       degraded: bool = False) -> tuple[str, str]:
     """Return (title, body) for a zone-exit note (alert tier -> NEUTRAL).
 
     A low-key bookend to the tier alerts: a user laddering on the last ACCUMULATE
@@ -258,6 +271,8 @@ def build_exit_message(*, composite: float, tier: str, subscores: dict,
                                 active_cats=active_cats, onchain_active=onchain_active)
     if cats_changed:
         body_lines += ["", _CATS_CHANGED_CAVEAT]
+    if degraded:
+        body_lines += ["", _DEGRADED_CAVEAT]
     pb = _playbook_lines(changed, what_to_do, plan)
     if pb:
         body_lines += ["", *pb]
@@ -291,6 +306,19 @@ def build_flash_message(*, composite: float, tier: str, subscores: dict,
 
 
 # --- Short-term swing alerts -------------------------------------------------
+
+# Applies to EVERY swing trigger, not just order-flow: the committed calibration
+# (app/st_winrates.json) measures the ALERTED (post-confluence) population as
+# statistically indistinguishable from the base rate — the email must not imply
+# a conviction the system's own numbers refute.
+_ST_NO_EDGE_LINE = ("Swing triggers overall: measured ~ coin-flip vs the base rate "
+                    "on the alerted population (no demonstrated edge) - timing "
+                    "context, not conviction.")
+_FLOW_NOTE = ("Order-flow read (CVD / OI / liquidation): FORWARD-TEST layer - "
+              "backtested ~ coin-flip over its short history, no live forward-test "
+              "verdict yet; timing context only.")
+_UNVALIDATED_NOTE = ("Funding/OI trigger: unvalidated - no backtest coverage "
+                     "(not replayable from candle history alone).")
 
 def diff_since(prev: dict | None, cur: dict) -> dict | None:
     """'What changed' between the last alerted run and now. prev/cur each carry
@@ -404,7 +432,10 @@ def build_st_message(*, trigger, timeframe: str, score: float, state: str,
     lines.append("")
     from .flow import FLOW_TRIGGER_KEYS
     if trigger.key in FLOW_TRIGGER_KEYS:
-        lines.append("Order-flow read (CVD / OI / liquidation): backtested ~ coin-flip, no demonstrated edge - timing context only.")
+        lines.append(_FLOW_NOTE)
+    elif trigger.key in shortterm.UNVALIDATED_TRIGGER_KEYS:
+        lines.append(_UNVALIDATED_NOTE)
+    lines.append(_ST_NO_EDGE_LINE)
     lines.append("Short-term swing timing - separate from the long-term accumulation thesis.")
     lines.append("Not financial advice - alert only. You decide whether, how much, and where to trade.")
     return title, "\n".join(lines)
@@ -435,7 +466,9 @@ def build_st_batch_message(items: list[dict], direction: str) -> tuple[str, str]
     title = f"BTC swing {direction}: {len(items)} triggers ({tf_summary})"
 
     lines = [f"{arrow} {len(items)} short-term {direction} triggers fired this run ({tf_summary}).",
-             "Confluence across multiple triggers/timeframes — higher conviction than a lone trigger.",
+             "Batched into one email because several triggers agreed — the agreement is "
+             "a noise/spam filter, not evidence of edge (the alerted population still "
+             "measures ~ coin-flip).",
              ""]
     for it in items:
         trig = it["trigger"]
@@ -456,7 +489,10 @@ def build_st_batch_message(items: list[dict], direction: str) -> tuple[str, str]
     lines.append("")
     from .flow import FLOW_TRIGGER_KEYS
     if any(it["trigger"].key in FLOW_TRIGGER_KEYS for it in items):
-        lines.append("Order-flow reads (CVD / OI / liquidation): backtested ~ coin-flip, no demonstrated edge - timing context only.")
+        lines.append(_FLOW_NOTE)
+    if any(it["trigger"].key in shortterm.UNVALIDATED_TRIGGER_KEYS for it in items):
+        lines.append(_UNVALIDATED_NOTE)
+    lines.append(_ST_NO_EDGE_LINE)
     lines.append("Short-term swing timing - separate from the long-term accumulation thesis.")
     lines.append("Not financial advice - alert only. You decide whether, how much, and where to trade.")
     return title, "\n".join(lines)

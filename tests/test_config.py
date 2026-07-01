@@ -61,3 +61,10 @@ def test_coinalyze_layer_toggle_and_defaults(monkeypatch):
 
     monkeypatch.setenv("COINALYZE_API_KEY", "ca-key")
     assert config.load_config().coinalyze_active is True
+
+
+def test_freshness_budget_default_and_override(monkeypatch):
+    monkeypatch.delenv("FRESHNESS_BUDGET_DAYS", raising=False)
+    assert config.load_config().freshness_budget_days == 3.0
+    monkeypatch.setenv("FRESHNESS_BUDGET_DAYS", "7")
+    assert config.load_config().freshness_budget_days == 7.0

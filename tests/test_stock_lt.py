@@ -1,8 +1,16 @@
-"""Tests for the long-term engine — fundamentals metrics + gate/rank/combine (pure)."""
+"""Tests for the long-term engine — fundamentals metrics + gate/rank/combine (pure)
+plus the SPY-benchmarked holdings lifecycle (in-memory DB)."""
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 from app import stock_fundamentals as F
+from app import stock_lt_collect, stock_lt_store, stock_store, store
 from app import stock_lt_scoring as S
+from app.config import load_config
+
+CFG = load_config()
+DAY = 86_400_000
 
 _STMT = {
     "revenues": "income_statement", "gross_profit": "income_statement",
@@ -142,3 +150,98 @@ def test_fair_value_band_cheap_vs_sector():
     c = _cand()  # earnings_yield = 150/3000 = 5%
     fv = S.fair_value_band(c, sector_median_ey=0.025)   # sector median 2.5% -> name cheaper
     assert fv and fv["fair_value"] > c["price"] and fv["discount_pct"] > 0
+
+
+# --- holdings lifecycle (SPY-benchmarked forward-test) -------------------------
+
+def _conn_mem():
+    conn = store.connect(":memory:")
+    store.init_db(conn)
+    stock_store.init_stock_db(conn)
+    stock_lt_store.init_stock_lt_db(conn)
+    return conn
+
+
+_NOW = datetime.now(timezone.utc)
+
+
+def test_close_dropped_by_conviction_uses_date_matched_spy():
+    conn = _conn_mem()
+    t = 100 * DAY
+    stock_lt_store.open_lt_holding(conn, ticker="AAA", opened_run_ts="r0", opened_ts=t,
+                                   entry=100.0, spy_entry=400.0, conviction=80)
+    # AAA is still scored (in candidates) but fell off the conviction list
+    candidates = [{"ticker": "AAA", "price": 110.0, "last_ts": t + 30 * DAY}]
+    spy_by_ts = {t + 30 * DAY: 440.0}
+    opened, deferred = stock_lt_collect._manage_holdings(
+        conn, CFG, "r1", set(), [], candidates, 440.0, spy_by_ts, _NOW, False)
+    assert opened == [] and deferred == []
+    closed = stock_lt_store.closed_lt_holdings(conn)
+    assert len(closed) == 1
+    h = closed[0]
+    assert h["exit_reason"] == "dropped_by_conviction"
+    assert h["spy_exit"] == 440.0
+    assert abs(h["excess_return"] - (0.10 - 0.10)) < 1e-9   # +10% vs SPY +10%
+    conn.close()
+
+
+def test_close_deferred_when_no_date_matched_pair():
+    conn = _conn_mem()
+    t_old, t_new = 100 * DAY, 130 * DAY
+    stock_lt_store.open_lt_holding(conn, ticker="BBB", opened_run_ts="r0", opened_ts=t_old,
+                                   entry=50.0, spy_entry=400.0, conviction=70)
+    # BBB vanished from the scorable set; its stored bar is weeks older than SPY's
+    stock_store.upsert_prices(conn, "BBB", [(t_old, 10, 11, 9, 48.0, 1e6)], source="test")
+    opened, deferred = stock_lt_collect._manage_holdings(
+        conn, CFG, "r1", set(), [], [], 440.0, {t_new: 440.0}, _NOW, False)
+    assert deferred == ["BBB"]
+    assert stock_lt_store.open_lt_holdings(conn)          # still open — no phantom exit
+    assert stock_lt_store.closed_lt_holdings(conn) == []
+    conn.close()
+
+
+def test_close_data_gap_when_dates_match():
+    conn = _conn_mem()
+    t = 100 * DAY
+    stock_lt_store.open_lt_holding(conn, ticker="CCC", opened_run_ts="r0", opened_ts=t,
+                                   entry=50.0, spy_entry=400.0, conviction=70)
+    # not scored this run (e.g. financials decode failure) but prices are current
+    stock_store.upsert_prices(conn, "CCC", [(t + 30 * DAY, 54, 56, 53, 55.0, 1e6)], source="test")
+    opened, deferred = stock_lt_collect._manage_holdings(
+        conn, CFG, "r1", set(), [], [], 440.0, {t + 30 * DAY: 440.0}, _NOW, False)
+    assert deferred == []
+    closed = stock_lt_store.closed_lt_holdings(conn)
+    assert len(closed) == 1 and closed[0]["exit_reason"] == "data_gap"
+    assert closed[0]["exit"] == 55.0
+    conn.close()
+
+
+def test_close_reexpresses_entry_in_current_basis_after_split():
+    conn = _conn_mem()
+    t = 100 * DAY
+    stock_lt_store.open_lt_holding(conn, ticker="EEE", opened_run_ts="r0", opened_ts=t,
+                                   entry=100.0, spy_entry=400.0, conviction=70, entry_ts=t)
+    # 10:1 split mid-hold: the stored series (current basis) shows the entry bar at 10
+    stock_store.upsert_prices(conn, "EEE", [(t, 9.9, 10.1, 9.8, 10.0, 1e7),
+                                            (t + 30 * DAY, 10.9, 11.2, 10.8, 11.0, 1e7)],
+                              source="test")
+    stock_lt_collect._manage_holdings(
+        conn, CFG, "r1", set(), [], [], 440.0, {t + 30 * DAY: 440.0}, _NOW, False)
+    closed = stock_lt_store.closed_lt_holdings(conn)
+    assert len(closed) == 1
+    # +10% vs SPY +10% -> ~0 excess, NOT the -89% a naive exit/entry would book
+    assert abs(closed[0]["excess_return"]) < 1e-6
+    conn.close()
+
+
+def test_open_uses_date_matched_spy_entry():
+    conn = _conn_mem()
+    t = 200 * DAY
+    survivors = [{"ticker": "DDD", "price": 30.0, "last_ts": t, "conviction": 90}]
+    spy_by_ts = {t: 430.0}   # SPY close of the SAME bar date as the entry price
+    opened, _ = stock_lt_collect._manage_holdings(
+        conn, CFG, "r1", {"DDD"}, survivors, survivors, 440.0, spy_by_ts, _NOW, False)
+    assert opened == ["DDD"]
+    h = stock_lt_store.open_lt_holdings(conn)[0]
+    assert h["spy_entry"] == 430.0 and h["entry"] == 30.0
+    conn.close()

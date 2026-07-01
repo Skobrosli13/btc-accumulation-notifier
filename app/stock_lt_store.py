@@ -58,7 +58,9 @@ CREATE TABLE IF NOT EXISTS stock_lt_holdings (
   closed_ts     INTEGER,
   exit          REAL,
   spy_exit      REAL,
-  excess_return REAL               -- (name % change) - (SPY % change) over the hold
+  excess_return REAL,              -- (name % change) - (SPY % change) over the hold
+  exit_reason   TEXT,              -- dropped_by_conviction | data_gap
+  entry_ts      INTEGER            -- bar ts of the entry close (split re-base anchor)
 );
 CREATE INDEX IF NOT EXISTS ix_stock_lt_holdings_status ON stock_lt_holdings(status, ticker);
 """
@@ -66,6 +68,8 @@ CREATE INDEX IF NOT EXISTS ix_stock_lt_holdings_status ON stock_lt_holdings(stat
 
 def init_stock_lt_db(conn: sqlite3.Connection) -> None:
     conn.executescript(_SCHEMA)
+    _add_column_if_missing(conn, "stock_lt_holdings", "exit_reason", "TEXT")
+    _add_column_if_missing(conn, "stock_lt_holdings", "entry_ts", "INTEGER")
     conn.commit()
 
 
@@ -182,20 +186,23 @@ def open_lt_holdings(conn: sqlite3.Connection) -> list[dict]:
 
 
 def open_lt_holding(conn: sqlite3.Connection, *, ticker: str, opened_run_ts: str, opened_ts: int,
-                    entry: float, spy_entry: float, conviction: float) -> None:
+                    entry: float, spy_entry: float, conviction: float,
+                    entry_ts: int | None = None) -> None:
     conn.execute(
-        "INSERT INTO stock_lt_holdings (ticker, opened_run_ts, opened_ts, entry, spy_entry, conviction, status) "
-        "VALUES (?, ?, ?, ?, ?, ?, 'OPEN')",
-        (ticker, opened_run_ts, opened_ts, entry, spy_entry, conviction),
+        "INSERT INTO stock_lt_holdings (ticker, opened_run_ts, opened_ts, entry, spy_entry, "
+        "conviction, status, entry_ts) VALUES (?, ?, ?, ?, ?, ?, 'OPEN', ?)",
+        (ticker, opened_run_ts, opened_ts, entry, spy_entry, conviction, entry_ts),
     )
     conn.commit()
 
 
 def close_lt_holding(conn: sqlite3.Connection, hid: int, *, closed_ts: int, exit_price: float,
-                     spy_exit: float, excess_return: float) -> None:
+                     spy_exit: float, excess_return: float,
+                     exit_reason: str | None = None) -> None:
     conn.execute(
-        "UPDATE stock_lt_holdings SET status='CLOSED', closed_ts=?, exit=?, spy_exit=?, excess_return=? WHERE id=?",
-        (closed_ts, exit_price, spy_exit, excess_return, hid),
+        "UPDATE stock_lt_holdings SET status='CLOSED', closed_ts=?, exit=?, spy_exit=?, "
+        "excess_return=?, exit_reason=? WHERE id=?",
+        (closed_ts, exit_price, spy_exit, excess_return, exit_reason, hid),
     )
     conn.commit()
 

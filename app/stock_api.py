@@ -22,6 +22,11 @@ router = APIRouter(prefix="/api/stock", tags=["stock"])
 
 # Daily cron; allow ~1 missed run + slack before "stale".
 _STOCK_STALE_HOURS = 30.0
+# A configured layer that returned ZERO rows for this many consecutive runs is
+# flagged degraded — key/flag presence says nothing about data actually flowing.
+_DEGRADED_RUNS = 3
+# Open positions not repriced for longer than this (~5 trading days) are surfaced.
+_POSITION_STALE_MS = 7 * 86_400_000
 
 
 @lru_cache(maxsize=1)
@@ -40,33 +45,86 @@ def _winrates() -> dict:
         return {}
 
 
+# Layer -> the run-readings counts key that proves data actually flowed.
+_LAYER_COUNT_KEYS = {
+    "prices": "prices_fetched",
+    "earnings_pead": "earnings_rows",
+    "insider": "insider_ok",
+    "shortvol": "shortvol_matched",
+}
+
+
+def _layer_status(runs: list[dict], layer: str, active: bool) -> str:
+    """'off' | 'ok' | 'degraded' from the last runs' per-layer outcome counts.
+    Degraded = configured-active but zero rows for the last N runs that recorded
+    counts (a revoked key / blocked scrape looks exactly like this). Runs from
+    before the counts readings existed are skipped (tolerate old rows)."""
+    if not active:
+        return "off"
+    key = _LAYER_COUNT_KEYS[layer]
+    vals = []
+    for r in runs:
+        c = (r.get("readings") or {}).get("counts") or {}
+        if c.get(key) is not None:
+            vals.append(c[key])
+    if len(vals) >= _DEGRADED_RUNS and all(v == 0 for v in vals[:_DEGRADED_RUNS]):
+        return "degraded"
+    return "ok"
+
+
 @router.get("/health")
 def health(cfg: Config = Depends(_cfg), _=Depends(_require_token)) -> dict:
     now = datetime.now(timezone.utc)
+    now_ms = int(now.timestamp() * 1000)
     out = {
         "ok": True, "now": now.isoformat(),
         "price_source": cfg.stock_price_source,
         "universe_path": cfg.stock_universe_path,
         "layers": {
-            "prices": True,  # keyless (Yahoo) or keyed (Alpaca/Tiingo)
+            "prices": False,  # proven by data flow below, not asserted
             "earnings_pead": cfg.finnhub_active,
             "insider": cfg.stock_insider_active,
             "shortvol": cfg.stock_shortvol_active,
-            "congress": cfg.stock_congress_active,
+            "congress": False,  # retired: upstream house-stock-watcher mirror unmaintained
         },
+        "layer_status": {}, "degraded_layers": [],
         "db_ok": False, "last_run": None, "run_age_hours": None, "stale": True,
-        "universe_n": None, "regime": None,
+        "universe_n": None, "regime": None, "coverage": None, "degraded_run": None,
+        "stale_positions": [],
     }
     try:
         conn = store.connect_readonly(cfg.db_path)
         lr = stock_store.last_stock_run_ts(conn)
-        latest = stock_store.latest_stock_run(conn)
+        runs = stock_store.recent_stock_runs(conn, _DEGRADED_RUNS)
         uni = stock_store.get_universe(conn)
+        openp = stock_store.open_positions(conn)
         conn.close()
+        latest = runs[0] if runs else None
+        readings = (latest or {}).get("readings", {})
+        counts = readings.get("counts") or {}
         out["db_ok"] = True
         out["last_run"] = lr.isoformat() if lr else None
         out["universe_n"] = len(uni)
-        out["regime"] = (latest or {}).get("readings", {}).get("regime")
+        out["regime"] = readings.get("regime")
+        out["coverage"] = readings.get("coverage")
+        out["degraded_run"] = readings.get("degraded")
+        out["layers"]["prices"] = bool(counts.get("prices_fetched") or
+                                       (readings.get("layers") or {}).get("prices"))
+        active = {"prices": True, "earnings_pead": cfg.finnhub_active,
+                  "insider": cfg.stock_insider_active, "shortvol": cfg.stock_shortvol_active}
+        out["layer_status"] = {k: _layer_status(runs, k, v) for k, v in active.items()}
+        out["layer_status"]["congress"] = "retired"
+        out["degraded_layers"] = [k for k, v in out["layer_status"].items() if v == "degraded"]
+        # Open positions whose ticker hasn't repriced in ~5 trading days: a silent
+        # per-name fetch failure freezes the forward-test without any other alarm.
+        out["stale_positions"] = [
+            {"ticker": p["ticker"], "archetype": p["archetype"],
+             "days_since_reprice": round((now_ms - (p.get("last_reprice_ts")
+                                                    or p.get("opened_ts") or now_ms))
+                                         / 86_400_000, 1)}
+            for p in openp
+            if now_ms - (p.get("last_reprice_ts") or p.get("opened_ts") or now_ms)
+            > _POSITION_STALE_MS]
         age = (now - lr).total_seconds() / 3600.0 if lr else None
         out["run_age_hours"] = round(age, 2) if age is not None else None
         out["stale"] = age is None or age > _STOCK_STALE_HOURS
@@ -128,6 +186,8 @@ def screener(cfg: Config = Depends(_cfg), _=Depends(_require_token)) -> dict:
         "regime": readings.get("regime"),
         "universe_n": (latest or {}).get("universe_n"),
         "scored_n": (latest or {}).get("scored_n"),
+        "coverage": readings.get("coverage"),
+        "degraded": readings.get("degraded"),
         "layers": readings.get("layers", {}),
         "price_source": readings.get("price_source", cfg.stock_price_source),
         "surfaced": [s for s in setups if s["surfaced"]],
@@ -144,14 +204,18 @@ def positions(cfg: Config = Depends(_cfg), _=Depends(_require_token)) -> dict:
     conn = _conn(cfg)
     try:
         openp = stock_store.open_positions(conn)
+        pending = stock_store.pending_positions(conn)
         closed = stock_store.closed_positions(conn)
     finally:
         conn.close()
-    summary = stock_positions.summarize(closed)
+    summary = stock_positions.summarize(closed)  # excludes voided ('rebased') rows
     recent_closed = sorted(closed, key=lambda r: r.get("closed_ts") or 0, reverse=True)[:40]
-    return {"open": openp, "recent_closed": recent_closed, "summary": summary,
-            "n_open": len(openp), "n_closed": len(closed),
-            "note": "Forward-tested on the tracker's own signals — out-of-sample, grows over time."}
+    return {"open": openp, "pending": pending, "recent_closed": recent_closed,
+            "summary": summary, "n_open": len(openp), "n_pending": len(pending),
+            "n_closed": len(closed),
+            "note": ("Forward-tested on the tracker's own signals — out-of-sample, "
+                     "grows over time. Fills are at the NEXT session's open (pending "
+                     "until then); voided/rebased rows never count.")}
 
 
 @router.get("/track_record")

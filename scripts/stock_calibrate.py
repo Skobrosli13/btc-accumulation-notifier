@@ -7,6 +7,13 @@ and writes:
   live trades have closed to beat the backtest seed (else the seed is kept, so a
   handful of live trades can't swing confidence around).
 
+Positions voided by a venue rebase (``exit_reason='rebased'``) and entries that
+never filled (non-CLOSED status, e.g. expired ``pending`` rows) are excluded from
+every aggregate. Promoted cells reuse the backtest's cell shape (``n_months``,
+month-clustered dispersion) and carry the ``alignment: announcement_date`` marker
+on PEAD — live entries key off the earnings *calendar* (announcement dates), so
+live cells are valid by construction.
+
 Run after trades have accumulated (e.g. weekly cron), then commit the JSON — the
 API reads these verbatim (a scoring change does NOT update them).
 
@@ -23,10 +30,35 @@ from pathlib import Path
 
 from app import stock_positions, stock_store, store
 from app.config import load_config
+from scripts.stock_backtest import build_cells, month_key
 
 log = logging.getLogger("stock-calibrate")
 _MIN_LIVE_TO_OVERRIDE = 40   # closed trades before live win-rates replace the backtest seed
 _APP = Path(__file__).resolve().parents[1] / "app"
+
+
+def eligible_positions(rows: list[dict]) -> list[dict]:
+    """Closed positions that count toward the record.
+
+    Excludes venue-rebase voids (``exit_reason='rebased'`` — the entry bar could
+    not be re-verified on the pinned venue) and anything not actually CLOSED
+    (e.g. ``pending`` entries that expired unfilled)."""
+    out = []
+    for r in rows:
+        if (r.get("exit_reason") or "") == "rebased":
+            continue
+        if (r.get("status") or "CLOSED").upper() != "CLOSED":
+            continue
+        out.append(r)
+    return out
+
+
+def live_cells(closed: list[dict]) -> dict:
+    """Per-archetype cells from live closed positions, in the backtest cell shape
+    (n / win_rate / expectancy_r / n_months / month dispersion / PEAD alignment)."""
+    trades = [{**r, "month": (month_key(r["opened_ts"]) if r.get("opened_ts") else None)}
+              for r in closed]
+    return build_cells(trades)
 
 
 def main(argv=None) -> int:
@@ -39,7 +71,7 @@ def main(argv=None) -> int:
     conn = store.connect(cfg.db_path)
     store.init_db(conn)
     stock_store.init_stock_db(conn)
-    closed = stock_store.closed_positions(conn)
+    closed = eligible_positions(stock_store.closed_positions(conn))
     conn.close()
 
     summary = stock_positions.summarize(closed)
@@ -54,6 +86,7 @@ def main(argv=None) -> int:
             "Out-of-sample and small until trades accumulate; not a forecast.",
             "Expectancy (avg R) is the target, not raw win-rate.",
             "Conservative single-exit R (stop / T2 / time-stop); intrabar ties go to the stop.",
+            "Venue-rebased (voided) exits and unfilled pending entries are excluded.",
         ],
     }
     print(json.dumps(track, indent=2))
@@ -64,9 +97,11 @@ def main(argv=None) -> int:
         if n >= _MIN_LIVE_TO_OVERRIDE:
             winrates = {"generated_at": now, "source": "live",
                         "note": "Live out-of-sample win-rates (replaced the backtest seed).",
-                        "archetypes": {k: {"n": v["n"], "win_rate": v["win_rate"],
-                                           "expectancy_r": v["expectancy_r"]}
-                                       for k, v in summary["archetypes"].items() if v["n"]}}
+                        "method": ("closed stock_positions net of costs; rebased/pending "
+                                   "excluded; effective-n = n_months (distinct entry months); "
+                                   "PEAD cells are announcement-date aligned (live entries "
+                                   "key off the earnings calendar)"),
+                        "archetypes": live_cells(closed)}
             (_APP / "stock_st_winrates.json").write_text(json.dumps(winrates, indent=2))
             log.info("wrote stock_st_winrates.json from LIVE data")
         else:

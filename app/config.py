@@ -95,10 +95,11 @@ class Config:
     # Free data
     fred_api_key: str | None
 
-    # Order-flow layer (Coinalyze — free, aggregated derivs incl. Binance:
-    # OI / funding / liquidations / candle-CVD). Presence of the key activates it.
+    # Order-flow layer (Coinalyze — free: OI / funding / liquidations / candle-CVD.
+    # The default symbol BTCUSDT_PERP.A is the SINGLE-VENUE Binance perp, not a
+    # cross-venue aggregate). Presence of the key activates it.
     coinalyze_api_key: str | None
-    coinalyze_symbol: str          # Coinalyze market id (e.g. BTCUSDT_PERP.A = Binance perp)
+    coinalyze_symbol: str          # Coinalyze market id (BTCUSDT_PERP.A = Binance perp, ONE venue)
     flow_cvd_lookback: int         # bars for CVD/price divergence on the primary ST timeframe
     flow_liq_spike_mult: float     # last-bar liquidations >= this x recent mean = a flush trigger
     flow_oi_bar_surge_pct: float   # abs SINGLE-BAR OI %change for the participant trigger (per-bar, not per-window)
@@ -195,6 +196,13 @@ class Config:
     massive_api_key: str | None = None
     stock_lt_top_n: int = 30           # long-buys conviction list size
     stock_lt_min_dollar_vol: float = 3_000_000.0  # liquidity floor for the LT universe
+
+    # Freshness budget for DAILY-cadence sources (bitcoin-data /last, BGeometrics
+    # files, Fear & Greed, hashrate): a dated reading older than this many days is
+    # treated as missing (None) instead of scored as current, so a frozen upstream
+    # renormalizes away (and flips active_cats) rather than silently pinning a
+    # category at a stale level. .env: FRESHNESS_BUDGET_DAYS (default 3).
+    freshness_budget_days: float = 3.0
 
     # --- Derived helpers -------------------------------------------------
 
@@ -376,6 +384,7 @@ def load_config() -> Config:
         massive_api_key=_opt("MASSIVE_API_KEY"),
         stock_lt_top_n=_get_int("STOCK_LT_TOP_N", 30),
         stock_lt_min_dollar_vol=_get_float("STOCK_LT_MIN_DOLLAR_VOL", 3_000_000.0),
+        freshness_budget_days=_get_float("FRESHNESS_BUDGET_DAYS", 3.0),
         api_token=_opt("API_TOKEN"),
         api_cors_origin=_opt("API_CORS_ORIGIN"),
         public_base_url=_get("PUBLIC_BASE_URL", "https://btc.riverviewweb.com").rstrip("/"),

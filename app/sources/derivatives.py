@@ -26,7 +26,12 @@ log = logging.getLogger(__name__)
 
 COINGLASS_BASE = "https://open-api-v4.coinglass.com/api"
 
-_NONE_READINGS = {"liq_magnitude": None, "oi_flush": None}
+_NONE_READINGS = {"liq_magnitude": None, "oi_flush": None, "oi_flush_unit": None}
+
+# Timestamp field names across Coinglass versions. Row ORDER varies like field
+# names do, so history rows are sorted by timestamp instead of trusting the
+# response order; a row with NO timestamp can't be order-verified and is unusable.
+_TS_FIELDS = ("time", "t", "ts", "timestamp", "createTime")
 
 
 def _hdr(api_key: str) -> dict:
@@ -62,6 +67,15 @@ def _first_field(row: dict, *names: str):
     return None
 
 
+def _row_ts(row: dict) -> int | None:
+    """Epoch timestamp of a history row, or None when no usable field exists."""
+    v = _first_field(row, *_TS_FIELDS)
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
 def _liquidations_24h_bn(api_key: str) -> float | None:
     data = get_json(f"{COINGLASS_BASE}/futures/liquidation/aggregated-history",
                     params={"symbol": "BTC", "interval": "1d", "limit": 1},
@@ -72,9 +86,12 @@ def _liquidations_24h_bn(api_key: str) -> float | None:
         rows = data.get("data") or []
         if not isinstance(rows, list) or not rows:
             return None
-        last = rows[-1]
-        if not isinstance(last, dict):
+        # Latest bar BY TIMESTAMP, not by position — a newest-first response
+        # would otherwise hand back the oldest bar.
+        stamped = [r for r in rows if isinstance(r, dict) and _row_ts(r) is not None]
+        if not stamped:
             return None
+        last = max(stamped, key=_row_ts)
         # Accept v4 snake_case (aggregated_* and plain) AND legacy camelCase.
         longs = _first_field(last,
                              "aggregated_long_liquidation_usd",
@@ -91,14 +108,21 @@ def _liquidations_24h_bn(api_key: str) -> float | None:
 
 
 def _oi_change_pct(api_key: str) -> float | None:
-    # Match the FREE oi_flush window (~24h, run_once's OKX-derived path) so adding
-    # a paid key does NOT silently redefine the indicator against the same -25%
-    # extreme threshold. limit=2 on the 1d interval => change between the last two
-    # daily closes ~ a 24h window. (We avoid pulling oi_flush_window_hours from
-    # config here because the daily granularity can't honor arbitrary sub-day
-    # windows anyway; 24h is the closest faithful match.)
+    # Match the FREE oi_flush (run_once's OKX-derived path) in BOTH window and
+    # denomination so adding a paid key does NOT silently redefine the indicator
+    # against the same -25% extreme threshold:
+    #   * window: limit=2 on the 1d interval => change between the last two daily
+    #     closes ~ a 24h window. (We avoid pulling oi_flush_window_hours from
+    #     config here because the daily granularity can't honor arbitrary sub-day
+    #     windows anyway; 24h is the closest faithful match.)
+    #   * denomination: the free path reads OKX OI in CONTRACTS (coin terms), so
+    #     request unit=coin here. A USD OI series embeds the price move itself —
+    #     a -20% crash drops USD OI ~20% with ZERO deleveraging, double-counting
+    #     what drop_24_48h_pct already measures. Explicitly USD-named fields are
+    #     rejected (None) rather than mis-scored in the wrong denomination.
     data = get_json(f"{COINGLASS_BASE}/futures/open-interest/aggregated-history",
-                    params={"symbol": "BTC", "interval": "1d", "limit": 2},
+                    params={"symbol": "BTC", "interval": "1d", "limit": 2,
+                            "unit": "coin"},
                     headers=_hdr(api_key))
     if not data or not _envelope_ok(data):
         return None
@@ -106,18 +130,27 @@ def _oi_change_pct(api_key: str) -> float | None:
         rows = data.get("data") or []
         if not isinstance(rows, list):
             return None
-        vals: list[float] = []
+        stamped: list[tuple[int, float]] = []
         for r in rows:
             if not isinstance(r, dict):
                 continue
-            # v4 close field varies: close / close_usd / openInterest (legacy).
-            v = _first_field(r, "close", "close_usd", "open_interest_usd",
-                             "open_interest", "openInterest")
-            if v is not None:
-                vals.append(float(v))
-        if len(vals) < 2 or vals[0] == 0:
+            ts = _row_ts(r)
+            if ts is None:
+                continue  # order-unverifiable row: unusable, not order-trusted
+            # v4 close field varies: close / open_interest / openInterest
+            # (legacy). close_usd / open_interest_usd are NOT accepted — wrong
+            # denomination for this indicator (see above).
+            v = _first_field(r, "close", "open_interest", "openInterest")
+            if v is None:
+                continue
+            try:
+                stamped.append((ts, float(v)))
+            except (TypeError, ValueError):
+                continue
+        stamped.sort(key=lambda p: p[0])  # oldest-first regardless of response order
+        if len(stamped) < 2 or stamped[0][1] == 0:
             return None
-        return (vals[-1] / vals[0] - 1.0) * 100.0  # % change over the window
+        return (stamped[-1][1] / stamped[0][1] - 1.0) * 100.0  # % change over the window
     except (KeyError, TypeError, ValueError):
         return None
 
@@ -136,6 +169,10 @@ def derivatives() -> dict:
             "liq_magnitude": _liquidations_24h_bn(cfg.coinglass_api_key),
             "oi_flush": _oi_change_pct(cfg.coinglass_api_key),
         }
+        # Record the denomination so downstream display can label the number.
+        # The free OKX-contracts fallback in run_once is coin-denominated by
+        # construction; _oi_change_pct requests unit=coin, so both paths match.
+        out["oi_flush_unit"] = "coin" if out["oi_flush"] is not None else None
     except Exception as exc:  # noqa: BLE001
         log.warning("Coinglass fetch failed (%s); paid derivatives skipped", exc)
         return dict(_NONE_READINGS)

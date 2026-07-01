@@ -39,10 +39,10 @@ ARCHETYPE_LABELS = {
     "mean_reversion": "Mean-reversion (oversold dip)",
 }
 
-# Which archetypes carry a *documented* edge (vs. context/unproven). Only PEAD
-# has one; momentum/mean-reversion are near coin-flips whose thin positive
-# expectancy comes from the R-frame, not a real forecasting edge. Drives both the
-# expectancy-weighted ranking and the honest edge/unproven labelling.
+# Which archetypes carry a *documented* edge in the literature. Kept for reference/
+# tests only — the LIVE edge/forward labelling derives from the measured win-rates
+# cells via ``stock_confidence.archetype_maturity`` (valid + significant -> edge),
+# never from this hardcoded set.
 EDGE_ARCHETYPES = {"pead_drift"}
 
 
@@ -262,13 +262,20 @@ def liquid(feat: dict, cfg: Config) -> bool:
 def context_score(insider: dict | None, shortvol: dict | None,
                   revision: dict | None) -> tuple[float, dict]:
     """0..1 context bonus + a breakdown, from the Phase-2/forward-test layers.
-    Absent layers contribute 0 (renormalize-away discipline)."""
+    Absent layers contribute 0 (renormalize-away discipline).
+
+    Short volume is scored as a per-symbol ANOMALY — today's ratio vs the ticker's
+    own trailing mean (``baseline_ratio``) — because the absolute off-exchange
+    short-volume ratio sits near 0.4-0.5 for most names (market-maker mechanics,
+    not positioning). No trailing history -> neutral, no bonus."""
     parts: dict[str, float] = {}
     if insider and insider.get("buyers"):
         parts["insider"] = _clamp01(insider["buyers"] / 3.0) * 0.6 + \
             _clamp01((insider.get("usd") or 0) / 2_000_000.0) * 0.4
     if shortvol and shortvol.get("short_ratio") is not None:
-        parts["shortvol"] = _clamp01((shortvol["short_ratio"] - 0.40) / 0.20)
+        base = shortvol.get("baseline_ratio")
+        if base:  # bonus only for a genuine outlier vs the ticker's own baseline
+            parts["shortvol"] = _clamp01((shortvol["short_ratio"] / base - 1.0) / 0.25)
     if revision and revision.get("net_delta") is not None:
         parts["revision"] = _clamp01(revision["net_delta"] / 5.0)
     score = min(1.0, sum(parts.values())) if parts else 0.0

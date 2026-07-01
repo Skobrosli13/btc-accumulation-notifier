@@ -87,6 +87,10 @@ if _cfg.api_cors_origin:
 # would otherwise mask) is caught.
 _RUN_STALE_HOURS = 13.0
 
+# How many recent runs (~2 days at the 6h cadence) the per-indicator availability
+# check inspects: an indicator None across all of them is reported dark.
+_INDICATOR_HEALTH_RUNS = 8
+
 
 @app.get("/api/health")
 def health(cfg: Config = Depends(get_config), _=Depends(require_token)) -> dict:
@@ -119,7 +123,30 @@ def health(cfg: Config = Depends(get_config), _=Depends(require_token)) -> dict:
         conn = store.connect_readonly(cfg.db_path)
         lc = store.last_collect_ts(conn)
         lr = store.last_run_ts(conn)
+        # Per-indicator availability from the persisted run readings: the config
+        # `layers` above only say what is CONFIGURED; a scored source that fails
+        # soft to None forever (a dead upstream) is otherwise invisible because
+        # the composite renormalizes around it with no alert.
+        recent_reads = store.recent_run_readings(conn, _INDICATOR_HEALTH_RUNS)
         conn.close()
+        inds = {}
+        for name in scoring.THRESHOLDS:
+            seen = [r["run_ts"] for r in recent_reads
+                    if scoring._finite(r["raw"].get(name)) is not None]
+            inds[name] = {
+                # data present in the LATEST run
+                "available": bool(recent_reads and seen
+                                  and seen[0] == recent_reads[0]["run_ts"]),
+                "runs_with_data": len(seen),
+                "runs_checked": len(recent_reads),
+                "last_seen": seen[0] if seen else None,
+            }
+        out["indicators"] = inds
+        # Scored indicators dark across every checked run — a likely dead source,
+        # not a one-run blip (empty until at least one run exists).
+        out["dark_indicators"] = (sorted(n for n, v in inds.items()
+                                         if v["runs_with_data"] == 0)
+                                  if recent_reads else [])
         out["db_ok"] = True
         out["last_collect"] = lc.isoformat() if lc else None
         out["last_run"] = lr.isoformat() if lr else None
@@ -147,6 +174,15 @@ def _st_winrates() -> dict:
         return {}
 
 
+def _trigger_stats(wr: dict, key: str) -> dict:
+    """Historical win-rate cell for a trigger key, or an explicit
+    {"unmeasured": true} marker when the calibration JSON carries no cell for it
+    (funding/OI and order-flow triggers are not replayable from candle history,
+    so they can never have one). Serving None would render as blank conviction
+    rather than "no coverage". Tolerates both the old and new st_winrates shapes."""
+    return wr.get(key) or {"unmeasured": True}
+
+
 @lru_cache(maxsize=1)
 def _track_record_data() -> dict:
     """Read app/track_record.json once (emitted by scripts/calibrate.py). {} if absent."""
@@ -159,20 +195,31 @@ def _track_record_data() -> dict:
 @app.get("/api/live_performance")
 def live_performance(cfg: Config = Depends(get_config), _=Depends(require_token)) -> dict:
     """Forward-tested record of the system's OWN past signals (out-of-sample; grows
-    over time). Long-term runs + fired swing alerts priced against stored candles."""
+    over time). Long-term runs + fired swing alerts priced against stored candles.
+
+    Fetched UNBOUNDED (and 1d candles / alerts are never pruned — see store.prune)
+    so the record genuinely covers the full history instead of quietly becoming a
+    rolling window that sheds the oldest matured outcomes."""
     conn = _conn(cfg)
     try:
         runs = store.all_runs(conn)
-        candles = store.recent_candles(conn, "1d", 400)
-        st_rows = store.recent_st_alerts(conn, 500)
+        candles = store.candles_since(conn, "1d")
+        st_rows = store.st_alerts_since(conn)
     finally:
         conn.close()
-    alerts = [{"ts": a.get("ts"), "direction": a.get("direction"), "price": a.get("price")}
+    # Drop the newest (possibly still-forming) daily candle so a provisional
+    # close can never price a "matured" outcome.
+    candles = candles[:-1] if len(candles) > 1 else candles
+    alerts = [{"ts": a.get("ts"), "direction": a.get("direction"), "price": a.get("price"),
+               "trigger_key": a.get("trigger_key"), "created_at": a.get("created_at")}
               for a in st_rows]
     return {
         "long_term": perf.long_term_performance(runs, candles),
         "short_term": perf.short_term_performance(alerts, candles),
-        "note": "Forward-tested on the system's live signals as they age — out-of-sample, grows over time.",
+        "note": ("Forward-tested on the system's live signals as they age — out-of-sample, "
+                 "grows over time and covers the full stored history. Long-term episode "
+                 "counts (not run counts) are the honest sample size; swing win rates are "
+                 "cost-adjusted and only meaningful against base_rate."),
     }
 
 
@@ -279,9 +326,10 @@ def _lt_breakdown(latest: dict, cfg: Config) -> dict:
             "zone_at": scoring.top_zone_boundary_raw(k),
             "zone_dir": "ge",
         } for k in scoring.TOP_THRESHOLDS],
-        "note": ("heuristic top-signal — thresholds anchored to the 2017/2021/2025 "
-                 "cycle tops via scripts/backtest_tops (1-3 cycles per indicator; "
-                 "not a proven edge)"),
+        "note": ("heuristic top-signal — thresholds tuned IN-SAMPLE on the "
+                 "2017/2021/2025 cycle tops, the same events scripts/backtest_tops "
+                 "then evaluates (1-3 cycles per indicator, one cycle for the "
+                 "on-chain members; circular fit, not a proven edge)"),
     }
 
     return {
@@ -401,7 +449,10 @@ def _enrich_st(conn, cfg: Config, sig: dict | None, tf: str,
         atr = (sig.get("indicators") or {}).get("atr")
         wr = _st_winrates().get("timeframes", {}).get(tf, {})
         live_trigs = shortterm.detect_triggers(df, cfg, funding, oi_chg_pct)
-        dirs = [t.direction for t in live_trigs]
+        # Confluence counts CANDLE triggers only (funding/OI triggers are
+        # context-only), mirroring the collector's gate exactly so the dashboard
+        # never shows a confluence verdict the alert path wouldn't reach.
+        dirs = shortterm.confluence_directions(live_trigs)
         sig["triggers"] = [{
             "key": t.key, "direction": t.direction, "label": t.label, "detail": t.detail,
             "counter_trend": alerting.is_counter_trend(t.direction, state),
@@ -410,7 +461,8 @@ def _enrich_st(conn, cfg: Config, sig: dict | None, tf: str,
                 dirs.count(t.direction), shortterm.regime_aligned(t.direction, regime),
                 alerting.is_counter_trend(t.direction, state)),
             "levels": shortterm.trade_levels(t.direction, st_price, atr),
-            "stats": wr.get(t.key),   # historical win-rate + ATR R-expectancy, or None
+            # historical win-rate + ATR R-expectancy, or {"unmeasured": true}
+            "stats": _trigger_stats(wr, t.key),
         } for t in live_trigs]
     except Exception:  # noqa: BLE001 - never 500 the dashboard over a recompute
         pass

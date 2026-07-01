@@ -1,12 +1,21 @@
 """Tests for the stock swing tracker — pure engine (no network) + store round-trip."""
 from __future__ import annotations
 
-from app import (stock_confidence, stock_levels, stock_positions, stock_scoring,
-                 stock_store, store)
+import dataclasses
+
+from app import (stock_collect, stock_confidence, stock_levels, stock_positions,
+                 stock_scoring, stock_store, store)
 from app.config import load_config
 
 CFG = load_config()
 DAY = 86_400_000
+
+
+def _conn_mem():
+    conn = store.connect(":memory:")
+    store.init_db(conn)
+    stock_store.init_stock_db(conn)
+    return conn
 
 
 def _bars(closes: list[float], vol: float = 2_000_000.0, start_ts: int = 1_600_000_000_000):
@@ -151,10 +160,33 @@ def _pos(direction="BUY", entry=100.0, stop=95.0, t2=110.0):
 
 
 def test_reprice_stop_hit():
-    bars = [{"ts": DAY, "high": 101, "low": 94, "close": 96}]  # low pierces stop 95
+    bars = [{"ts": DAY, "open": 99, "high": 101, "low": 94, "close": 96}]  # low pierces stop 95
     u = stock_positions.reprice(_pos(), bars, "", 12)
     assert u["status"] == "CLOSED" and u["exit_reason"] == "stop"
-    assert round(u["realized_r"], 2) == -1.0
+    assert round(u["realized_r"], 2) == -1.0   # opened above the stop -> fills AT the stop
+
+
+def test_reprice_gap_through_stop_fills_at_open():
+    # bar OPENS below the stop: the stop price is unattainable, fill at the open
+    bars = [{"ts": DAY, "open": 90, "high": 92, "low": 88, "close": 91}]
+    u = stock_positions.reprice(_pos(), bars, "", 12)   # entry 100 stop 95 risk 5
+    assert u["exit_reason"] == "stop" and u["exit_price"] == 90
+    assert round(u["realized_r"], 2) == -2.0   # (90-100)/5, worse than -1R
+
+
+def test_reprice_gap_through_stop_sell_mirrored():
+    pos = _pos("SELL", entry=100.0, stop=105.0, t2=90.0)
+    bars = [{"ts": DAY, "open": 110, "high": 112, "low": 108, "close": 111}]
+    u = stock_positions.reprice(pos, bars, "", 12)
+    assert u["exit_reason"] == "stop" and u["exit_price"] == 110   # max(open, stop)
+    assert round(u["realized_r"], 2) == -2.0
+
+
+def test_reprice_stop_without_open_falls_back_to_stop_price():
+    # legacy bar dicts without 'open' keep the old stop-price fill
+    bars = [{"ts": DAY, "high": 101, "low": 94, "close": 96}]
+    u = stock_positions.reprice(_pos(), bars, "", 12)
+    assert u["exit_reason"] == "stop" and u["exit_price"] == 95
 
 
 def test_reprice_target_hit():
@@ -215,6 +247,15 @@ def test_summarize_expectancy():
     assert abs(s["overall"]["expectancy_r"] - 0.0) < 1e-9
 
 
+def test_summarize_excludes_voided_rows():
+    closed = [{"archetype": "momentum", "realized_r": 2.0},
+              {"archetype": "momentum", "realized_r": None, "exit_reason": "rebased"},
+              {"archetype": "momentum", "realized_r": None}]
+    s = stock_positions.summarize(closed)
+    assert s["overall"]["n"] == 1              # voided rows never count as wins/losses
+    assert s["overall"]["win_rate"] == 1.0
+
+
 # --- confidence --------------------------------------------------------------
 
 class _C:
@@ -233,17 +274,64 @@ def test_confidence_bounds_and_label():
 
 def test_confidence_live_confirmed_only_for_live_source():
     # a backtest seed with high n is still a prior (not live-confirmed)
-    seed = {"source": "backtest", "archetypes": {"pead_drift": {"n": 600, "win_rate": 0.6, "expectancy_r": 0.4}}}
+    seed = {"source": "backtest", "archetypes": {"pead_drift": {
+        "n": 600, "win_rate": 0.6, "expectancy_r": 0.4, "alignment": "announcement_date"}}}
     assert stock_confidence.confidence(_C(), seed)["live_confirmed"] is False
     # only LIVE out-of-sample data flips the flag
-    live = {"source": "live", "archetypes": {"pead_drift": {"n": 60, "win_rate": 0.6, "expectancy_r": 0.4}}}
+    live = {"source": "live", "archetypes": {"pead_drift": {
+        "n": 60, "win_rate": 0.6, "expectancy_r": 0.4, "alignment": "announcement_date"}}}
     c = stock_confidence.confidence(_C(), live)
     assert c["live_confirmed"] is True and c["n"] == 60
 
 
 def test_confidence_cap():
-    strong = {"archetypes": {"pead_drift": {"n": 500, "win_rate": 0.99, "expectancy_r": 2}}}
+    strong = {"archetypes": {"pead_drift": {"n": 500, "win_rate": 0.99, "expectancy_r": 2,
+                                            "alignment": "announcement_date"}}}
     assert stock_confidence.confidence(_C(), strong)["prob"] <= 0.80
+
+
+def test_expectancy_shrunk_toward_prior_like_win_rate():
+    # mean_reversion prior expectancy 0.10; n=24 empirical 0.257 must be shrunk with
+    # the same pseudo-count as win-rate, not taken verbatim.
+    wr = {"archetypes": {"mean_reversion": {"n": 24, "win_rate": 0.625, "expectancy_r": 0.257}}}
+    br = stock_confidence.base_rate("mean_reversion", wr)
+    assert abs(br["expectancy_r"] - (0.257 * 24 + 0.10 * 30) / 54) < 1e-9
+    assert br["expectancy_r"] < 0.257
+    # a large-n cell barely moves
+    wr2 = {"archetypes": {"momentum": {"n": 1010, "win_rate": 0.494, "expectancy_r": 0.099}}}
+    assert abs(stock_confidence.base_rate("momentum", wr2)["expectancy_r"] - 0.099) < 0.01
+
+
+def test_pead_cell_without_alignment_marker_falls_back_to_prior():
+    # old (period-end-aligned) seeds are invalid for the announcement-anchored setup
+    stale = {"archetypes": {"pead_drift": {"n": 159, "win_rate": 0.673, "expectancy_r": 0.408}}}
+    br = stock_confidence.base_rate("pead_drift", stale)
+    assert br["n"] == 0
+    assert br["win_rate"] == stock_confidence.PRIOR["pead_drift"]["win_rate"]
+    valid = {"archetypes": {"pead_drift": {"n": 159, "win_rate": 0.673, "expectancy_r": 0.408,
+                                           "alignment": "announcement_date"}}}
+    assert stock_confidence.base_rate("pead_drift", valid)["n"] == 159
+
+
+def test_archetype_maturity_derived_from_winrates_cell():
+    # no winrates at all -> forward
+    assert stock_confidence.archetype_maturity("pead_drift", {}) == "forward"
+    # unmarked pead cell (invalid alignment) -> forward even if flagged significant
+    stale = {"archetypes": {"pead_drift": {"n": 500, "win_rate": 0.7, "expectancy_r": 0.4,
+                                           "not_significant": False}}}
+    assert stock_confidence.archetype_maturity("pead_drift", stale) == "forward"
+    # valid + explicitly significant -> edge
+    valid = {"archetypes": {"pead_drift": {"n": 500, "win_rate": 0.7, "expectancy_r": 0.4,
+                                           "alignment": "announcement_date",
+                                           "not_significant": False}}}
+    assert stock_confidence.archetype_maturity("pead_drift", valid) == "edge"
+    # valid but not significant (or unmarked significance) -> forward
+    insig = {"archetypes": {"pead_drift": {"n": 40, "win_rate": 0.6, "expectancy_r": 0.2,
+                                           "alignment": "announcement_date",
+                                           "not_significant": True}}}
+    assert stock_confidence.archetype_maturity("pead_drift", insig) == "forward"
+    unmarked = {"archetypes": {"momentum": {"n": 1010, "win_rate": 0.494, "expectancy_r": 0.099}}}
+    assert stock_confidence.archetype_maturity("momentum", unmarked) == "forward"
 
 
 # --- ranking -----------------------------------------------------------------
@@ -300,3 +388,222 @@ def test_store_roundtrip():
     sigs = stock_store.latest_stock_signals(conn)
     assert sigs[0]["ticker"] == "AAA" and sigs[0]["detail"]["catalyst"] == "x"
     conn.close()
+
+
+# --- short-volume anomaly context ---------------------------------------------
+
+def test_shortvol_context_is_anomaly_vs_own_baseline():
+    # no trailing baseline -> neutral (no bonus at all)
+    s, parts = stock_scoring.context_score(None, {"short_ratio": 0.55}, None)
+    assert "shortvol" not in parts and s == 0.0
+    # sitting AT its own baseline (a perfectly normal 45% ratio) -> zero bonus
+    _, parts2 = stock_scoring.context_score(
+        None, {"short_ratio": 0.45, "baseline_ratio": 0.45}, None)
+    assert parts2.get("shortvol", 0.0) == 0.0
+    # a genuine outlier vs its own history earns the bonus
+    _, parts3 = stock_scoring.context_score(
+        None, {"short_ratio": 0.60, "baseline_ratio": 0.45}, None)
+    assert parts3["shortvol"] > 0.5
+
+
+def test_shortvol_baseline_excludes_today_and_needs_history():
+    conn = _conn_mem()
+    rows = [{"ticker": "AAA", "ts": i * DAY, "short_vol": 45.0, "short_exempt": 0.0,
+             "total_vol": 100.0} for i in range(1, 7)]
+    stock_store.upsert_shortvol(conn, rows)
+    base = stock_collect._shortvol_baseline(conn, "AAA", 6 * DAY)   # 5 prior sessions
+    assert base is not None and abs(base - 0.45) < 1e-9
+    assert stock_collect._shortvol_baseline(conn, "AAA", 3 * DAY) is None  # too little history
+    conn.close()
+
+
+# --- position lifecycle: pending fill / expiry / rebase / void -----------------
+
+def _pending(conn, ticker="AAA", sig_ts=100 * DAY, atr=2.0):
+    return stock_store.insert_position(
+        conn, ticker=ticker, opened_run_ts="r0", opened_ts=sig_ts, direction="BUY",
+        archetype="momentum", confidence=0.6, entry=100.0, stop=95.0, t1=104.0,
+        t2=107.0, atr=atr, time_stop_days=20, status="PENDING", entry_venue="test")
+
+
+def test_pending_fills_at_next_bar_open():
+    conn = _conn_mem()
+    sig_ts = 100 * DAY
+    _pending(conn, sig_ts=sig_ts)
+    assert stock_store.has_open_position(conn, "AAA", "momentum")   # pending blocks dups
+    assert not stock_store.open_positions(conn)                     # ...but is not open risk
+    bars = [{"ts": sig_ts, "open": 99, "high": 101, "low": 98, "close": 100, "volume": 1e6},
+            {"ts": sig_ts + DAY, "open": 102, "high": 103, "low": 101, "close": 102.5, "volume": 1e6}]
+    events = stock_collect._advance_positions(conn, CFG, "r1", sig_ts + 2 * DAY,
+                                              {"AAA": bars}, {"AAA": "test"}, False)
+    assert events == []
+    openp = stock_store.open_positions(conn)
+    assert len(openp) == 1 and not stock_store.pending_positions(conn)
+    pos = openp[0]
+    assert pos["entry"] == 102.0                 # the NEXT bar's open, not the signal close
+    assert pos["filled_ts"] == sig_ts + DAY
+    assert pos["entry_bar_close"] == 102.5 and pos["entry_venue"] == "test"
+    assert pos["stop"] < 102.0 < pos["t2"]       # levels recomputed off the fill price
+    assert pos["last_reprice_ts"] == sig_ts + 2 * DAY
+    conn.close()
+
+
+def test_pending_expires_unfilled():
+    conn = _conn_mem()
+    sig_ts = 100 * DAY
+    _pending(conn, sig_ts=sig_ts)
+    # no bar ever arrives after the signal; 6 days later the setup expires
+    bars = [{"ts": sig_ts, "open": 99, "high": 101, "low": 98, "close": 100, "volume": 1e6}]
+    events = stock_collect._advance_positions(conn, CFG, "r1", sig_ts + 6 * DAY,
+                                              {"AAA": bars}, {"AAA": "test"}, False)
+    assert events and events[0]["exit_reason"] == "unfilled"
+    assert not stock_store.pending_positions(conn)
+    assert not stock_store.open_positions(conn)
+    assert stock_store.closed_positions(conn) == []   # EXPIRED never enters the record
+    assert not stock_store.has_open_position(conn, "AAA", "momentum")
+    conn.close()
+
+
+def test_pending_expires_when_first_bar_is_too_late():
+    conn = _conn_mem()
+    sig_ts = 100 * DAY
+    _pending(conn, sig_ts=sig_ts)
+    # data resumed only after a >5-day gap: too stale to fill honestly
+    bars = [{"ts": sig_ts + 8 * DAY, "open": 102, "high": 103, "low": 101, "close": 102,
+             "volume": 1e6}]
+    stock_collect._advance_positions(conn, CFG, "r1", sig_ts + 8 * DAY,
+                                     {"AAA": bars}, {"AAA": "test"}, False)
+    assert not stock_store.pending_positions(conn)
+    assert not stock_store.open_positions(conn)
+    conn.close()
+
+
+def _filled(conn, ticker="AAA", fill_ts=101 * DAY):
+    pid = _pending(conn, ticker=ticker, sig_ts=fill_ts - DAY)
+    stock_store.fill_position(conn, pid, filled_ts=fill_ts, entry=100.0, stop=95.0,
+                              t1=104.0, t2=110.0, entry_venue="test",
+                              entry_bar_close=100.0, last_reprice_ts=fill_ts)
+    return pid
+
+
+def test_open_position_rebased_after_split_not_stopped_out():
+    conn = _conn_mem()
+    fill_ts = 101 * DAY
+    _filled(conn, fill_ts=fill_ts)
+    # the venue retroactively 10:1-split-adjusted the WHOLE series
+    bars = [{"ts": fill_ts, "open": 9.9, "high": 10.2, "low": 9.8, "close": 10.0, "volume": 1e7},
+            {"ts": fill_ts + DAY, "open": 10.1, "high": 10.4, "low": 10.0, "close": 10.3, "volume": 1e7}]
+    events = stock_collect._advance_positions(conn, CFG, "r1", fill_ts + 2 * DAY,
+                                              {"AAA": bars}, {"AAA": "test"}, False)
+    assert events == []                        # NOT a fake -1R stop-out
+    pos = stock_store.open_positions(conn)[0]
+    assert abs(pos["entry"] - 10.0) < 1e-9 and abs(pos["stop"] - 9.5) < 1e-9
+    assert abs(pos["entry_bar_close"] - 10.0) < 1e-9   # next run's ratio ~ 1
+    conn.close()
+
+
+def test_open_position_voided_when_entry_bar_missing():
+    conn = _conn_mem()
+    fill_ts = 101 * DAY
+    _filled(conn, fill_ts=fill_ts)
+    # re-fetched series no longer contains the entry bar -> basis unverifiable
+    bars = [{"ts": fill_ts + DAY, "open": 50, "high": 51, "low": 49, "close": 50, "volume": 1e6}]
+    events = stock_collect._advance_positions(conn, CFG, "r1", fill_ts + 2 * DAY,
+                                              {"AAA": bars}, {"AAA": "test"}, False)
+    assert events and events[0]["exit_reason"] == "rebased"
+    closed = stock_store.closed_positions(conn)
+    assert len(closed) == 1 and closed[0]["exit_reason"] == "rebased"
+    assert closed[0]["realized_r"] is None
+    # ...and the voided row never pollutes the aggregate record
+    assert stock_positions.summarize(closed)["overall"]["n"] == 0
+    conn.close()
+
+
+def test_open_position_closes_normally_through_lifecycle():
+    conn = _conn_mem()
+    fill_ts = 101 * DAY
+    _filled(conn, fill_ts=fill_ts)   # entry 100 stop 95 t2 110
+    bars = [{"ts": fill_ts, "open": 100, "high": 102, "low": 99, "close": 101, "volume": 1e6},
+            {"ts": fill_ts + DAY, "open": 103, "high": 111, "low": 102, "close": 109, "volume": 1e6}]
+    events = stock_collect._advance_positions(conn, CFG, "r1", fill_ts + 2 * DAY,
+                                              {"AAA": bars}, {"AAA": "test"}, False)
+    assert events and events[0]["exit_reason"] == "t2"
+    assert stock_store.closed_positions(conn)[0]["exit_price"] == 110.0
+    conn.close()
+
+
+# --- alert send failure: retry-once + cooldown discipline ----------------------
+
+def test_unsent_alert_does_not_arm_cooldown_and_retries_once():
+    conn = _conn_mem()
+    stock_store.record_stock_alert(conn, ts=DAY, created_at="t", ticker="AAA",
+                                   archetype="momentum", direction="BUY", entry=10.0,
+                                   stop=9.0, t1=11.0, t2=12.0, confidence=0.6,
+                                   message="m", sent=False)
+    assert stock_store.last_stock_alert(conn, "AAA", "momentum") is None  # cooldown NOT armed
+    rows = stock_store.unsent_stock_alerts(conn)
+    assert len(rows) == 1
+    stock_store.mark_stock_alert_retry(conn, rows[0]["id"], sent=True)
+    assert stock_store.unsent_stock_alerts(conn) == []
+    assert stock_store.last_stock_alert(conn, "AAA", "momentum") is not None  # armed after resend
+    # a failed retry is dropped for good (retry-once, no infinite loop)
+    stock_store.record_stock_alert(conn, ts=DAY, created_at="t", ticker="BBB",
+                                   archetype="momentum", direction="BUY", entry=10.0,
+                                   stop=9.0, t1=11.0, t2=12.0, confidence=0.6,
+                                   message="m", sent=False)
+    rows = stock_store.unsent_stock_alerts(conn)
+    stock_store.mark_stock_alert_retry(conn, rows[0]["id"], sent=False)
+    assert stock_store.unsent_stock_alerts(conn) == []
+    assert stock_store.last_stock_alert(conn, "BBB", "momentum") is None
+    conn.close()
+
+
+# --- estimate snapshot guard ---------------------------------------------------
+
+def test_estimate_snapshot_guard_once_per_day(monkeypatch):
+    conn = _conn_mem()
+    cfg = dataclasses.replace(CFG, finnhub_api_key="test-key")
+    calls = {"n": 0}
+
+    def fake_rec(tk, key):
+        calls["n"] += 1
+        return {"period": "2026-06", "strong_buy": 5, "buy": 10, "hold": 3,
+                "sell": 1, "strong_sell": 0}
+
+    monkeypatch.setattr(stock_collect.estimates, "recommendation", fake_rec)
+    stock_collect._snapshot_estimates(conn, cfg, ["AAA"])
+    assert calls["n"] == 1
+    stock_collect._snapshot_estimates(conn, cfg, ["AAA"])   # within 20h -> guarded
+    assert calls["n"] == 1                                  # no re-fetch either
+    assert len(stock_store.last_two_estimate_snaps(conn, "AAA")) == 1  # single same-day snap
+    conn.close()
+
+
+# --- run readings: health counts contract ---------------------------------------
+
+def test_recent_stock_runs_parse_counts():
+    conn = _conn_mem()
+    for i, fetched in enumerate([500, 0, 0, 0]):
+        stock_store.record_stock_run(
+            conn, run_ts=f"2026-06-0{i+1}T00:00:00+00:00", universe_n=500, scored_n=0,
+            readings={"counts": {"prices_fetched": fetched, "earnings_rows": 0}})
+    runs = stock_store.recent_stock_runs(conn, 3)
+    assert len(runs) == 3
+    assert all(r["readings"]["counts"]["prices_fetched"] == 0 for r in runs)  # newest 3
+    conn.close()
+
+
+def test_layer_status_degraded_on_zero_rows_for_n_runs():
+    from app import stock_api
+    zero = [{"readings": {"counts": {"earnings_rows": 0, "prices_fetched": 500}}}] * 3
+    assert stock_api._layer_status(zero, "earnings_pead", True) == "degraded"
+    assert stock_api._layer_status(zero, "prices", True) == "ok"
+    assert stock_api._layer_status(zero, "earnings_pead", False) == "off"
+    # a single zero-row run (blip) is NOT degraded
+    blip = [{"readings": {"counts": {"earnings_rows": 0}}},
+            {"readings": {"counts": {"earnings_rows": 12}}},
+            {"readings": {"counts": {"earnings_rows": 7}}}]
+    assert stock_api._layer_status(blip, "earnings_pead", True) == "ok"
+    # runs from before the counts readings existed are tolerated (old shape)
+    old = [{"readings": {"layers": {"earnings": True}}}] * 3
+    assert stock_api._layer_status(old, "earnings_pead", True) == "ok"

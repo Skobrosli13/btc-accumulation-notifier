@@ -68,6 +68,17 @@ def test_health_ok(client):
     assert j["onchain_source"] == "bitcoin-data"
 
 
+def test_health_per_indicator_availability(client):
+    # Config-driven layer badges can't see a dead source; the per-indicator block
+    # reads what each source actually RETURNED in the persisted runs.
+    j = client.get("/api/health", headers=_auth()).json()
+    inds = j["indicators"]
+    assert inds["fng"]["available"] is True and inds["fng"]["runs_with_data"] == 1
+    assert inds["fng"]["runs_checked"] == 1
+    assert inds["mayer"]["available"] is False and inds["mayer"]["last_seen"] is None
+    assert "mayer" in j["dark_indicators"] and "fng" not in j["dark_indicators"]
+
+
 def test_longterm_latest(client):
     j = client.get("/api/longterm/latest", headers=_auth()).json()
     assert j["latest"]["tier"] == "WATCH"
@@ -117,6 +128,61 @@ def test_playbook_endpoint(client):
     assert client.get("/api/playbook").status_code == 401   # token-gated
     j = client.get("/api/playbook", headers=_auth()).json()
     assert "playbook" in j and "what_to_do" in j and "tier" in j
+
+
+def test_trigger_stats_unmeasured_marker():
+    wr = {"ema_cross_bull": {"n": 124, "win_rate": 0.508}}
+    assert api._trigger_stats(wr, "ema_cross_bull")["n"] == 124
+    # keys with no cell (funding/OI, flow) get an explicit marker, not None
+    assert api._trigger_stats(wr, "funding_spike_bull") == {"unmeasured": True}
+    assert api._trigger_stats({}, "liq_long_flush") == {"unmeasured": True}
+
+
+def test_live_performance_contract(tmp_path):
+    """Response shape of /api/live_performance (the dashboard builds against this)."""
+    db = str(tmp_path / "lp.db")
+    conn = store.connect(db)
+    store.init_db(conn)
+    day = 86_400_000
+    base = int(datetime(2026, 1, 1, tzinfo=timezone.utc).timestamp() * 1000)
+    # 60 daily candles; the endpoint drops the newest (possibly forming) one
+    store.upsert_candles(conn, "1d",
+                         [(base + d * day, 100.0 + d, 101.0 + d, 99.0 + d, 100.0 + d, 1.0)
+                          for d in range(60)], source="okx")
+    run_iso = datetime.fromtimestamp((base + 2 * day) / 1000, tz=timezone.utc).isoformat()
+    store.record_run(conn, run_ts=run_iso, price=102.0, composite=65.0, tier="ACCUMULATE",
+                     active_cats=["price"], readings={}, tier_alerted=True,
+                     flash_alerted=False, notified_tier="ACCUMULATE")
+    # two rows for one confluence-gated event (candle + flow trigger)
+    store.record_st_alert(conn, ts=base + 2 * day, created_at=run_iso,
+                          trigger_key="ema_cross_bull", timeframe="4h", direction="BUY",
+                          price=102.0, message="m", sent=True)
+    store.record_st_alert(conn, ts=base + 2 * day, created_at=run_iso,
+                          trigger_key="liq_long_flush", timeframe="4h", direction="BUY",
+                          price=102.0, message="m", sent=True)
+    conn.close()
+    cfg = make_config(db_path=db, api_token="secret", st_timeframes=("4h",))
+    api.app.dependency_overrides[api.get_config] = lambda: cfg
+    try:
+        j = TestClient(api.app).get("/api/live_performance", headers=_auth()).json()
+    finally:
+        api.app.dependency_overrides.clear()
+
+    lt = j["long_term"]
+    assert set(lt) == {"horizons", "window"}
+    h30 = lt["horizons"]["30"]
+    assert {"n_runs", "n_signal", "signal_hit_rate", "base_rate",
+            "episodes", "episode_hit_rate", "ci"} <= set(h30)
+    assert h30["n_signal"] == 1 and h30["episodes"] == 1
+    assert lt["window"]["from"] == run_iso
+
+    st = j["short_term"]
+    assert st["n_events"] == 1                       # same-candle rows deduped to one event
+    assert st["by_direction"]["BUY"]["n"] == 1
+    # flow keys get their own forward-test scoreboard row
+    assert set(st["by_key"]) == {"ema_cross_bull", "liq_long_flush"}
+    assert st["base_rate"] is not None and st["horizon_days"] == 7
+    assert "note" in st and "note" in j
 
 
 def test_track_record(client):

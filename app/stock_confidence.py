@@ -33,6 +33,32 @@ def _clamp(x: float, lo: float, hi: float) -> float:
     return lo if x < lo else hi if x > hi else x
 
 
+def _cell(archetype: str, winrates: dict | None) -> dict | None:
+    """The archetype's win-rates cell, or None when absent OR invalid.
+
+    A ``pead_drift`` cell is only valid when it carries
+    ``alignment == 'announcement_date'`` — older seeds measured drift from the
+    fiscal period-end, not the announcement, so their rates are meaningless for
+    the live announcement-anchored setup and fall back to the built-in PRIOR."""
+    rec = ((winrates or {}).get("archetypes", {}) or {}).get(archetype) if winrates else None
+    if not rec or not rec.get("n"):
+        return None
+    if archetype == "pead_drift" and rec.get("alignment") != "announcement_date":
+        return None
+    return rec
+
+
+def archetype_maturity(archetype: str, winrates: dict | None) -> str:
+    """Honesty rung for an archetype: 'edge' or 'forward', derived from the loaded
+    win-rates cell — never hardcoded. 'edge' requires a VALID cell (see ``_cell``)
+    that is explicitly significant (``not_significant == False``); anything else —
+    no cell, invalid alignment, unmarked/insignificant — stays a forward-test."""
+    rec = _cell(archetype, winrates)
+    if rec is not None and rec.get("not_significant") is False:
+        return "edge"
+    return "forward"
+
+
 def base_rate(archetype: str, winrates: dict | None) -> dict:
     """The calibrated base rate for an archetype, shrunk toward the prior by sample
     size. Returns {win_rate, expectancy_r, n, live_confirmed}.
@@ -42,16 +68,23 @@ def base_rate(archetype: str, winrates: dict | None) -> dict:
     (in-sample, survivorship-biased), so it informs the rate but keeps the honest
     'backtested prior' label."""
     prior = PRIOR.get(archetype, {"win_rate": 0.50, "expectancy_r": 0.0})
-    rec = ((winrates or {}).get("archetypes", {}) or {}).get(archetype) if winrates else None
-    if not rec or not rec.get("n"):
+    rec = _cell(archetype, winrates)
+    if rec is None:
         return {**prior, "n": 0, "live_confirmed": False}
     n = int(rec["n"])
     is_live = (winrates or {}).get("source") == "live"
-    # Shrink the empirical rate toward the prior with a pseudo-count so a handful of
-    # trades can't swing the number around (Bayesian-ish smoothing).
+    # Shrink the empirical rates toward the prior with a pseudo-count so a handful
+    # of trades can't swing the number around (Bayesian-ish smoothing). Expectancy
+    # gets the SAME shrinkage — it is the noisier statistic (unbounded, fat-tailed
+    # in R) and the one that actually drives ranking, so a small-n archetype must
+    # not buy priority with an unstable average.
     k = _LIVE_CONFIRM_N
-    wr = (rec.get("win_rate", prior["win_rate"]) * n + prior["win_rate"] * k) / (n + k)
-    exp = rec.get("expectancy_r", prior["expectancy_r"])
+    wr_emp = rec.get("win_rate")
+    exp_emp = rec.get("expectancy_r")
+    wr = ((wr_emp if wr_emp is not None else prior["win_rate"]) * n
+          + prior["win_rate"] * k) / (n + k)
+    exp = ((exp_emp if exp_emp is not None else prior["expectancy_r"]) * n
+           + prior["expectancy_r"] * k) / (n + k)
     return {"win_rate": wr, "expectancy_r": exp, "n": n,
             "live_confirmed": is_live and n >= _LIVE_CONFIRM_N}
 

@@ -19,8 +19,9 @@ recovery, not the bleed.
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 
-from ._http import get_json
+from ._http import get_json, is_stale
 
 log = logging.getLogger(__name__)
 
@@ -30,24 +31,52 @@ BLOCKCHAIN_HASHRATE = "https://api.blockchain.info/charts/hash-rate"
 _NONE = {"hash_ribbon": None}
 
 
+def _closed_fresh_values(pts: list[tuple[float, float]]) -> list[float]:
+    """(ts_seconds, value) points -> values with the still-forming current UTC
+    day dropped and a staleness gate on the newest CLOSED point.
+
+    A few hours of Poisson block arrivals is an extremely noisy hashrate
+    estimate; near a knife-edge 30/60 cross the scored ribbon state must not
+    flip on intra-day noise (netactivity.py drops the forming day for the same
+    reason — mempool.space includes it, blockchain.com doesn't, so this also
+    keeps the two venues consistent). A series whose latest closed day exceeds
+    the freshness budget means a frozen upstream: unusable, not scorable.
+    """
+    pts = sorted(pts, key=lambda p: p[0])
+    today = datetime.now(timezone.utc).date()
+    while pts and datetime.fromtimestamp(pts[-1][0], tz=timezone.utc).date() >= today:
+        pts.pop()
+    if not pts:
+        return []
+    if is_stale(pts[-1][0]):
+        log.warning("hashrate series is stale; treated as unavailable")
+        return []
+    return [v for _, v in pts]
+
+
 def _mempool_series() -> list[float]:
-    """Daily avg hashrate (H/s), oldest->newest, from mempool.space. [] on failure."""
+    """Daily avg hashrate (H/s), oldest->newest, from mempool.space — forming
+    day dropped, staleness-gated. [] on failure."""
     data = get_json(MEMPOOL_HASHRATE)
     if not isinstance(data, dict):
         return []
-    out: list[float] = []
+    pts: list[tuple[float, float]] = []
     for row in data.get("hashrates") or []:
-        v = row.get("avgHashrate") if isinstance(row, dict) else None
-        if v is not None:
-            try:
-                out.append(float(v))
-            except (TypeError, ValueError):
-                continue
-    return out
+        if not isinstance(row, dict):
+            continue
+        ts, v = row.get("timestamp"), row.get("avgHashrate")
+        if ts is None or v is None:
+            continue
+        try:
+            pts.append((float(ts), float(v)))
+        except (TypeError, ValueError):
+            continue
+    return _closed_fresh_values(pts)
 
 
 def _blockchain_series() -> list[float]:
-    """Daily hashrate (TH/s), oldest->newest, from blockchain.com. [] on failure.
+    """Daily hashrate (TH/s), oldest->newest, from blockchain.com — forming day
+    dropped, staleness-gated. [] on failure.
 
     Units differ from mempool (TH/s vs H/s) but the Hash Ribbon uses only the
     30d/60d RATIO, so the absolute scale is irrelevant.
@@ -55,15 +84,18 @@ def _blockchain_series() -> list[float]:
     data = get_json(BLOCKCHAIN_HASHRATE, params={"timespan": "1year", "format": "json"})
     if not isinstance(data, dict):
         return []
-    out: list[float] = []
+    pts: list[tuple[float, float]] = []
     for row in data.get("values") or []:
-        v = row.get("y") if isinstance(row, dict) else None
-        if v is not None:
-            try:
-                out.append(float(v))
-            except (TypeError, ValueError):
-                continue
-    return out
+        if not isinstance(row, dict):
+            continue
+        ts, v = row.get("x"), row.get("y")
+        if ts is None or v is None:
+            continue
+        try:
+            pts.append((float(ts), float(v)))
+        except (TypeError, ValueError):
+            continue
+    return _closed_fresh_values(pts)
 
 
 def _ribbon_score(series: list[float], *, short: int = 30, long_: int = 60,

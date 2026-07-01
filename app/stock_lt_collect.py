@@ -28,6 +28,8 @@ log = logging.getLogger("stock-lt-collect")
 _STALE_DAYS = 80          # refresh financials older than this
 _THROTTLE_S = 12.5        # ~5 calls/min for Massive financials (free-tier limit)
 _MIN_BARS = 210           # need ~1yr history for 200DMA + 12-1 momentum
+_MAX_BAR_AGE_MS = 7 * 86_400_000   # ~5 trading days: older stored bars = dead ticker, don't score
+_ADJ_VENUES = {"yahoo", "tiingo"}  # venues whose closes are split+dividend adjusted
 
 
 def _momentum_trend(bars: list[dict]) -> tuple[float | None, bool]:
@@ -72,9 +74,18 @@ def _refresh_financials(conn, cfg: Config, universe: list[dict], limit: int,
     return fetched
 
 
-def _spy_close(cfg: Config) -> float | None:
-    res = prices.daily_bars("SPY", cfg, limit=5)
-    return res[0][-1][4] if res else None
+def _spy_quote(cfg: Config) -> tuple[float, int, dict[int, float], str] | None:
+    """(latest SPY close, its bar ts, {bar_ts: close} for date-matching, venue).
+
+    Holdings are opened/closed against the SPY close of the SAME bar date as the
+    name's close — a stale name price benchmarked against a fresh SPY quote would
+    corrupt the excess-return forward-test with timestamp-mismatched pairs."""
+    res = prices.daily_bars("SPY", cfg, limit=10)
+    if not res:
+        return None
+    bars, src = res
+    by_ts = {b[0]: b[4] for b in bars}
+    return bars[-1][4], bars[-1][0], by_ts, src
 
 
 def run(cfg: Config, *, dry_run: bool = False, limit: int | None = None,
@@ -92,13 +103,21 @@ def run(cfg: Config, *, dry_run: bool = False, limit: int | None = None,
     if not dry_run:
         _refresh_financials(conn, cfg, universe, financials_limit, throttle)
 
-    spy = _spy_close(cfg)
+    q = _spy_quote(cfg)
+    spy, spy_ts, spy_by_ts, spy_src = q if q else (None, None, {}, None)
+    now_ms = int(now.timestamp() * 1000)
 
     candidates = []
+    stale_n = 0
     for u in universe:
         tk = u["ticker"]
         bars = stock_store.recent_prices(conn, tk, 300)
         if len(bars) < _MIN_BARS:
+            continue
+        # Stored prices come from the daily swing collector; a series that stopped
+        # updating (delisted/renamed/venue drop) must not be scored as current.
+        if now_ms - bars[-1]["ts"] > _MAX_BAR_AGE_MS:
+            stale_n += 1
             continue
         fin = stock_lt_store.get_financials(conn, tk)
         if not fin or not fin["periods"]:
@@ -111,7 +130,8 @@ def run(cfg: Config, *, dry_run: bool = False, limit: int | None = None,
             continue
         mom, above = _momentum_trend(bars)
         candidates.append({"ticker": tk, "sector": u.get("sector"), "metrics": metrics,
-                           "momentum_12_1": mom, "above_200dma": above, "price": price})
+                           "momentum_12_1": mom, "above_200dma": above, "price": price,
+                           "last_ts": bars[-1]["ts"]})
 
     survivors, gated = stock_lt_scoring.rank_long_buys(candidates)
 
@@ -155,11 +175,21 @@ def run(cfg: Config, *, dry_run: bool = False, limit: int | None = None,
         })
 
     # --- forward-test holdings vs SPY ---
-    fired = _manage_holdings(conn, cfg, run_ts, surfaced_tickers, survivors, spy, now, dry_run)
+    fired, deferred = _manage_holdings(conn, cfg, run_ts, surfaced_tickers, survivors,
+                                       candidates, spy, spy_by_ts, now, dry_run)
 
-    readings = {"massive": cfg.massive_active, "spy": spy,
+    # Benchmark basis honesty: yahoo/tiingo closes are dividend-adjusted (total-
+    # return-ish); alpaca/stooq are split-only, so a price-only excess understates a
+    # value tilt's dividend yield vs SPY by roughly 1%/yr.
+    basis = ("total_return_adjusted" if spy_src in _ADJ_VENUES else "price_only_ex_dividends")
+    readings = {"massive": cfg.massive_active, "spy": spy, "spy_ts": spy_ts,
                 "financials_cached": len(stock_lt_store.financials_freshness(conn)),
-                "gated_out": len(gated)}
+                "gated_out": len(gated), "stale_priced_n": stale_n,
+                "deferred_closes_n": len(deferred),
+                "benchmark_basis": basis, "spy_venue": spy_src,
+                "benchmark_note": ("Excess vs SPY on venue-adjusted closes; dividends "
+                                   "accrue only where the venue dividend-adjusts — "
+                                   "price-only legs bias the measure AGAINST the strategy.")}
     if not dry_run:
         if spy is not None:
             store.set_meta(conn, "lt_spy_close", str(spy))   # for open-holding mark-to-market
@@ -170,44 +200,74 @@ def run(cfg: Config, *, dry_run: bool = False, limit: int | None = None,
     conn.close()
 
     summary = {"run_ts": run_ts, "universe_n": len(universe), "scored_n": len(candidates),
-               "survivors_n": len(survivors), "spy": spy,
+               "survivors_n": len(survivors), "spy": spy, "stale_priced_n": stale_n,
                "top": [{"rank": s["rank"], "ticker": s["ticker"], "conviction": s["conviction"],
                         "value": s["value_rank"], "quality": s["quality_rank"],
                         "mom": s["momentum_rank"], "piotroski": s["piotroski"],
                         "altman_z": s["altman_z"], "sector": s["sector"]}
                        for s in signals[:top_n]],
-               "new_holdings": fired}
+               "new_holdings": fired, "deferred_closes": deferred}
     return summary
 
 
-def _manage_holdings(conn, cfg, run_ts, surfaced: set, survivors: list, spy, now, dry_run) -> list:
-    """Open holdings for new conviction names; close those that dropped out (excess vs SPY)."""
+def _manage_holdings(conn, cfg, run_ts, surfaced: set, survivors: list, candidates: list,
+                     spy, spy_by_ts: dict, now, dry_run) -> tuple[list, list]:
+    """Open holdings for new conviction names; close those that dropped out (excess
+    vs SPY) using a DATE-MATCHED name/SPY close pair, else defer the close to a
+    later run. Dropped names are tagged 'dropped_by_conviction' (still scored, fell
+    off the list) or 'data_gap' (vanished from the scorable set — stale prices,
+    missing financials) so the forward-test separates conviction exits from data
+    artifacts. Returns (opened tickers, deferred-close tickers)."""
     if spy is None:
-        return []
-    price_of = {c["ticker"]: c["price"] for c in survivors}
-    opened = []
+        return [], []
+    price_of = {c["ticker"]: (c["price"], c.get("last_ts")) for c in candidates}
+    conviction_of = {c["ticker"]: c.get("conviction", 0) for c in survivors}
+    scored = set(price_of)
+    opened: list = []
+    deferred: list = []
     open_h = stock_lt_store.open_lt_holdings(conn)
     held = {h["ticker"]: h for h in open_h}
     now_ms = int(now.timestamp() * 1000)
-    # open new
+    # open new (entry paired with the SPY close of the same bar date where available)
     for tk in surfaced:
         if tk not in held and tk in price_of and not dry_run:
+            px, ts = price_of[tk]
             stock_lt_store.open_lt_holding(conn, ticker=tk, opened_run_ts=run_ts, opened_ts=now_ms,
-                                           entry=price_of[tk], spy_entry=spy,
-                                           conviction=next((c["conviction"] for c in survivors if c["ticker"] == tk), 0))
+                                           entry=px, spy_entry=spy_by_ts.get(ts, spy),
+                                           conviction=conviction_of.get(tk, 0), entry_ts=ts)
             opened.append(tk)
     # close dropped
     for tk, h in held.items():
-        if tk not in surfaced and not dry_run:
-            exit_price = price_of.get(tk)
-            if exit_price is None:
-                bars = stock_store.recent_prices(conn, tk, 1)
-                exit_price = bars[-1]["close"] if bars else h["entry"]
-            name_ret = (exit_price / h["entry"] - 1) if h["entry"] else 0
-            spy_ret = (spy / h["spy_entry"] - 1) if h["spy_entry"] else 0
-            stock_lt_store.close_lt_holding(conn, h["id"], closed_ts=now_ms, exit_price=exit_price,
-                                            spy_exit=spy, excess_return=round(name_ret - spy_ret, 4))
-    return opened
+        if tk in surfaced or dry_run:
+            continue
+        reason = "dropped_by_conviction" if tk in scored else "data_gap"
+        px, ts = price_of.get(tk, (None, None))
+        if px is None:
+            bars = stock_store.recent_prices(conn, tk, 1)
+            if bars:
+                px, ts = bars[-1]["close"], bars[-1]["ts"]
+        spy_exit = spy_by_ts.get(ts) if ts is not None else None
+        if px is None or spy_exit is None:
+            # No same-date name/SPY pair (stale or missing bar) — a phantom exit
+            # priced weeks ago against today's SPY would corrupt the record: defer.
+            deferred.append(tk)
+            continue
+        # Split re-base guard: the stored series is kept on the venue's CURRENT
+        # adjustment basis, so the entry bar's close TODAY re-expresses the frozen
+        # entry in the same basis as the exit — a mid-hold split otherwise books a
+        # catastrophic fake excess return.
+        entry = h["entry"]
+        if h.get("entry_ts"):
+            basis = stock_store.close_at(conn, tk, h["entry_ts"])
+            if basis:
+                entry = basis
+        name_ret = (px / entry - 1) if entry else 0
+        spy_ret = (spy_exit / h["spy_entry"] - 1) if h["spy_entry"] else 0
+        stock_lt_store.close_lt_holding(conn, h["id"], closed_ts=now_ms, exit_price=px,
+                                        spy_exit=spy_exit,
+                                        excess_return=round(name_ret - spy_ret, 4),
+                                        exit_reason=reason)
+    return opened, deferred
 
 
 def main(argv=None) -> int:

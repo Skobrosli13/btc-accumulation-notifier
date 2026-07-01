@@ -19,6 +19,8 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 
+import pandas as pd
+
 from app import alerting, shortterm
 from app.config import Config
 
@@ -184,7 +186,8 @@ def _cooldown_ok(cursor: _Cursor | None, candle_ts: int, now_ms: int,
 
 
 def replay_alerts(df, cfg: Config, timeframe: str, *,
-                  regime_series=None, maxh: int = 0) -> ReplayResult:
+                  regime_series=None, maxh: int = 0,
+                  full_warm: bool = True) -> ReplayResult:
     """Walk the closed-candle frame the way the collector does and return the RAW
     fires and the ALERTED subset.
 
@@ -197,15 +200,30 @@ def replay_alerts(df, cfg: Config, timeframe: str, *,
                                dirs.count(direction), regime_aligned, is_counter_trend)
       3. cooldown / same-candle dedup per (trigger_key, timeframe)
 
+    The replay detects CANDLE triggers only (no funding/OI/flow inputs) — which is
+    also the live confluence population: collect_once counts only candle triggers
+    toward the direction count (funding_spike_*/oi_surge_*/flow triggers are
+    context, excluded from the gate), so the alerted set here matches production.
+    Those non-candle trigger TYPES are not measured here at all; st_calibrate lists
+    them under ``unmeasured_keys``.
+
     Cooldown 'now' is the candle's own close time (open_time + one timeframe), which
     is when the collector would have evaluated it — deterministic and network-free.
 
-    ``regime_series`` is the daily-close series used for the 200DMA regime; when
-    None (e.g. a 4h-only synthetic frame) the regime is 'unknown' and the regime
-    gates behave exactly as they do live with an unknown regime.
+    ``regime_series`` is the daily-close series used for the 200DMA regime, sliced
+    at each event's evaluation time by daily-candle CLOSE (see ``_regime_at``) so
+    the tag has no look-ahead; when None (e.g. a 4h-only synthetic frame) the
+    regime is 'unknown' and the regime gates behave exactly as they do live with
+    an unknown regime.
 
     ``maxh`` (max forward horizon) trims the tail so every alerted event has a full
     forward window to score; pass 0 to replay the whole frame.
+
+    ``full_warm`` (default True) starts scoring only once a full LIVE_WINDOW of
+    bars precedes the candle: live always recomputes the EWM indicators on ~300
+    bars, so events scored on shorter warm-up windows are events live would never
+    fire — they are DROPPED, not scored short. Pass False only for short synthetic
+    test frames exercising the gate logic.
     """
     closed = df[df["confirmed"]].reset_index(drop=True) if "confirmed" in df.columns else df.reset_index(drop=True)
     n = len(closed)
@@ -213,14 +231,16 @@ def replay_alerts(df, cfg: Config, timeframe: str, *,
     cursors: dict[str, _Cursor] = {}
     out = ReplayResult()
     stop_at = n - maxh if maxh else n
-    for i in range(MIN_LOOKBACK, stop_at):
+    first = max(MIN_LOOKBACK, LIVE_WINDOW - 1) if full_warm else MIN_LOOKBACK
+    for i in range(first, stop_at):
         window = closed.iloc[max(0, i - (LIVE_WINDOW - 1)): i + 1]
         triggers = shortterm.detect_triggers(window, cfg)
         if not triggers:
             continue
         candle_ts = int(closed["open_time"].iloc[i].timestamp() * 1000)
         now_ms = candle_ts + tf_ms  # collector evaluates after the candle closes
-        regime = _regime_at(regime_series, closed["open_time"].iloc[i]) if regime_series is not None else "unknown"
+        eval_ts = closed["open_time"].iloc[i] + pd.Timedelta(milliseconds=tf_ms)
+        regime = _regime_at(regime_series, eval_ts) if regime_series is not None else "unknown"
         score, _ = shortterm.st_composite(window, cfg)
         state = shortterm.st_state(score, cfg)
         dirs = [t.direction for t in triggers]
@@ -277,16 +297,22 @@ def _tf_ms(timeframe: str) -> int:
     return _TF_MS.get(timeframe, 4 * 3_600_000)
 
 
-def _regime_at(daily_close, when) -> str:
-    """200DMA regime as of ``when`` (a Timestamp), using only daily closes up to it.
+def _regime_at(daily_close, eval_ts) -> str:
+    """200DMA regime as of ``eval_ts`` (the evaluating candle's CLOSE time), using
+    only daily candles already CLOSED by then.
 
-    Mirrors shortterm.current_regime but sliced at the evaluation time so there is
-    no look-ahead. 'unknown' when fewer than 200 daily closes precede ``when``.
+    The daily series is indexed by candle OPEN time; a daily candle opened at day D
+    closes at D+1 00:00, so only rows with ``open + 1d <= eval_ts`` are known.
+    Slicing by open time alone would let an intraday (4h) event see its own day's
+    close up to ~20h early — look-ahead exactly at the 200DMA crossings where
+    triggers cluster. Mirrors shortterm.current_regime over the closed subset;
+    'unknown' when fewer than 200 closed daily candles precede ``eval_ts``.
     """
     if daily_close is None:
         return "unknown"
     try:
-        sub = daily_close[daily_close.index <= when] if hasattr(daily_close, "index") else None
+        cutoff = eval_ts - pd.Timedelta(days=1)
+        sub = daily_close[daily_close.index <= cutoff] if hasattr(daily_close, "index") else None
     except TypeError:
         sub = None
     if sub is None:
