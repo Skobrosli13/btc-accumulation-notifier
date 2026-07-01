@@ -29,7 +29,7 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 from . import (alerting, notify_email, perf, scoring, shortterm, stock_api,
-               stock_store, store)
+               stock_lt_api, stock_lt_store, stock_store, store)
 from .config import Config, load_config
 from .sources import exchange
 
@@ -39,6 +39,8 @@ app = FastAPI(title="BTC Signal API", version="1.0.0")
 
 # Stock swing tracker (second asset) — namespaced under /api/stock/*.
 app.include_router(stock_api.router)
+# Long-term stock "long buys" engine — /api/stock/longterm/*.
+app.include_router(stock_lt_api.router)
 
 
 def _ensure_schema() -> None:
@@ -50,6 +52,7 @@ def _ensure_schema() -> None:
         conn = store.connect(load_config().db_path)
         store.init_db(conn)
         stock_store.init_stock_db(conn)
+        stock_lt_store.init_stock_lt_db(conn)
         conn.close()
     except Exception:  # noqa: BLE001 - never block startup on schema init
         pass

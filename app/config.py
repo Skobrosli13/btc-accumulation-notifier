@@ -189,6 +189,12 @@ class Config:
     stock_cooldown_days: float = 5.0
     stock_allow_shorts: bool = False   # Phase 1 = long-only; flip on for Phase 2 (negative-PEAD/short setups)
     stock_cost_bps: float = 10.0       # round-trip commission+slippage (bps) netted out of forward-test R
+    # massive.com (Polygon-shaped): grouped-daily prices + full financials + reference.
+    # Presence of the key upgrades prices to Massive (robust, 1 call/day) and lights
+    # up the long-term fundamentals engine. Free tier: delayed EOD, 5 calls/min.
+    massive_api_key: str | None = None
+    stock_lt_top_n: int = 30           # long-buys conviction list size
+    stock_lt_min_dollar_vol: float = 3_000_000.0  # liquidity floor for the LT universe
 
     # --- Derived helpers -------------------------------------------------
 
@@ -242,10 +248,16 @@ class Config:
         return bool(self.alpaca_api_key and self.alpaca_secret_key)
 
     @property
+    def massive_active(self) -> bool:
+        return bool(self.massive_api_key)
+
+    @property
     def stock_price_source(self) -> str:
         """Which venue prices() will prefer — kept aligned with sources/stocks/prices.py.
-        Keyless default is the (fragile) Yahoo chart endpoint; a free Alpaca/Tiingo
-        key upgrades to a robust, documented feed."""
+        Massive grouped-daily (robust, 1 call/day) is preferred when keyed; else a
+        free Alpaca/Tiingo key; else the keyless (fragile) Yahoo chart endpoint."""
+        if self.massive_active:
+            return "massive"
         if self.alpaca_active:
             return "alpaca"
         if self.tiingo_api_key:
@@ -362,6 +374,9 @@ def load_config() -> Config:
         stock_cooldown_days=_get_float("STOCK_COOLDOWN_DAYS", 5),
         stock_allow_shorts=_get_bool("STOCK_ALLOW_SHORTS", False),
         stock_cost_bps=_get_float("STOCK_COST_BPS", 10.0),
+        massive_api_key=_opt("MASSIVE_API_KEY"),
+        stock_lt_top_n=_get_int("STOCK_LT_TOP_N", 30),
+        stock_lt_min_dollar_vol=_get_float("STOCK_LT_MIN_DOLLAR_VOL", 3_000_000.0),
         api_token=_opt("API_TOKEN"),
         api_cors_origin=_opt("API_CORS_ORIGIN"),
         public_base_url=_get("PUBLIC_BASE_URL", "https://btc.riverviewweb.com").rstrip("/"),
