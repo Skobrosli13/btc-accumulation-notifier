@@ -196,7 +196,7 @@ def _advance_positions(conn, cfg: Config, run_ts: str, bars_by_ticker: dict[str,
         if not new_bars:
             continue
         tstop = pos.get("time_stop_days") or cfg.stock_time_stop_days
-        upd = stock_positions.reprice(pos, new_bars, run_ts, tstop)
+        upd = stock_positions.reprice(pos, new_bars, run_ts, tstop, cost_bps=cfg.stock_cost_bps)
         if upd["status"] == "CLOSED":
             events.append({"ticker": pos["ticker"], "archetype": pos["archetype"],
                            **upd})
@@ -204,7 +204,8 @@ def _advance_positions(conn, cfg: Config, run_ts: str, bars_by_ticker: dict[str,
                 stock_store.close_position(conn, pos["id"], closed_run_ts=run_ts,
                                            closed_ts=upd["closed_ts"], exit_price=upd["exit_price"],
                                            realized_r=upd["realized_r"], exit_reason=upd["exit_reason"],
-                                           mfe_r=upd["mfe_r"], mae_r=upd["mae_r"])
+                                           mfe_r=upd["mfe_r"], mae_r=upd["mae_r"],
+                                           gross_r=upd.get("gross_r"), cost_r=upd.get("cost_r"))
         elif not dry_run:
             stock_store.update_position_excursion(conn, pos["id"], upd["mfe_r"], upd["mae_r"])
     return events

@@ -129,7 +129,8 @@ def _setup_from_signal(s: dict) -> dict:
         "context": d.get("context") or {},
         "rel": d.get("rel"), "regime": d.get("regime_state"),
         "pead_detail": {k: d.get(k) for k in
-                        ("surprise_pct", "reaction_pct", "drift_since_pct", "bars_since")
+                        ("surprise_pct", "reaction_pct", "reaction_sigma", "rev_surprise_pct",
+                         "vol_ratio", "drift_since_pct", "bars_since")
                         if d.get(k) is not None} or None,
     }
 

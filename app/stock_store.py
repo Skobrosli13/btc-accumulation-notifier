@@ -47,6 +47,9 @@ CREATE TABLE IF NOT EXISTS stock_earnings (
   estimate     REAL,
   surprise     REAL,              -- actual - estimate
   surprise_pct REAL,              -- surprise / |estimate| * 100
+  rev_actual   REAL,
+  rev_estimate REAL,
+  rev_surprise_pct REAL,          -- revenue surprise % (confluence with EPS)
   PRIMARY KEY (ticker, period)
 );
 CREATE INDEX IF NOT EXISTS ix_stock_earnings_rts ON stock_earnings(report_ts DESC);
@@ -122,7 +125,9 @@ CREATE TABLE IF NOT EXISTS stock_positions (
   closed_run_ts TEXT,
   closed_ts     INTEGER,
   exit_price    REAL,
-  realized_r    REAL,             -- (exit-entry)/risk, signed by direction
+  realized_r    REAL,             -- NET (exit-entry)/risk minus costs, signed by direction
+  gross_r       REAL,             -- realized R before costs
+  cost_r        REAL,             -- round-trip cost charged, in R
   exit_reason   TEXT,             -- stop | t1 | t2 | time | reversal
   mfe_r         REAL,             -- max favorable excursion in R (running)
   mae_r         REAL              -- max adverse excursion in R (running)
@@ -151,6 +156,11 @@ def init_stock_db(conn: sqlite3.Connection) -> None:
     # (future additive columns go here via _add_column_if_missing, e.g.)
     _add_column_if_missing(conn, "stock_signals", "revision", "REAL")
     _add_column_if_missing(conn, "stock_positions", "time_stop_days", "INTEGER")
+    _add_column_if_missing(conn, "stock_positions", "gross_r", "REAL")
+    _add_column_if_missing(conn, "stock_positions", "cost_r", "REAL")
+    _add_column_if_missing(conn, "stock_earnings", "rev_actual", "REAL")
+    _add_column_if_missing(conn, "stock_earnings", "rev_estimate", "REAL")
+    _add_column_if_missing(conn, "stock_earnings", "rev_surprise_pct", "REAL")
     conn.commit()
 
 
@@ -249,8 +259,10 @@ def upsert_earnings(conn: sqlite3.Connection, rows: list[dict]) -> None:
     conn.executemany(
         """
         INSERT OR REPLACE INTO stock_earnings
-          (ticker, period, report_ts, hour, actual, estimate, surprise, surprise_pct)
-        VALUES (:ticker, :period, :report_ts, :hour, :actual, :estimate, :surprise, :surprise_pct)
+          (ticker, period, report_ts, hour, actual, estimate, surprise, surprise_pct,
+           rev_actual, rev_estimate, rev_surprise_pct)
+        VALUES (:ticker, :period, :report_ts, :hour, :actual, :estimate, :surprise,
+                :surprise_pct, :rev_actual, :rev_estimate, :rev_surprise_pct)
         """,
         rows,
     )
@@ -474,13 +486,16 @@ def update_position_excursion(conn: sqlite3.Connection, pos_id: int,
 
 def close_position(conn: sqlite3.Connection, pos_id: int, *, closed_run_ts: str,
                    closed_ts: int, exit_price: float, realized_r: float,
-                   exit_reason: str, mfe_r: float, mae_r: float) -> None:
+                   exit_reason: str, mfe_r: float, mae_r: float,
+                   gross_r: float | None = None, cost_r: float | None = None) -> None:
     conn.execute(
         """
         UPDATE stock_positions SET status='CLOSED', closed_run_ts=?, closed_ts=?,
-          exit_price=?, realized_r=?, exit_reason=?, mfe_r=?, mae_r=? WHERE id=?
+          exit_price=?, realized_r=?, gross_r=?, cost_r=?, exit_reason=?, mfe_r=?, mae_r=?
+        WHERE id=?
         """,
-        (closed_run_ts, closed_ts, exit_price, realized_r, exit_reason, mfe_r, mae_r, pos_id),
+        (closed_run_ts, closed_ts, exit_price, realized_r, gross_r, cost_r,
+         exit_reason, mfe_r, mae_r, pos_id),
     )
     conn.commit()
 

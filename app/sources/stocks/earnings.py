@@ -37,11 +37,15 @@ def _norm(row: dict) -> dict | None:
         return None
     surprise = (actual - est) if est is not None else None
     surprise_pct = (surprise / abs(est) * 100.0) if (surprise is not None and est) else None
+    # Revenue surprise (confluence with EPS strengthens the drift; divergence weakens it).
+    rev_a, rev_e = row.get("revenueActual"), row.get("revenueEstimate")
+    rev_surprise_pct = ((rev_a - rev_e) / abs(rev_e) * 100.0) if (rev_a is not None and rev_e) else None
     q, y = row.get("quarter"), row.get("year")
     period = f"{y}Q{q}" if (q and y) else row.get("date")
     return {"ticker": sym, "period": period, "report_ts": rts,
             "hour": (row.get("hour") or ""), "actual": actual, "estimate": est,
-            "surprise": surprise, "surprise_pct": surprise_pct}
+            "surprise": surprise, "surprise_pct": surprise_pct,
+            "rev_actual": rev_a, "rev_estimate": rev_e, "rev_surprise_pct": rev_surprise_pct}
 
 
 def earnings_calendar(api_key: str | None, from_date: str, to_date: str) -> list[dict]:
@@ -81,5 +85,7 @@ def surprise_history(ticker: str, api_key: str | None, limit: int = 12) -> list[
             "surprise_pct": (r.get("surprisePercent")
                              if r.get("surprisePercent") is not None
                              else (surprise / abs(est) * 100.0 if surprise is not None and est else None)),
+            # /stock/earnings has no revenue; backtest PEAD runs without rev confluence
+            "rev_actual": None, "rev_estimate": None, "rev_surprise_pct": None,
         })
     return out

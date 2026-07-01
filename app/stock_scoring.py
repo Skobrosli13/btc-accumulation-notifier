@@ -103,23 +103,25 @@ def features(bars: list[dict]) -> dict | None:
     }
 
 
-def _earnings_reaction(bars: list[dict], report_ts: int, hour: str | None) -> tuple[float | None, float | None, int]:
-    """(reaction_return, drift_since_reaction, bars_since_report).
+def _earnings_reaction(bars: list[dict], report_ts: int, hour: str | None
+                       ) -> tuple[float | None, float | None, int, int | None]:
+    """(reaction_return, drift_since_reaction, bars_since_report, reaction_idx).
 
     reaction = the confirming move on the first session on/after the report
     (next session if reported after-hours), as close/prev_close-1. drift = the
-    move from that reaction close to the latest close."""
+    move from that reaction close to the latest close. reaction_idx = the bar
+    index of the reaction session (for volume confirmation)."""
     idx = next((i for i, b in enumerate(bars) if b["ts"] >= report_ts), None)
     if idx is None:
-        return None, None, 0
+        return None, None, 0, None
     # amc (after market close) -> the market's reaction is the NEXT session.
     if (hour or "").lower() == "amc":
         idx = min(idx + 1, len(bars) - 1)
     if idx < 1 or idx >= len(bars):
-        return None, None, len(bars) - 1 - (idx if idx < len(bars) else len(bars) - 1)
+        return None, None, len(bars) - 1 - min(idx, len(bars) - 1), None
     reaction = bars[idx]["close"] / bars[idx - 1]["close"] - 1.0
     drift = bars[-1]["close"] / bars[idx]["close"] - 1.0
-    return reaction, drift, len(bars) - 1 - idx
+    return reaction, drift, len(bars) - 1 - idx, idx
 
 
 @dataclass
@@ -138,13 +140,24 @@ class Candidate:
 
 def pead_candidate(ticker: str, feat: dict, bars: list[dict], earnings: dict | None,
                    cfg: Config) -> Candidate | None:
-    """Post-earnings drift setup: fresh surprise whose reaction confirms the sign."""
+    """Post-earnings drift setup: fresh surprise whose reaction confirms the sign.
+
+    Strength is a SUE-flavored *quality* read, not just raw surprise %:
+    - **SUE proxy** — the earnings-day reaction measured in units of the stock's own
+      daily volatility (reaction / ATR%). A 10% pop on a 2%-ATR name is a far bigger
+      surprise than 10% on a 12%-ATR name; drift scales with the standardized shock.
+    - **Revenue confluence** — a beat on BOTH EPS and revenue drifts more reliably;
+      an EPS beat with a revenue miss (low-quality) is damped.
+    - **Volume confirmation** — drift holds when the reaction is on heavy volume
+      (institutional participation), not a thin pop.
+    """
     if not earnings or earnings.get("surprise_pct") is None:
         return None
     sp = earnings["surprise_pct"]
     if abs(sp) < cfg.stock_pead_min_surprise:
         return None
-    reaction, drift, bars_since = _earnings_reaction(bars, earnings["report_ts"], earnings.get("hour"))
+    reaction, drift, bars_since, idx = _earnings_reaction(
+        bars, earnings["report_ts"], earnings.get("hour"))
     if reaction is None or bars_since < 1 or bars_since > cfg.stock_pead_lookback_days:
         return None
     # Drift thesis requires the market reaction to AGREE with the surprise sign.
@@ -153,17 +166,44 @@ def pead_candidate(ticker: str, feat: dict, bars: list[dict], earnings: dict | N
     if not (up or down):
         return None
     direction = "BUY" if up else "SELL"
-    strength = (_clamp01(abs(sp) / 12.0) * 0.6 + _clamp01(abs(reaction) / 0.06) * 0.4)
-    # Prefer earlier in the drift window (more room left) and confirmed-but-not-exhausted.
+
+    # SUE proxy: reaction standardized by the stock's typical daily range (ATR%).
+    atr_pct = feat.get("atr_pct") or 3.0
+    reaction_sigma = abs(reaction) / max(atr_pct / 100.0, 0.005)  # in "ATR units"
+    conviction = 0.4 * _clamp01(abs(sp) / 12.0) + 0.6 * _clamp01(reaction_sigma / 4.0)
+
+    # Revenue confluence: agree -> boost, diverge -> damp, missing -> neutral.
+    rev_sp = earnings.get("rev_surprise_pct")
+    if rev_sp is not None and abs(rev_sp) > 0.5:
+        rev_factor = 1.15 if (rev_sp > 0) == (sp > 0) else 0.85
+    else:
+        rev_factor = 1.0
+
+    # Volume confirmation on the reaction bar vs its prior-20d average.
+    vol_ratio = None
+    if idx is not None and idx >= 20:
+        prior = [b["volume"] for b in bars[idx - 20:idx]]
+        avg = sum(prior) / len(prior) if prior else 0
+        if avg > 0:
+            vol_ratio = bars[idx]["volume"] / avg
+    vol_factor = 1.1 if (vol_ratio and vol_ratio >= 2.0) else (
+        0.9 if (vol_ratio is not None and vol_ratio < 1.0) else 1.0)
+
     freshness = 1.0 - (bars_since / (cfg.stock_pead_lookback_days + 1))
-    strength = _clamp01(strength * (0.6 + 0.4 * freshness))
+    strength = _clamp01(conviction * rev_factor * vol_factor * (0.6 + 0.4 * freshness))
+
+    rev_tag = ("" if rev_sp is None else
+               (f", rev {'beat' if rev_sp > 0 else 'miss'} {abs(rev_sp):.0f}%"))
     return Candidate(ticker, direction, "pead_drift", strength, detail={
         "surprise_pct": round(sp, 2), "reaction_pct": round(reaction * 100, 2),
+        "reaction_sigma": round(reaction_sigma, 2), "rev_surprise_pct":
+            (round(rev_sp, 2) if rev_sp is not None else None),
+        "vol_ratio": (round(vol_ratio, 2) if vol_ratio is not None else None),
         "drift_since_pct": round((drift or 0) * 100, 2), "bars_since": bars_since,
         "report_ts": earnings["report_ts"], "actual": earnings.get("actual"),
         "estimate": earnings.get("estimate"),
-        "catalyst": f"EPS {'beat' if sp > 0 else 'miss'} {abs(sp):.0f}%, "
-                    f"day-1 {reaction*100:+.1f}%, {bars_since}d into drift",
+        "catalyst": f"EPS {'beat' if sp > 0 else 'miss'} {abs(sp):.0f}%{rev_tag}, "
+                    f"day-1 {reaction*100:+.1f}% ({reaction_sigma:.1f}sd), {bars_since}d into drift",
     })
 
 

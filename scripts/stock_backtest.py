@@ -70,7 +70,8 @@ def backtest_ticker(ticker: str, bars: list[dict], cfg, earnings_map: dict[int, 
             continue
         pos = {"direction": cand.direction, "entry": lv["entry"], "stop": lv["stop"],
                "t2": lv["t2"], "mfe_r": 0.0, "mae_r": 0.0}
-        upd = stock_positions.reprice(pos, bars[i + 1:], "", lv["time_stop_days"])
+        upd = stock_positions.reprice(pos, bars[i + 1:], "", lv["time_stop_days"],
+                                      cost_bps=cfg.stock_cost_bps)
         if upd["status"] != "CLOSED":
             continue
         trades.append({"ticker": ticker, "archetype": cand.archetype,

@@ -21,18 +21,29 @@ def _r(direction: str, price: float, entry: float, risk: float) -> float:
 
 
 def reprice(position: dict, new_bars: list[dict], run_ts: str,
-            time_stop_days: int) -> dict:
+            time_stop_days: int, cost_bps: float = 0.0) -> dict:
     """Resolve/advance one open position against bars AFTER its entry.
 
     ``new_bars`` = [{ts,high,low,close}, ...] oldest->newest, ts > opened_ts.
-    Returns a dict describing the update: either
-      {status:'CLOSED', exit_price, realized_r, exit_reason, closed_ts, mfe_r, mae_r}
+    ``cost_bps`` is the round-trip commission+slippage charged in R terms (so the
+    forward-test measures NET, not gross, expectancy — costs bite tight-stop setups
+    much harder than wide-stop ones). Returns either
+      {status:'CLOSED', exit_price, realized_r(net), gross_r, cost_r, exit_reason, closed_ts, mfe_r, mae_r}
     or {status:'OPEN', mfe_r, mae_r}."""
     direction = position["direction"]
     entry, stop, t2 = position["entry"], position["stop"], position["t2"]
     risk = abs(entry - stop)
+    # Cost in R = round-trip cost fraction / risk fraction (risk/entry).
+    cost_r = ((cost_bps / 10000.0) / (risk / entry)) if (risk > 0 and entry) else 0.0
     mfe = float(position.get("mfe_r") or 0.0)
     mae = float(position.get("mae_r") or 0.0)
+
+    def _close(exit_price, reason, ts):
+        gross = _r(direction, exit_price, entry, risk)
+        return {"status": "CLOSED", "exit_price": exit_price,
+                "realized_r": round(gross - cost_r, 3), "gross_r": round(gross, 3),
+                "cost_r": round(cost_r, 3), "exit_reason": reason, "closed_ts": ts,
+                "mfe_r": round(mfe, 3), "mae_r": round(mae, 3)}
 
     for i, b in enumerate(new_bars):
         hi, lo, close = b["high"], b["low"], b["close"]
@@ -46,21 +57,11 @@ def reprice(position: dict, new_bars: list[dict], run_ts: str,
             mae = min(mae, _r(direction, hi, entry, risk))
             stop_hit, t2_hit = hi >= stop, lo <= t2
         if stop_hit:   # conservative: stop wins a same-bar stop+target tie
-            return {"status": "CLOSED", "exit_price": stop,
-                    "realized_r": round(_r(direction, stop, entry, risk), 3),
-                    "exit_reason": "stop", "closed_ts": b["ts"],
-                    "mfe_r": round(mfe, 3), "mae_r": round(mae, 3)}
+            return _close(stop, "stop", b["ts"])
         if t2_hit:
-            return {"status": "CLOSED", "exit_price": t2,
-                    "realized_r": round(_r(direction, t2, entry, risk), 3),
-                    "exit_reason": "t2", "closed_ts": b["ts"],
-                    "mfe_r": round(mfe, 3), "mae_r": round(mae, 3)}
-        # time-stop: exit at the close of the Nth bar since entry
-        if i + 1 >= time_stop_days:
-            return {"status": "CLOSED", "exit_price": close,
-                    "realized_r": round(_r(direction, close, entry, risk), 3),
-                    "exit_reason": "time", "closed_ts": b["ts"],
-                    "mfe_r": round(mfe, 3), "mae_r": round(mae, 3)}
+            return _close(t2, "t2", b["ts"])
+        if i + 1 >= time_stop_days:   # time-stop: exit at the close of the Nth bar
+            return _close(close, "time", b["ts"])
     return {"status": "OPEN", "mfe_r": round(mfe, 3), "mae_r": round(mae, 3)}
 
 

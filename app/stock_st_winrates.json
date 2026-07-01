@@ -1,22 +1,22 @@
 {
-  "generated_at": "2026-07-01T02:52:25.954953+00:00",
+  "generated_at": "2026-07-01T03:52:39.313672+00:00",
   "source": "backtest",
   "note": "In-sample walk-forward seed (survivorship-biased).",
   "archetypes": {
-    "pead_drift": {
-      "n": 142,
-      "win_rate": 0.655,
-      "expectancy_r": 0.446
-    },
     "momentum": {
-      "n": 906,
-      "win_rate": 0.518,
-      "expectancy_r": 0.166
+      "n": 1010,
+      "win_rate": 0.494,
+      "expectancy_r": 0.099
+    },
+    "pead_drift": {
+      "n": 159,
+      "win_rate": 0.673,
+      "expectancy_r": 0.408
     },
     "mean_reversion": {
-      "n": 36,
-      "win_rate": 0.5,
-      "expectancy_r": 0.117
+      "n": 24,
+      "win_rate": 0.625,
+      "expectancy_r": 0.257
     }
   }
 }

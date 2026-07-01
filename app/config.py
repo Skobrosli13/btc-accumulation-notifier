@@ -188,6 +188,7 @@ class Config:
     stock_time_stop_days: int = 12
     stock_cooldown_days: float = 5.0
     stock_allow_shorts: bool = False   # Phase 1 = long-only; flip on for Phase 2 (negative-PEAD/short setups)
+    stock_cost_bps: float = 10.0       # round-trip commission+slippage (bps) netted out of forward-test R
 
     # --- Derived helpers -------------------------------------------------
 
@@ -360,6 +361,7 @@ def load_config() -> Config:
         stock_time_stop_days=_get_int("STOCK_TIME_STOP_DAYS", 12),
         stock_cooldown_days=_get_float("STOCK_COOLDOWN_DAYS", 5),
         stock_allow_shorts=_get_bool("STOCK_ALLOW_SHORTS", False),
+        stock_cost_bps=_get_float("STOCK_COST_BPS", 10.0),
         api_token=_opt("API_TOKEN"),
         api_cors_origin=_opt("API_CORS_ORIGIN"),
         public_base_url=_get("PUBLIC_BASE_URL", "https://btc.riverviewweb.com").rstrip("/"),

@@ -83,6 +83,40 @@ def test_small_surprise_ignored():
     assert stock_scoring.pead_candidate("X", stock_scoring.features(bars), bars, small, CFG) is None
 
 
+def _pead_scenario(reaction, n=210, step=0.2, vol=2_000_000.0):
+    """Uptrend with an earnings reaction bar at index n-6; returns (bars, report_ts)."""
+    closes = _uptrend(n, base=40, step=step)
+    closes[n - 6] = closes[n - 7] * (1 + reaction)
+    for j in range(n - 5, n):
+        closes[j] = closes[j - 1] * 1.003
+    b = _bars(closes, vol=vol)
+    return b, b[n - 6]["ts"]
+
+
+def test_pead_sue_bigger_reaction_scores_higher():
+    # Same EPS surprise, but a bigger reaction relative to the stock's vol (higher SUE)
+    # is a stronger drift setup.
+    big_bars, ts_b = _pead_scenario(0.08)
+    small_bars, ts_s = _pead_scenario(0.015)
+    e_big = {"report_ts": ts_b, "surprise_pct": 8.0, "hour": "", "rev_surprise_pct": None}
+    e_small = {"report_ts": ts_s, "surprise_pct": 8.0, "hour": "", "rev_surprise_pct": None}
+    c_big = stock_scoring.pead_candidate("X", stock_scoring.features(big_bars), big_bars, e_big, CFG)
+    c_small = stock_scoring.pead_candidate("X", stock_scoring.features(small_bars), small_bars, e_small, CFG)
+    assert c_big and c_small
+    assert c_big.primary > c_small.primary
+    assert c_big.detail["reaction_sigma"] > c_small.detail["reaction_sigma"]
+
+
+def test_pead_revenue_confluence():
+    bars, ts = _pead_scenario(0.06)
+    feat = stock_scoring.features(bars)
+    agree = {"report_ts": ts, "surprise_pct": 8.0, "hour": "", "rev_surprise_pct": 5.0}
+    diverge = {"report_ts": ts, "surprise_pct": 8.0, "hour": "", "rev_surprise_pct": -5.0}
+    c_agree = stock_scoring.pead_candidate("X", feat, bars, agree, CFG)
+    c_div = stock_scoring.pead_candidate("X", feat, bars, diverge, CFG)
+    assert c_agree.primary > c_div.primary   # EPS+revenue beat drifts better than EPS-beat/rev-miss
+
+
 # --- levels ------------------------------------------------------------------
 
 def test_levels_buy_geometry():
@@ -146,6 +180,29 @@ def test_reprice_still_open():
     bars = [{"ts": DAY, "high": 101, "low": 99, "close": 100.5}]
     u = stock_positions.reprice(_pos(), bars, "", time_stop_days=12)
     assert u["status"] == "OPEN"
+
+
+def test_reprice_cost_aware_net_below_gross():
+    # t2 hit: gross +2R; a 10bps round-trip cost shaves cost_r off the net.
+    bars = [{"ts": DAY, "high": 111, "low": 99, "close": 108}]  # entry100 stop95 t2110 risk5
+    u = stock_positions.reprice(_pos(), bars, "", 12, cost_bps=10)
+    assert u["gross_r"] == 2.0
+    assert u["cost_r"] > 0 and u["realized_r"] == round(2.0 - u["cost_r"], 3)
+    assert u["realized_r"] < u["gross_r"]
+
+
+def test_reprice_cost_bites_tight_stops_harder():
+    wide = stock_positions.reprice(_pos(entry=100, stop=90, t2=120),
+                                   [{"ts": DAY, "high": 121, "low": 99, "close": 118}], "", 12, cost_bps=10)
+    tight = stock_positions.reprice(_pos(entry=100, stop=98, t2=104),
+                                    [{"ts": DAY, "high": 105, "low": 99, "close": 104}], "", 12, cost_bps=10)
+    assert tight["cost_r"] > wide["cost_r"]   # same cost %, smaller risk -> more R lost
+
+
+def test_reprice_zero_cost_default_unchanged():
+    bars = [{"ts": DAY, "high": 111, "low": 99, "close": 108}]
+    u = stock_positions.reprice(_pos(), bars, "", 12)   # default cost_bps=0
+    assert u["realized_r"] == u["gross_r"] == 2.0
 
 
 def test_summarize_expectancy():
