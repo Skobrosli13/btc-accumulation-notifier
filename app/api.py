@@ -28,13 +28,34 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
-from . import alerting, notify_email, perf, scoring, shortterm, store
+from . import (alerting, notify_email, perf, scoring, shortterm, stock_api,
+               stock_store, store)
 from .config import Config, load_config
 from .sources import exchange
 
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 app = FastAPI(title="BTC Signal API", version="1.0.0")
+
+# Stock swing tracker (second asset) — namespaced under /api/stock/*.
+app.include_router(stock_api.router)
+
+
+def _ensure_schema() -> None:
+    """Best-effort: create both schemas so the READ-ONLY endpoints never hit a
+    missing table on a fresh box (before the first collector cron has run). The
+    API already writes for subscribe (_conn_rw/init_db), so this needs no new
+    privilege; the stock tables are additive and idempotent."""
+    try:
+        conn = store.connect(load_config().db_path)
+        store.init_db(conn)
+        stock_store.init_stock_db(conn)
+        conn.close()
+    except Exception:  # noqa: BLE001 - never block startup on schema init
+        pass
+
+
+_ensure_schema()
 
 # Display labels (server-side single source of truth; the dashboard never re-derives).
 _CATEGORY_LABELS = {

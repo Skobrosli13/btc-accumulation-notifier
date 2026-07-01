@@ -1,0 +1,4 @@
+{
+  "note": "Out-of-sample forward-test summary emitted by scripts/stock_calibrate.py from closed stock_positions. {available:false} until enough positions have closed.",
+  "available": false
+}
