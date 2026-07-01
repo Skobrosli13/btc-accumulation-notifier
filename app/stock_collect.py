@@ -275,10 +275,9 @@ def run(cfg: Config, *, dry_run: bool = False, limit: int | None = None,
     ranked = stock_scoring.rank(candidates, regime, universe_ret63)
     winrates = _winrates()
 
-    # --- Build signals + levels + confidence, open positions for the top setups ---
-    signals: list[dict] = []
-    to_alert: list[dict] = []
-    for i, c in enumerate(ranked):
+    # Pass 1: levels + confidence + expected-value PRIORITY per candidate.
+    records: list = []
+    for c in ranked:
         feat = c._feat
         structure = None
         if c.archetype == "pead_drift" and c.detail.get("report_ts"):
@@ -288,11 +287,23 @@ def run(cfg: Config, *, dry_run: bool = False, limit: int | None = None,
         if lv is None:
             continue
         conf = stock_confidence.confidence(c, winrates)
+        priority = stock_scoring.priority_score(c.composite, conf.get("expectancy_r"))
+        records.append((priority, c, feat, lv, conf))
+    # Rank by expected value so the documented edge (PEAD) surfaces ABOVE trending
+    # momentum noise instead of being buried under it in a strong tape.
+    records.sort(key=lambda r: r[0], reverse=True)
+
+    # Pass 2: assign rank/surfaced, build signals, open positions for the top setups.
+    signals: list[dict] = []
+    to_alert: list[dict] = []
+    for i, (priority, c, feat, lv, conf) in enumerate(records):
         rank_no = i + 1
         surfaced = rank_no <= cfg.stock_top_n
         detail = {**c.detail, "archetype_label": stock_scoring.ARCHETYPE_LABELS[c.archetype],
                   "confidence": conf, "levels": lv, "rel": round(c.rel, 3),
-                  "regime": c.regime, "regime_state": regime, "surfaced": surfaced}
+                  "regime": c.regime, "regime_state": regime, "surfaced": surfaced,
+                  "priority": round(priority, 1),
+                  "edge_class": ("edge" if stock_scoring.is_edge(c.archetype) else "unproven")}
         sig = {
             "ticker": c.ticker, "rank": rank_no, "direction": c.direction,
             "archetype": c.archetype, "composite": round(c.composite, 1),

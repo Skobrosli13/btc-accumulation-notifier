@@ -39,6 +39,24 @@ ARCHETYPE_LABELS = {
     "mean_reversion": "Mean-reversion (oversold dip)",
 }
 
+# Which archetypes carry a *documented* edge (vs. context/unproven). Only PEAD
+# has one; momentum/mean-reversion are near coin-flips whose thin positive
+# expectancy comes from the R-frame, not a real forecasting edge. Drives both the
+# expectancy-weighted ranking and the honest edge/unproven labelling.
+EDGE_ARCHETYPES = {"pead_drift"}
+
+
+def is_edge(archetype: str) -> bool:
+    return archetype in EDGE_ARCHETYPES
+
+
+def priority_score(composite: float, expectancy_r: float | None) -> float:
+    """Rank by EXPECTED VALUE, not raw signal strength: a high-expectancy archetype
+    (PEAD, ~+0.45R) outranks a strong-but-low-edge momentum name (~+0.17R) at equal
+    composite, so the screener leads with the edge instead of burying it under
+    whatever's trending. ``expectancy_r`` is the archetype's calibrated avg-R."""
+    return composite * (1.0 + max(-0.5, expectancy_r or 0.0))
+
 
 def _clamp01(x: float) -> float:
     return 0.0 if x < 0 else 1.0 if x > 1 else x

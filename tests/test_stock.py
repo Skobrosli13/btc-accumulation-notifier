@@ -191,6 +191,17 @@ def test_confidence_cap():
 
 # --- ranking -----------------------------------------------------------------
 
+def test_priority_score_edge_outranks_trending():
+    # PEAD (+0.45R) at a LOWER composite should outrank momentum (+0.17R) at a higher
+    # composite — the screener leads with expected value, not raw signal strength.
+    pead = stock_scoring.priority_score(72, 0.45)
+    mom = stock_scoring.priority_score(85, 0.17)
+    assert pead > mom
+    assert stock_scoring.is_edge("pead_drift") and not stock_scoring.is_edge("momentum")
+    # None expectancy is treated as 0 (no boost, no crash)
+    assert stock_scoring.priority_score(50, None) == 50
+
+
 def test_rank_sorts_and_assigns_composite():
     a = stock_scoring.Candidate("A", "BUY", "momentum", 0.9)
     b = stock_scoring.Candidate("B", "BUY", "momentum", 0.3)

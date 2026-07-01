@@ -109,6 +109,7 @@ def _setup_from_signal(s: dict) -> dict:
         "ticker": s["ticker"], "rank": s["rank"], "direction": s["direction"],
         "archetype": s["archetype"], "archetype_label": d.get("archetype_label", s["archetype"]),
         "composite": s["composite"], "surfaced": d.get("surfaced", True),
+        "edge_class": d.get("edge_class", "unproven"), "priority": d.get("priority"),
         "catalyst": d.get("catalyst"),
         "name": feat.get("name"), "sector": feat.get("sector"),
         "confidence": {
