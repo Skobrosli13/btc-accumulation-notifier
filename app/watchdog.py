@@ -1,13 +1,21 @@
 """Dead-man's-switch.
 
-Emails if EITHER pipeline has gone stale — so a broken pipeline (e.g. an exchange
+Emails if ANY pipeline has gone stale — so a broken pipeline (e.g. an exchange
 API change) never silently masquerades as "quiet market, no signal". Crucially the
-two pipelines are checked SEPARATELY against their own cadence: the 10-min collector
+pipelines are checked SEPARATELY against their own cadence: the 10-min collector
 keeps the DB "fresh" essentially always, so checking only the most-recent activity
 would let the 6h long-term run die for weeks unnoticed (the headline product).
 
-  * collector (collect_once, */10): stale after WATCHDOG_STALE_HOURS (default 3h)
-  * long-term (run_once, every 6h):  stale after ~2 cadences + slack (13h)
+  * collector (collect_once, */10):        stale after WATCHDOG_STALE_HOURS (default 3h)
+  * long-term (run_once, every 6h):         stale after ~2 cadences + slack (13h)
+  * stock swing (stock_collect, daily):     stale after ~50h  (~2 cadences + slack)
+  * stock long-term (stock_lt_collect, wk): stale after ~200h (~1 cadence  + slack)
+
+The two stock pipelines are OPTIONAL layers — deployed only when their API keys are
+set. A stock pipeline that has NEVER produced a run means "not enabled on this box",
+not "dead", so each is watched only once it has recorded at least one run; a
+previously-live pipeline going dark still alerts. (Both record a run row on every
+cron invocation, even a closed-market day, so the thresholds track wall-clock.)
 
 Re-alerts are DEBOUNCED with escalation (first hit, then ~6h, then daily) so a
 weekend outage doesn't produce ~48 identical emails. Sent over ALL configured
@@ -26,13 +34,16 @@ import logging
 import sys
 from datetime import datetime, timezone
 
-from . import notify, store
+from . import notify, stock_lt_store, stock_store, store
 from .config import Config, load_config
 
 log = logging.getLogger("btc-watchdog")
 
 # Long-term run cadence is 6h; flag only after ~2 missed cadences + slack.
 RUN_STALE_HOURS = 13.0
+# Optional stock pipelines (watched only once each has recorded a run — see module docstring).
+STOCK_SWING_STALE_HOURS = 50.0    # daily cron; ~2 missed cadences + slack
+STOCK_LT_STALE_HOURS = 200.0      # weekly cron; ~1 missed cadence + slack
 # Debounce: don't re-alert until this many hours since the last watchdog alert.
 _REALERT_AFTER_HOURS = 6.0
 _META_KEY = "watchdog_last_alert"
@@ -42,29 +53,47 @@ def check(cfg: Config, *, dry_run: bool = False) -> dict:
     now = datetime.now(timezone.utc)
     conn = store.connect(cfg.db_path)
     store.init_db(conn)
+    # Ensure the optional stock schemas exist so their "last run" reads return
+    # None (not-enabled) instead of raising on a box that never ran them.
+    stock_store.init_stock_db(conn)
+    stock_lt_store.init_stock_lt_db(conn)
+
     last_collect = store.last_collect_ts(conn)
     last_run = store.last_run_ts(conn)
+    last_stock = stock_store.last_stock_run_ts(conn)
+    last_lt = stock_lt_store.last_lt_run_ts(conn)
 
     def _age_h(t):
         return (now - t).total_seconds() / 3600.0 if t is not None else None
 
     collect_age = _age_h(last_collect)
     run_age = _age_h(last_run)
+    stock_age = _age_h(last_stock)
+    lt_age = _age_h(last_lt)
     collect_stale = collect_age is None or collect_age > cfg.watchdog_stale_hours
     run_stale = run_age is None or run_age > RUN_STALE_HOURS
-    stale = collect_stale or run_stale
+    # Optional layers: "stale" only once seen at least once (never-run == not enabled).
+    stock_stale = last_stock is not None and stock_age > STOCK_SWING_STALE_HOURS
+    lt_stale = last_lt is not None and lt_age > STOCK_LT_STALE_HOURS
+    stale = collect_stale or run_stale or stock_stale or lt_stale
 
     result = {
         "last_collect": last_collect.isoformat() if last_collect else None,
         "last_run": last_run.isoformat() if last_run else None,
+        "last_stock_run": last_stock.isoformat() if last_stock else None,
+        "last_lt_run": last_lt.isoformat() if last_lt else None,
         "collect_age_hours": collect_age, "run_age_hours": run_age,
+        "stock_age_hours": stock_age, "lt_age_hours": lt_age,
         "collect_stale": collect_stale, "run_stale": run_stale,
+        "stock_stale": stock_stale, "lt_stale": lt_stale,
         "stale": stale, "alerted": False,
     }
 
     if not stale:
-        log.info("watchdog: healthy (collect %.1fh, run %.1fh ago)",
-                 collect_age or 0.0, run_age or 0.0)
+        log.info("watchdog: healthy (collect %.1fh, run %.1fh, stock %s, lt %s)",
+                 collect_age or 0.0, run_age or 0.0,
+                 f"{stock_age:.1f}h" if stock_age is not None else "n/a",
+                 f"{lt_age:.1f}h" if lt_age is not None else "n/a")
         conn.close()
         return result
 
@@ -83,12 +112,18 @@ def check(cfg: Config, *, dry_run: bool = False) -> dict:
 
     problems = []
     if collect_stale:
-        problems.append(f"short-term collector (last {_when(collect_age)}, "
+        problems.append(f"BTC short-term collector (last {_when(collect_age)}, "
                         f"threshold {cfg.watchdog_stale_hours:.0f}h)")
     if run_stale:
-        problems.append(f"long-term run (last {_when(run_age)}, "
+        problems.append(f"BTC long-term run (last {_when(run_age)}, "
                         f"threshold {RUN_STALE_HOURS:.0f}h)")
-    title = "BTC notifier WATCHDOG: pipeline stale"
+    if stock_stale:
+        problems.append(f"stock swing collector (last {_when(stock_age)}, "
+                        f"threshold {STOCK_SWING_STALE_HOURS:.0f}h)")
+    if lt_stale:
+        problems.append(f"stock long-term run (last {_when(lt_age)}, "
+                        f"threshold {STOCK_LT_STALE_HOURS:.0f}h)")
+    title = "Signal system WATCHDOG: pipeline stale"
     body = (
         "A pipeline has stopped producing data:\n  - " + "\n  - ".join(problems) + "\n\n"
         "'No alerts' right now does NOT mean 'quiet market' — it likely means the "

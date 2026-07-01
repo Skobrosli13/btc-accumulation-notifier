@@ -22,8 +22,8 @@ import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from . import (notify, stock_confidence, stock_levels, stock_positions, stock_scoring,
-               stock_store, store)
+from . import (maturity, notify, stock_confidence, stock_levels, stock_positions,
+               stock_scoring, stock_store, store)
 from .config import Config, load_config
 from .sources.stocks import (congress, earnings, estimates, insider, prices, shortvol,
                              universe)
@@ -379,8 +379,11 @@ def _maybe_alert(conn, cfg: Config, to_alert: list[dict], now, dry_run: bool) ->
     for a in to_alert:
         s, d = a["sig"], a["detail"]
         conf = d["confidence"]
+        # Same maturity rung the dashboard card shows: PEAD is the documented edge,
+        # momentum / mean-reversion are timing context (see app/maturity.py).
+        mat = maturity.EDGE if s["archetype"] in stock_scoring.EDGE_ARCHETYPES else maturity.CONTEXT
         lines.append(
-            f"{s['direction']} {s['ticker']} — {d['archetype_label']} "
+            f"[{mat}] {s['direction']} {s['ticker']} — {d['archetype_label']} "
             f"(conf {conf['prob']*100:.0f}% {conf['label']})\n"
             f"  {d.get('catalyst','')}\n"
             f"  entry {s['entry']}  stop {s['stop']}  T1 {s['t1']}  T2 {s['t2']}  "

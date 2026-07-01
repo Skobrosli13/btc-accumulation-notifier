@@ -12,39 +12,16 @@ from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 from . import stock_confidence, stock_positions, stock_store, store
-from .config import Config, load_config
+from .api_deps import conn_ro as _conn, get_config as _cfg, require_token as _require_token
+from .config import Config
 
 router = APIRouter(prefix="/api/stock", tags=["stock"])
 
 # Daily cron; allow ~1 missed run + slack before "stale".
 _STOCK_STALE_HOURS = 30.0
-
-
-@lru_cache(maxsize=1)
-def _cfg() -> Config:
-    return load_config()
-
-
-def _require_token(authorization: str | None = Header(None)) -> None:
-    import secrets
-    cfg = _cfg()
-    if not cfg.api_token:
-        return
-    expected = f"Bearer {cfg.api_token}"
-    ok = bool(authorization) and secrets.compare_digest(
-        (authorization or "").encode("utf-8", "ignore"), expected.encode("utf-8"))
-    if not ok:
-        raise HTTPException(status_code=401, detail="unauthorized")
-
-
-def _conn(cfg: Config) -> sqlite3.Connection:
-    try:
-        return store.connect_readonly(cfg.db_path)
-    except sqlite3.OperationalError as exc:
-        raise HTTPException(status_code=503, detail=f"database unavailable: {exc}")
 
 
 @lru_cache(maxsize=1)

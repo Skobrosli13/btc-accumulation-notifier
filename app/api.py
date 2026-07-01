@@ -22,14 +22,14 @@ from functools import lru_cache
 from pathlib import Path
 
 import pandas as pd
-from fastapi import (BackgroundTasks, Depends, FastAPI, Header, HTTPException,
-                     Query)
+from fastapi import (BackgroundTasks, Depends, FastAPI, HTTPException, Query)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 from . import (alerting, notify_email, perf, scoring, shortterm, stock_api,
                stock_lt_api, stock_lt_store, stock_store, store)
+from .api_deps import conn_ro as _conn, conn_rw as _conn_rw, get_config, require_token
 from .config import Config, load_config
 from .sources import exchange
 
@@ -71,11 +71,6 @@ _COMPONENT_LABELS = {
 }
 
 
-@lru_cache(maxsize=1)
-def get_config() -> Config:
-    return load_config()
-
-
 # CORS only matters if the dashboard is served cross-origin (it usually isn't).
 _cfg = get_config()
 if _cfg.api_cors_origin:
@@ -85,44 +80,6 @@ if _cfg.api_cors_origin:
         allow_methods=["GET"],
         allow_headers=["*"],
     )
-
-
-def require_token(authorization: str | None = Header(None),
-                  cfg: Config = Depends(get_config)) -> None:
-    """Enforce the internal bearer token when one is configured."""
-    if not cfg.api_token:
-        return  # dev / localhost-only: open
-    expected = f"Bearer {cfg.api_token}"
-    # Constant-time compare so the token can't be recovered byte-by-byte via timing.
-    # Compare bytes so a non-ASCII header can't raise TypeError -> 500 (compare_digest
-    # rejects mixed/non-ASCII str); a bad header should be a clean 401.
-    ok = bool(authorization) and secrets.compare_digest(
-        (authorization or "").encode("utf-8", "ignore"), expected.encode("utf-8"))
-    if not ok:
-        raise HTTPException(status_code=401, detail="unauthorized")
-
-
-def _conn(cfg: Config) -> sqlite3.Connection:
-    try:
-        return store.connect_readonly(cfg.db_path)
-    except sqlite3.OperationalError as exc:
-        raise HTTPException(status_code=503, detail=f"database unavailable: {exc}")
-
-
-def _conn_rw(cfg: Config) -> sqlite3.Connection:
-    """A short-lived read-WRITE connection for the subscribe/unsubscribe writes.
-
-    The API is read-only by design; this is the one narrow exception. The
-    subscribers table is separate from the collector's tables and WAL +
-    busy_timeout handle the rare writer overlap. ``init_db`` is idempotent and
-    guarantees the table exists even before the first collector run.
-    """
-    try:
-        conn = store.connect(cfg.db_path)
-        store.init_db(conn)
-        return conn
-    except sqlite3.OperationalError as exc:
-        raise HTTPException(status_code=503, detail=f"database unavailable: {exc}")
 
 
 # Long-term runs are a 6h cron; allow ~2 cadences + slack before "stale" so a
