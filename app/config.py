@@ -253,11 +253,10 @@ class Config:
 
     @property
     def stock_price_source(self) -> str:
-        """Which venue prices() will prefer — kept aligned with sources/stocks/prices.py.
-        Massive grouped-daily (robust, 1 call/day) is preferred when keyed; else a
-        free Alpaca/Tiingo key; else the keyless (fragile) Yahoo chart endpoint."""
-        if self.massive_active:
-            return "massive"
+        """The BULK primary venue prices() uses for the daily 536-name fetch — aligned
+        with sources/stocks/prices.py. Yahoo is the keyless bulk default (Massive's
+        5/min free limit rules it out as a bulk source; it's a per-ticker FALLBACK for
+        the few names Yahoo drops). A free Alpaca/Tiingo key upgrades the bulk feed."""
         if self.alpaca_active:
             return "alpaca"
         if self.tiingo_api_key:

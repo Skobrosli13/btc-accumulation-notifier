@@ -172,6 +172,19 @@ def tiingo_daily(ticker: str, token: str, limit: int = 400) -> list[Bar] | None:
     return out[-limit:]
 
 
+def _massive_daily(ticker: str, key: str | None, limit: int = 400) -> list[Bar] | None:
+    """Massive per-ticker daily aggregates as a fallback (UTC-midnight ts). None on failure."""
+    from datetime import timedelta
+    from . import massive
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=int(limit * 1.5) + 5)
+    bars = massive.daily_bars(ticker, key, start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"))
+    if not bars:
+        return None
+    out = [(_ts_to_midnight_ms(int(t / 1000)), o, h, l, c, v) for (t, o, h, l, c, v) in bars]
+    return out[-limit:]
+
+
 def daily_bars(ticker: str, cfg, limit: int = 400) -> tuple[list[Bar], str] | None:
     """Best available daily bars for one ticker + the venue that served them.
 
@@ -185,6 +198,10 @@ def daily_bars(ticker: str, cfg, limit: int = 400) -> tuple[list[Bar], str] | No
     if cfg.tiingo_api_key:
         attempts.append(("tiingo", lambda: tiingo_daily(ticker, cfg.tiingo_api_key, limit)))
     attempts.append(("yahoo", lambda: yahoo_daily(ticker, limit)))
+    # Massive per-ticker as a keyed FALLBACK (5/min free limit -> only for the handful
+    # of names Yahoo drops, never the bulk feed).
+    if getattr(cfg, "massive_active", False):
+        attempts.append(("massive", lambda: _massive_daily(ticker, cfg.massive_api_key, limit)))
     attempts.append(("stooq", lambda: stooq_daily(ticker, limit)))
     for source, fn in attempts:
         try:
