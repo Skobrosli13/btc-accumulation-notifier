@@ -1,44 +1,66 @@
 {
-  "generated_at": "2026-06-19T22:40:26.495771+00:00",
-  "method": "expanding-window percentile composite (price + macro + multi-cycle on-chain), timing-neutral",
-  "days": 2939,
+  "generated_at": "2026-07-01T23:44:57.420691+00:00",
+  "method": "expanding-window percentile composite (price + macro + multi-cycle on-chain), timing-neutral; indicator histories seeded with pre-panel native data; CI over episode starts spaced >= the horizon",
+  "days": 2951,
   "from": "2018-06-03",
-  "to": "2026-06-19",
-  "signal_days": 703,
-  "signal_episodes": 63,
+  "to": "2026-07-01",
+  "signal_days": 1120,
+  "signal_episodes": 65,
+  "seeded": {
+    "mayer": 850,
+    "m2_yoy": 702,
+    "real_yield": 3859,
+    "nfci": 2474,
+    "realized_ratio": 1049,
+    "reserve_risk": 2345,
+    "lth_sopr": 2345,
+    "sth_sopr": 2345,
+    "lth_mvrv": 2345
+  },
   "horizons": {
     "90d": {
-      "signal_hit_rate": 0.555,
-      "base_rate": 0.559,
-      "episode_hit_rate": 0.673,
+      "signal_hit_rate": 0.558,
+      "base_rate": 0.557,
+      "episode_hit_rate": 0.534,
+      "episodes_effective": 13,
+      "episode_hit_rate_effective": 0.538,
       "ci": [
-        0.564,
-        0.782
-      ]
+        0.308,
+        0.769
+      ],
+      "edge": false
     },
     "180d": {
-      "signal_hit_rate": 0.673,
-      "base_rate": 0.606,
-      "episode_hit_rate": 0.556,
+      "signal_hit_rate": 0.644,
+      "base_rate": 0.603,
+      "episode_hit_rate": 0.596,
+      "episodes_effective": 8,
+      "episode_hit_rate_effective": 0.5,
       "ci": [
-        0.444,
-        0.667
-      ]
+        0.25,
+        0.75
+      ],
+      "edge": false
     },
     "365d": {
-      "signal_hit_rate": 0.849,
-      "base_rate": 0.708,
-      "episode_hit_rate": 0.808,
+      "signal_hit_rate": 0.865,
+      "base_rate": 0.705,
+      "episode_hit_rate": 0.796,
+      "episodes_effective": 5,
+      "episode_hit_rate_effective": 0.8,
       "ci": [
-        0.712,
-        0.885
-      ]
+        0.4,
+        1.0
+      ],
+      "edge": false
     }
   },
   "caveats": [
     "Composite over the deep multi-cycle indicators: price-structure (200WMA/Mayer), macro (FRED), and on-chain (realized ratio, reserve risk, LTH/STH-SOPR, LTH-MVRV).",
     "Excludes one-free-cycle on-chain (MVRV-Z/NUPL/SOPR/Puell), sentiment, and derivatives.",
-    "Timing multiplier neutralized; cycle context excluded.",
+    "signal_hit_rate / base_rate use fully overlapping daily windows \u2014 descriptive only. The ci and 'edge' verdict use episode starts spaced >= the horizon (episodes_effective); at 365d that is a single-digit sample.",
+    "Live scoring additionally applies the cycle multiplier (~\u00b15%) and tier hysteresis, both EXCLUDED here; a composite near the 40/60/80 cutoffs can tier differently live.",
+    "Category weights, tier cutoffs, redundancy groups and the indicator selection itself are in-sample choices made with full-sample knowledge.",
     "One asset, ~2-3 cycles. Past behavior is not a forecast."
   ]
 }

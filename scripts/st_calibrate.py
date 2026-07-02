@@ -3,7 +3,10 @@
 For each swing trigger, over OKX history, this measures the ALERTED population —
 the events that actually reach the user after the live collector's gates (regime
 suppression + confluence + per-(key,tf) cooldown / same-candle dedup), recomputed
-on the same ~300-candle window production uses. For each alerted cell it reports:
+on the same ~300-candle window production uses. One residual gap remains: the
+replay's composite state has no funding component while live's does, so the
+is_counter_trend leg of the confluence gate can diverge marginally from
+production (see CAVEATS / st_validation.replay_alerts). For each alerted cell it reports:
 n, win_rate, a Wilson 95% CI, the unconditional base_rate, and the EXPECTANCY
 (avg R-multiple) of the ATR stop/target frame (stop=1.5xATR, target=2.5xATR), net
 of a 10 bps round-trip cost and with unresolved trades marked to market.
@@ -19,8 +22,9 @@ promise. The live services only READ the committed st_winrates.json.
 
 JSON SCHEMA NOTE: each cell carries {direction, n, fires, horizon_bars, win_rate,
 wilson_lo, wilson_hi, base_rate, expectancy_R, resolved, low_n, not_significant}.
-``n`` counts DE-CORRELATED EPISODES — same-key alerted fires closer together than
-the forward horizon are collapsed to the first (st_validation.collapse_episodes),
+``n`` counts DE-CORRELATED EPISODES — a same-key alerted fire starting fewer than
+horizon_bars after the last KEPT episode is collapsed into it
+(st_validation.collapse_episodes, same spacing semantics as calibrate._spaced),
 because overlapping return windows counted as independent trials would tighten
 the Wilson CI dishonestly. ``fires`` keeps the pre-collapse alerted count. The top
 level carries "population":"alerted" plus "unmeasured_keys": alertable trigger
@@ -60,6 +64,34 @@ UNMEASURED_KEYS = [
     "funding_spike_bull", "funding_spike_bear", "oi_surge_long", "oi_surge_short",
     "cvd_bull_divergence", "cvd_bear_divergence", "oi_new_longs", "oi_new_shorts",
     "liq_long_flush", "liq_short_flush",
+]
+
+# Honesty caveats written verbatim into st_winrates.json (module-level so tests can
+# pin their presence without running the network regen).
+CAVEATS = [
+    "Win-rates are the ALERTED population (post regime+confluence+cooldown), "
+    "not every raw trigger fire. The two differ; the alerted set is what users get.",
+    "n counts de-correlated episodes (each kept fire starts >= horizon_bars after "
+    "the last kept one, mirroring calibrate._spaced); overlapping forward windows "
+    "are never counted as independent trials.",
+    "Cells with n<min_n (low_n=true) are not statistically meaningful.",
+    "Cells whose Wilson CI includes base_rate (not_significant=true) are "
+    "indistinguishable from the unconditional move rate.",
+    "Horizons differ by timeframe (horizon_bars per cell: 4h races 24 bars "
+    "= 4 days, 1d races 10 bars = 10 days) and differ from the 7d "
+    "live-performance line — different measurements of different things.",
+    "Trigger thresholds and the confluence gate were TUNED on this same "
+    "sample (in-sample). A cell that ever turns significant must also hold "
+    "on a walk-forward holdout (scripts.backtest_shortterm splits at "
+    "2024-01-01) before being treated as edge.",
+    "funding/OI/flow trigger types (unmeasured_keys) have NO cells here — "
+    "no backtest coverage at all.",
+    "Residual replay gap: live st_composite includes a funding component the "
+    "replay never sees, which can shift the composite state and flip "
+    "is_counter_trend at the state-band edges — lone-trigger confluence "
+    "decisions can differ marginally, so the alerted population here matches "
+    "production only up to that funding-state margin.",
+    "One venue (OKX), a few years; past behavior is not a forecast.",
 ]
 
 
@@ -140,25 +172,7 @@ def main() -> int:
         "live_window": stv.LIVE_WINDOW,
         "unmeasured_keys": UNMEASURED_KEYS,
         "timeframes": {},
-        "caveats": [
-            "Win-rates are the ALERTED population (post regime+confluence+cooldown), "
-            "not every raw trigger fire. The two differ; the alerted set is what users get.",
-            "n counts de-correlated episodes (gap >= horizon_bars); overlapping "
-            "forward windows are never counted as independent trials.",
-            "Cells with n<min_n (low_n=true) are not statistically meaningful.",
-            "Cells whose Wilson CI includes base_rate (not_significant=true) are "
-            "indistinguishable from the unconditional move rate.",
-            "Horizons differ by timeframe (horizon_bars per cell: 4h races 24 bars "
-            "= 4 days, 1d races 10 bars = 10 days) and differ from the 7d "
-            "live-performance line — different measurements of different things.",
-            "Trigger thresholds and the confluence gate were TUNED on this same "
-            "sample (in-sample). A cell that ever turns significant must also hold "
-            "on a walk-forward holdout (scripts.backtest_shortterm splits at "
-            "2024-01-01) before being treated as edge.",
-            "funding/OI/flow trigger types (unmeasured_keys) have NO cells here — "
-            "no backtest coverage at all.",
-            "One venue (OKX), a few years; past behavior is not a forecast.",
-        ],
+        "caveats": list(CAVEATS),
     }
 
     regime_series = None

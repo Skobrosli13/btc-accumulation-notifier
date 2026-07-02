@@ -7,6 +7,9 @@ Covers the honesty fixes:
     rate-capped (degraded) build can't silently pin itself.
   * backtest_flow.py: forming-bar drop mirrors collect_once._closed; the
     Bonferroni z used by the promotion check.
+  * backtest_shortterm.py: per-horizon cells count episodes spaced against the
+    last KEPT fire (no chaining across dropped events — a slow drip of fires
+    with disjoint forward windows must not collapse to one episode).
   * eval_netactivity.py: the z-score matches the LIVE definition (trailing window
     EXCLUDING the current point, population std), and bucket days collapse to
     non-overlapping episodes.
@@ -91,6 +94,25 @@ def test_bonferroni_z_widens_with_cells():
 def test_flow_collapse_keeps_first_of_each_run():
     assert backtest_flow._collapse([10, 11, 12, 30], gap=3) == [10, 30]
     assert backtest_flow._collapse([10, 14, 18], gap=3) == [10, 14, 18]
+
+
+# --- backtest_shortterm.py: episode-spaced per-horizon cells ----------------------
+
+def test_shortterm_score_counts_spaced_episodes_not_chained_drips():
+    # Fires every 20 bars with a 24-bar horizon: windows of the 0- and 40-bar fires
+    # are disjoint, so the horizon cell must score 2 episodes (last-KEPT spacing),
+    # not 1 (the old chaining collapsed the whole drip). 'n' stays the fire count.
+    from scripts import backtest_shortterm as bst
+    from scripts.st_validation import AlertEvent
+
+    events = [AlertEvent("macd_bull_cross", "BUY", "4h", i, i * 1000)
+              for i in (0, 20, 40, 60)]
+    closes = [100.0 + 0.1 * i for i in range(100)]   # rising -> BUYs win
+    scored = bst._score(events, closes, horizons=[24])
+    rec = scored["macd_bull_cross"]
+    assert rec["n"] == 4                 # gated fires, pre-collapse
+    assert rec[24]["n"] == 2             # episodes at bars 0 and 40
+    assert rec[24]["win"] == pytest.approx(1.0)
 
 
 # --- eval_netactivity.py: live-aligned z + episode spacing -----------------------

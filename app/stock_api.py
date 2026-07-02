@@ -134,6 +134,23 @@ def health(cfg: Config = Depends(_cfg), _=Depends(_require_token)) -> dict:
     return out
 
 
+def _setup_maturity(archetype: str, edge_class: str | None) -> str:
+    """The honesty rung ('edge' | 'forward') the dashboard badge renders — the SAME
+    rung the alert email stamped. Prefers the edge_class persisted at signal time
+    (what the email used); pre-migration rows derive it from the currently loaded
+    win-rates via stock_confidence.archetype_maturity."""
+    if edge_class in ("edge", "forward"):
+        return edge_class
+    return stock_confidence.archetype_maturity(archetype, _winrates())
+
+
+def _annotate_maturity(rows: list[dict]) -> list[dict]:
+    """Attach the per-archetype maturity rung to raw position rows (in place)."""
+    for r in rows:
+        r["maturity"] = stock_confidence.archetype_maturity(r.get("archetype"), _winrates())
+    return rows
+
+
 def _setup_from_signal(s: dict) -> dict:
     """Shape a stored stock_signals row (+ parsed detail) into a screener setup card."""
     d = s.get("detail") or {}
@@ -145,6 +162,7 @@ def _setup_from_signal(s: dict) -> dict:
         "archetype": s["archetype"], "archetype_label": d.get("archetype_label", s["archetype"]),
         "composite": s["composite"], "surfaced": d.get("surfaced", True),
         "edge_class": d.get("edge_class", "unproven"), "priority": d.get("priority"),
+        "maturity": _setup_maturity(s["archetype"], d.get("edge_class")),
         "catalyst": d.get("catalyst"),
         "name": feat.get("name"), "sector": feat.get("sector"),
         "confidence": {
@@ -210,6 +228,10 @@ def positions(cfg: Config = Depends(_cfg), _=Depends(_require_token)) -> dict:
         conn.close()
     summary = stock_positions.summarize(closed)  # excludes voided ('rebased') rows
     recent_closed = sorted(closed, key=lambda r: r.get("closed_ts") or 0, reverse=True)[:40]
+    # per-position maturity rung so the tracker cards read the same honesty
+    # vocabulary as the screener setups and the alert emails
+    for rows in (openp, pending, recent_closed):
+        _annotate_maturity(rows)
     return {"open": openp, "pending": pending, "recent_closed": recent_closed,
             "summary": summary, "n_open": len(openp), "n_pending": len(pending),
             "n_closed": len(closed),

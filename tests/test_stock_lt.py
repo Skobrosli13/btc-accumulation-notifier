@@ -163,19 +163,21 @@ def _conn_mem():
 
 
 _NOW = datetime.now(timezone.utc)
+_NOW_MS = int(_NOW.timestamp() * 1000)
 
 
 def test_close_dropped_by_conviction_uses_date_matched_spy():
     conn = _conn_mem()
     t = 100 * DAY
     stock_lt_store.open_lt_holding(conn, ticker="AAA", opened_run_ts="r0", opened_ts=t,
-                                   entry=100.0, spy_entry=400.0, conviction=80)
+                                   entry=100.0, spy_entry=400.0, conviction=80,
+                                   entry_close=100.0)
     # AAA is still scored (in candidates) but fell off the conviction list
     candidates = [{"ticker": "AAA", "price": 110.0, "last_ts": t + 30 * DAY}]
     spy_by_ts = {t + 30 * DAY: 440.0}
-    opened, deferred = stock_lt_collect._manage_holdings(
+    opened, deferred, forced = stock_lt_collect._manage_holdings(
         conn, CFG, "r1", set(), [], candidates, 440.0, spy_by_ts, _NOW, False)
-    assert opened == [] and deferred == []
+    assert opened == [] and deferred == [] and forced == []
     closed = stock_lt_store.closed_lt_holdings(conn)
     assert len(closed) == 1
     h = closed[0]
@@ -187,16 +189,37 @@ def test_close_dropped_by_conviction_uses_date_matched_spy():
 
 def test_close_deferred_when_no_date_matched_pair():
     conn = _conn_mem()
-    t_old, t_new = 100 * DAY, 130 * DAY
-    stock_lt_store.open_lt_holding(conn, ticker="BBB", opened_run_ts="r0", opened_ts=t_old,
-                                   entry=50.0, spy_entry=400.0, conviction=70)
-    # BBB vanished from the scorable set; its stored bar is weeks older than SPY's
-    stock_store.upsert_prices(conn, "BBB", [(t_old, 10, 11, 9, 48.0, 1e6)], source="test")
-    opened, deferred = stock_lt_collect._manage_holdings(
-        conn, CFG, "r1", set(), [], [], 440.0, {t_new: 440.0}, _NOW, False)
-    assert deferred == ["BBB"]
+    t_bar = _NOW_MS - 10 * DAY   # name froze 10 days ago (inside the defer bound)
+    stock_lt_store.open_lt_holding(conn, ticker="BBB", opened_run_ts="r0",
+                                   opened_ts=t_bar - 60 * DAY, entry=50.0,
+                                   spy_entry=400.0, conviction=70, entry_close=50.0)
+    # BBB vanished from the scorable set; its stored bar is >5 days older than any
+    # SPY bar in the window -> no date-matched pair yet
+    stock_store.upsert_prices(conn, "BBB", [(t_bar, 10, 11, 9, 48.0, 1e6)], source="test")
+    spy_by_ts = {_NOW_MS - 2 * DAY: 440.0, _NOW_MS - DAY: 441.0}
+    opened, deferred, forced = stock_lt_collect._manage_holdings(
+        conn, CFG, "r1", set(), [], [], 441.0, spy_by_ts, _NOW, False)
+    assert deferred == ["BBB"] and forced == []
     assert stock_lt_store.open_lt_holdings(conn)          # still open — no phantom exit
     assert stock_lt_store.closed_lt_holdings(conn) == []
+    conn.close()
+
+
+def test_deferred_close_force_closes_after_30_days():
+    conn = _conn_mem()
+    t_bar = _NOW_MS - 40 * DAY   # delisted: bars frozen 40 days ago, outside the SPY window
+    stock_lt_store.open_lt_holding(conn, ticker="DDX", opened_run_ts="r0",
+                                   opened_ts=t_bar - 100 * DAY, entry=40.0,
+                                   spy_entry=400.0, conviction=70, entry_close=40.0)
+    stock_store.upsert_prices(conn, "DDX", [(t_bar, 44, 45, 43, 44.0, 1e6)], source="test")
+    spy_by_ts = {_NOW_MS - 2 * DAY: 440.0, _NOW_MS - DAY: 444.0}
+    opened, deferred, forced = stock_lt_collect._manage_holdings(
+        conn, CFG, "r1", set(), [], [], 444.0, spy_by_ts, _NOW, False)
+    assert forced == ["DDX"] and deferred == []
+    closed = stock_lt_store.closed_lt_holdings(conn)
+    assert len(closed) == 1 and closed[0]["exit_reason"] == "data_gap"
+    assert closed[0]["exit"] == 44.0
+    assert closed[0]["spy_exit"] == 440.0   # nearest available SPY bar, best-effort
     conn.close()
 
 
@@ -204,15 +227,32 @@ def test_close_data_gap_when_dates_match():
     conn = _conn_mem()
     t = 100 * DAY
     stock_lt_store.open_lt_holding(conn, ticker="CCC", opened_run_ts="r0", opened_ts=t,
-                                   entry=50.0, spy_entry=400.0, conviction=70)
+                                   entry=50.0, spy_entry=400.0, conviction=70,
+                                   entry_close=50.0)
     # not scored this run (e.g. financials decode failure) but prices are current
     stock_store.upsert_prices(conn, "CCC", [(t + 30 * DAY, 54, 56, 53, 55.0, 1e6)], source="test")
-    opened, deferred = stock_lt_collect._manage_holdings(
+    opened, deferred, forced = stock_lt_collect._manage_holdings(
         conn, CFG, "r1", set(), [], [], 440.0, {t + 30 * DAY: 440.0}, _NOW, False)
-    assert deferred == []
+    assert deferred == [] and forced == []
     closed = stock_lt_store.closed_lt_holdings(conn)
     assert len(closed) == 1 and closed[0]["exit_reason"] == "data_gap"
     assert closed[0]["exit"] == 55.0
+    conn.close()
+
+
+def test_spy_exit_matches_nearest_bar_within_tolerance():
+    conn = _conn_mem()
+    t_bar = _NOW_MS - 3 * DAY   # exit bar has no exact-ts SPY twin (holiday skew)
+    stock_lt_store.open_lt_holding(conn, ticker="GGG", opened_run_ts="r0",
+                                   opened_ts=t_bar - 60 * DAY, entry=100.0,
+                                   spy_entry=400.0, conviction=70, entry_close=100.0)
+    candidates = [{"ticker": "GGG", "price": 110.0, "last_ts": t_bar}]
+    spy_by_ts = {_NOW_MS - 4 * DAY: 438.0, _NOW_MS - DAY: 442.0}   # nearest = 1 day away
+    opened, deferred, forced = stock_lt_collect._manage_holdings(
+        conn, CFG, "r1", set(), [], candidates, 442.0, spy_by_ts, _NOW, False)
+    assert deferred == [] and forced == []
+    closed = stock_lt_store.closed_lt_holdings(conn)
+    assert len(closed) == 1 and closed[0]["spy_exit"] == 438.0
     conn.close()
 
 
@@ -234,14 +274,71 @@ def test_close_reexpresses_entry_in_current_basis_after_split():
     conn.close()
 
 
+def test_entry_anchor_rolls_forward_and_survives_prune():
+    conn = _conn_mem()
+    t_entry = _NOW_MS - 600 * DAY    # older than the ~500-day stock_prices prune
+    t_exit = _NOW_MS - DAY
+    stock_lt_store.open_lt_holding(conn, ticker="EEE", opened_run_ts="r0",
+                                   opened_ts=t_entry, entry=100.0, spy_entry=400.0,
+                                   conviction=70, entry_ts=t_entry, entry_close=100.0)
+    # run 1: the entry bar is still stored, but on the venue's NEW post-10:1-split
+    # basis — the anchor must roll forward while the bar is observable
+    stock_store.upsert_prices(conn, "EEE", [(t_entry, 9.9, 10.1, 9.8, 10.0, 1e7),
+                                            (t_exit, 10.9, 11.2, 10.8, 11.0, 1e7)],
+                              source="test")
+    stock_lt_collect._manage_holdings(conn, CFG, "r1", {"EEE"}, [], [], 440.0,
+                                      {t_exit: 440.0}, _NOW, False)
+    h = stock_lt_store.open_lt_holdings(conn)[0]
+    assert h["entry_close"] == 10.0          # rolled to the current basis, persisted
+    # the entry bar is then pruned (hold outlived the 500-day price retention)...
+    conn.execute("DELETE FROM stock_prices WHERE ticker='EEE' AND ts=?", (t_entry,))
+    conn.commit()
+    # ...and the eventual conviction-drop close still books the true excess return
+    opened, deferred, forced = stock_lt_collect._manage_holdings(
+        conn, CFG, "r1", set(), [], [], 440.0, {t_exit: 440.0}, _NOW, False)
+    assert deferred == [] and forced == []
+    closed = stock_lt_store.closed_lt_holdings(conn)
+    assert len(closed) == 1
+    assert abs(closed[0]["excess_return"]) < 1e-6   # +10% vs SPY +10%, not -89%
+    conn.close()
+
+
+def test_close_defers_without_any_entry_anchor():
+    conn = _conn_mem()
+    t_exit = _NOW_MS - DAY
+    # legacy row: no entry_ts, no entry_close -> the frozen entry is unverifiable
+    stock_lt_store.open_lt_holding(conn, ticker="FFF", opened_run_ts="r0",
+                                   opened_ts=_NOW_MS - 90 * DAY, entry=100.0,
+                                   spy_entry=400.0, conviction=70)
+    candidates = [{"ticker": "FFF", "price": 110.0, "last_ts": t_exit}]
+    opened, deferred, forced = stock_lt_collect._manage_holdings(
+        conn, CFG, "r1", set(), [], candidates, 440.0, {t_exit: 440.0}, _NOW, False)
+    assert deferred == ["FFF"] and forced == []
+    assert stock_lt_store.open_lt_holdings(conn)   # deferred, never a frozen-entry close
+    assert stock_lt_store.closed_lt_holdings(conn) == []
+    conn.close()
+
+
 def test_open_uses_date_matched_spy_entry():
     conn = _conn_mem()
     t = 200 * DAY
     survivors = [{"ticker": "DDD", "price": 30.0, "last_ts": t, "conviction": 90}]
     spy_by_ts = {t: 430.0}   # SPY close of the SAME bar date as the entry price
-    opened, _ = stock_lt_collect._manage_holdings(
+    opened, _, _ = stock_lt_collect._manage_holdings(
         conn, CFG, "r1", {"DDD"}, survivors, survivors, 440.0, spy_by_ts, _NOW, False)
     assert opened == ["DDD"]
     h = stock_lt_store.open_lt_holdings(conn)[0]
     assert h["spy_entry"] == 430.0 and h["entry"] == 30.0
+    assert h["entry_close"] == 30.0   # split-guard anchor stored at open
     conn.close()
+
+
+def test_benchmark_basis_derived_from_venue_basis():
+    # yahoo/tiingo/alpaca serve SPLIT-ONLY series -> the excess measure is
+    # price-only; only stooq (split+dividend) earns the total-return label.
+    assert stock_lt_collect._benchmark_basis("yahoo") == "price_only_ex_dividends"
+    assert stock_lt_collect._benchmark_basis("tiingo") == "price_only_ex_dividends"
+    assert stock_lt_collect._benchmark_basis("alpaca") == "price_only_ex_dividends"
+    assert stock_lt_collect._benchmark_basis("stooq") == "total_return_adjusted"
+    assert stock_lt_collect._benchmark_basis(None) == "price_only_ex_dividends"
+    assert not hasattr(stock_lt_collect, "_ADJ_VENUES")   # stale hardcoded set removed

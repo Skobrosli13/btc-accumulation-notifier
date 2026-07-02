@@ -217,9 +217,11 @@ def live_performance(cfg: Config = Depends(get_config), _=Depends(require_token)
         "long_term": perf.long_term_performance(runs, candles),
         "short_term": perf.short_term_performance(alerts, candles),
         "note": ("Forward-tested on the system's live signals as they age — out-of-sample, "
-                 "grows over time and covers the full stored history. Long-term episode "
-                 "counts (not run counts) are the honest sample size; swing win rates are "
-                 "cost-adjusted and only meaningful against base_rate."),
+                 "grows over time and covers the full stored history. Long-term "
+                 "episodes_effective (episode starts spaced >= the horizon; the CI's "
+                 "population) is the honest sample size — raw run and episode counts "
+                 "overlap; swing win rates are cost-adjusted and only meaningful "
+                 "against base_rate."),
     }
 
 
@@ -275,16 +277,32 @@ def _lt_breakdown(latest: dict, cfg: Config) -> dict:
         "drop_24_48h_pct": ps.get("drop_24_48h_pct"), "source": ps.get("source"),
     }
 
-    ath_d = cfg.ath_date
-    if ps.get("ath_date"):
+    # Cycle panel: derive from the SAME ATH the run's multiplier actually used —
+    # run_once persists it as readings["cycle_ath"] (date/price/source, including
+    # the stored-1d-history override). Fall back to the venue price_struct only
+    # for runs recorded before cycle_ath existed, then to the config date, so
+    # ath_date/days_since_ath/in_window can never contradict the multiplier
+    # served beside them.
+    cyc_ath = readings.get("cycle_ath") or {}
+    ath_d, ath_price, ath_source = cfg.ath_date, ps.get("ath_price"), "config"
+    for cand_date, cand_price, cand_src in (
+            (cyc_ath.get("date"), cyc_ath.get("price"), cyc_ath.get("source") or "run"),
+            (ps.get("ath_date"), ps.get("ath_price"), "venue")):
+        if not cand_date:
+            continue
         try:
-            ath_d = datetime.strptime(ps["ath_date"], "%Y-%m-%d").date()
+            ath_d = datetime.strptime(cand_date, "%Y-%m-%d").date()
+            ath_price, ath_source = cand_price, cand_src
+            break
         except (ValueError, TypeError):
-            pass
+            continue
     days_since_ath = (datetime.now(timezone.utc).date() - ath_d).days
     cycle = {
         "ath_date": ath_d.isoformat(),
-        "ath_price": ps.get("ath_price"),
+        "ath_price": ath_price,
+        # Which read fed this panel: "stored"/"venue"/"config" as recorded by the
+        # run (or "venue"/"config" via the pre-migration fallback path here).
+        "ath_source": ath_source,
         "days_since_ath": days_since_ath,
         "typical_days": cfg.peak_to_trough_days,
         "window_lo": cfg.peak_to_trough_days - scoring.CYCLE_WINDOW_HALFWIDTH_DAYS,

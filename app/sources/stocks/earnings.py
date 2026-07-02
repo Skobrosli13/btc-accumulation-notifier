@@ -9,12 +9,16 @@ Two endpoints:
   never usable as a report date — it is only joined on (year, quarter) to backfill
   a missing actual/estimate on a calendar row.
 
-Free tier is 60 calls/min. Fail-soft: returns ``[]`` when no key / on any error, so
+Free tier is 60 calls/min, so every Finnhub call in this module is paced to
+<= 55/min (monotonic-clock throttle) — the paged history pull alone is ~25
+calls/ticker and an unpaced multi-ticker backtest regen would silently lose
+windows to 429s. Fail-soft: returns ``[]`` when no key / on any error, so
 the screener degrades to the keyless technical archetypes.
 """
 from __future__ import annotations
 
 import logging
+import time
 from datetime import datetime, timedelta, timezone
 
 from .._http import get_json  # app.sources.stocks -> app.sources._http
@@ -25,6 +29,21 @@ FINNHUB = "https://finnhub.io/api/v1"
 
 _HISTORY_WINDOW_DAYS = 90    # one calendar page ~ a fiscal quarter
 _MAX_HISTORY_WINDOWS = 24    # hard cap on paging (~6 years)
+_MIN_INTERVAL_S = 60.0 / 55.0   # pace Finnhub calls to <= 55/min (free tier: 60/min)
+_MIN_WINDOW_COVERAGE = 0.90  # <90% of history windows answered -> drop the ticker
+_last_call = 0.0             # monotonic ts of the last Finnhub call (module-wide)
+
+
+def _pace() -> None:
+    """Monotonic-clock throttle: sleep so consecutive Finnhub calls stay
+    >= ``_MIN_INTERVAL_S`` apart (<= 55 calls/min against the 60/min free tier)."""
+    global _last_call
+    if _MIN_INTERVAL_S <= 0:
+        return
+    wait = _last_call + _MIN_INTERVAL_S - time.monotonic()
+    if wait > 0:
+        time.sleep(wait)
+    _last_call = time.monotonic()
 
 
 def _date_to_ms(datestr: str) -> int | None:
@@ -60,6 +79,7 @@ def earnings_calendar(api_key: str | None, from_date: str, to_date: str) -> list
     One request covers the whole universe. [] if no key / on failure."""
     if not api_key:
         return []
+    _pace()
     data = get_json(f"{FINNHUB}/calendar/earnings",
                     params={"from": from_date, "to": to_date, "token": api_key})
     rows = (data or {}).get("earningsCalendar") or []
@@ -87,10 +107,17 @@ def surprise_history(ticker: str, api_key: str | None, years: float = 4.5) -> li
     session and the drift window start where the market actually learned the number.
     A calendar row missing actual/estimate is backfilled from ``/stock/earnings``
     joined on (year, quarter); the fiscal ``period`` end date from that endpoint is
-    deliberately never used as ``report_ts``. [] when no key / on failure."""
+    deliberately never used as ``report_ts``. [] when no key / on failure.
+
+    Coverage guard: a window whose request FAILED (``get_json`` -> None, e.g. a
+    429 after retries) is not the same as a window with no reports. If fewer than
+    ``_MIN_WINDOW_COVERAGE`` of the requested windows answered, the whole history
+    is dropped ([]), so a partial, rate-limit-biased record can't masquerade as a
+    complete one downstream (the backtest PEAD map)."""
     if not api_key:
         return []
     # Join feed: per-symbol surprises keyed by fiscal (year, quarter).
+    _pace()
     hist = get_json(f"{FINNHUB}/stock/earnings",
                     params={"symbol": ticker, "limit": 60, "token": api_key})
     by_quarter: dict[tuple[int, int], dict] = {}
@@ -101,14 +128,19 @@ def surprise_history(ticker: str, api_key: str | None, years: float = 4.5) -> li
     out: list[dict] = []
     end = datetime.now(timezone.utc)
     windows = max(1, min(_MAX_HISTORY_WINDOWS, int(years * 365 / _HISTORY_WINDOW_DAYS) + 1))
+    failed = 0
     for w in range(windows):
         to_d = end - timedelta(days=w * _HISTORY_WINDOW_DAYS)
         frm_d = to_d - timedelta(days=_HISTORY_WINDOW_DAYS - 1)
+        _pace()
         data = get_json(f"{FINNHUB}/calendar/earnings",
                         params={"from": frm_d.strftime("%Y-%m-%d"),
                                 "to": to_d.strftime("%Y-%m-%d"),
                                 "symbol": ticker, "token": api_key})
-        for r in (data or {}).get("earningsCalendar") or []:
+        if data is None:            # request failed — distinct from an empty window
+            failed += 1
+            continue
+        for r in data.get("earningsCalendar") or []:
             if (r.get("symbol") or "").upper() != ticker.upper():
                 continue
             joined = by_quarter.get(_quarter_key(r) or (-1, -1)) or {}
@@ -120,6 +152,11 @@ def surprise_history(ticker: str, api_key: str | None, years: float = 4.5) -> li
             n = _norm(merged)
             if n:
                 out.append(n)
+    if failed and (windows - failed) / windows < _MIN_WINDOW_COVERAGE:
+        log.warning("%s: only %d/%d earnings-history windows answered (rate-limited?) — "
+                    "DROPPING the ticker's history so a partial record can't pass for a "
+                    "complete one", ticker, windows - failed, windows)
+        return []
     # De-dup window-edge overlaps; newest first.
     seen: set[tuple] = set()
     uniq: list[dict] = []

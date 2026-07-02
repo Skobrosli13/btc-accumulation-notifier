@@ -11,7 +11,10 @@ All deterministic, over SYNTHETIC frames — no network. Covers:
     full_warm=False so short synthetic frames can fire; warm-up behavior has its
     own test.)
   * The 200DMA regime tag sees only CLOSED daily candles (no look-ahead).
+  * collapse_episodes spaces against the last KEPT event with inclusive >=
+    (mirrors calibrate._spaced; no chaining across dropped fires).
   * st_calibrate._score_population de-correlates overlapping fires to episodes.
+  * st_calibrate's committed caveats disclose the funding replay-parity gap.
 """
 from __future__ import annotations
 
@@ -315,6 +318,47 @@ def test_collapse_episodes_merges_adjacent_same_key():
     assert ("macd_bull_cross", 11) in keys_idx
 
 
+def test_collapse_episodes_does_not_chain_across_dropped_events():
+    # A slow drip every 20 bars with a 24-bar horizon: dropped fires must NOT reset
+    # the spacing anchor. Compare-against-last-KEPT keeps 0 and 40 (2 episodes);
+    # the old chaining (update last_idx on every event) collapsed all four to one.
+    from scripts.st_validation import AlertEvent
+    events = [AlertEvent("macd_bull_cross", "BUY", "4h", i, i * 1000)
+              for i in (0, 20, 40, 60)]
+    kept = stv.collapse_episodes(events, gap_bars=24)
+    assert sorted(e.index for e in kept) == [0, 40]
+
+
+def test_collapse_episodes_boundary_is_inclusive():
+    # Two fires exactly gap_bars apart have disjoint close-to-close forward windows
+    # -> both kept (>= semantics, mirroring calibrate._spaced), not dropped ('>').
+    from scripts.st_validation import AlertEvent
+    events = [AlertEvent("ema_cross_bull", "BUY", "4h", 0, 0),
+              AlertEvent("ema_cross_bull", "BUY", "4h", 24, 24_000)]
+    kept = stv.collapse_episodes(events, gap_bars=24)
+    assert sorted(e.index for e in kept) == [0, 24]
+    # One bar inside the horizon still collapses.
+    events_inside = [AlertEvent("ema_cross_bull", "BUY", "4h", 0, 0),
+                     AlertEvent("ema_cross_bull", "BUY", "4h", 23, 23_000)]
+    assert [e.index for e in stv.collapse_episodes(events_inside, gap_bars=24)] == [0]
+
+
+def test_collapse_episodes_mirrors_calibrate_spaced():
+    # The two de-correlation helpers shipped by the wave must agree: same drip
+    # pattern, bars expressed as days for calibrate._spaced.
+    import numpy as np
+    from scripts.calibrate import _spaced
+    from scripts.st_validation import AlertEvent
+
+    bars = [0, 20, 40, 60, 84]
+    gap = 24
+    dates = np.array([np.datetime64("2024-01-01") + np.timedelta64(b, "D") for b in bars])
+    spaced_bars = [bars[i] for i in _spaced(list(range(len(bars))), dates, gap)]
+    events = [AlertEvent("ema_cross_bull", "BUY", "4h", b, b * 1000) for b in bars]
+    collapsed_bars = sorted(e.index for e in stv.collapse_episodes(events, gap_bars=gap))
+    assert collapsed_bars == spaced_bars == [0, 40, 84]
+
+
 # --- st_calibrate cell construction -------------------------------------------
 
 def test_score_population_decorrelates_to_episodes_and_stamps_horizon():
@@ -338,3 +382,17 @@ def test_score_population_decorrelates_to_episodes_and_stamps_horizon():
     # Opting out of collapse scores every fire (the old, overlap-inflated n).
     raw_cells = _score_population(events, frame, fwd=10, collapse=False)
     assert raw_cells["ema_cross_bull"]["n"] == 3
+
+
+# --- artifact honesty: caveats ------------------------------------------------
+
+def test_st_calibrate_caveats_disclose_funding_replay_gap():
+    # The replay's composite state has no funding component while live's does
+    # (st_composite via shortterm.evaluate(..., funding=...)); the artifact must
+    # say so instead of claiming exact alerted-population parity.
+    from scripts.st_calibrate import CAVEATS
+    funding_caveats = [c for c in CAVEATS
+                       if "funding component" in c and "is_counter_trend" in c]
+    assert funding_caveats, "st_winrates caveats must disclose the funding replay gap"
+    # And the episode caveat must describe the last-KEPT >= spacing semantics.
+    assert any("last kept" in c and ">= horizon_bars" in c for c in CAVEATS)

@@ -51,6 +51,17 @@ def _send_telegram(cfg: Config, title: str, body: str) -> bool:
         return False
 
 
+def has_transport(cfg: Config) -> bool:
+    """True when at least one notification transport is configured.
+
+    Callers use this to tell a RETRYABLE send failure (configured transport,
+    transient error) apart from the documented empty-.env no-op, where ``send``
+    always returns False — e.g. the stock cooldown arms off alert creation when
+    there is nothing to send through, instead of waiting for a send that can
+    never succeed."""
+    return cfg.notifications_configured()
+
+
 def _email_recipients(cfg: Config, conn: sqlite3.Connection | None) -> dict[str, str | None]:
     """Build the email broadcast list as {email: unsubscribe_token | None}.
 

@@ -133,19 +133,25 @@ def run(cfg: Config, *, dry_run: bool = False) -> dict:
     # invocation (slow venue, hung HTTP call) is still in flight; two writers
     # interleaving upserts and sends would double-alert and race the cooldown
     # reads. Dry runs don't write, so they neither take nor steal the lock.
-    if not dry_run and not store.try_acquire_lock(conn, _LOCK_KEY, now.timestamp(),
-                                                  _LOCK_TTL_S):
-        log.warning("another collect_once invocation holds the lock; exiting early")
-        conn.close()
-        return {"now": now.isoformat(), "skipped": "overlap-lock",
-                "timeframes": {}, "alerts": []}
+    # The ownership token makes the release safe against TTL steals: if THIS
+    # run overruns the TTL and a newer invocation steals the lock, our release
+    # is a no-op instead of freeing the new holder's claim mid-run.
+    lock_token: str | None = None
+    if not dry_run:
+        lock_token = store.try_acquire_lock(conn, _LOCK_KEY, now.timestamp(),
+                                            _LOCK_TTL_S)
+        if lock_token is None:
+            log.warning("another collect_once invocation holds the lock; exiting early")
+            conn.close()
+            return {"now": now.isoformat(), "skipped": "overlap-lock",
+                    "timeframes": {}, "alerts": []}
     _http.set_deadline(_NET_BUDGET_S)
     try:
         return _run_locked(cfg, conn, now, dry_run=dry_run)
     finally:
         _http.set_deadline(None)
-        if not dry_run:
-            store.release_lock(conn, _LOCK_KEY)
+        if lock_token is not None:
+            store.release_lock(conn, _LOCK_KEY, lock_token)
         conn.close()
 
 

@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 import dataclasses
+from datetime import datetime, timezone
 
-from app import (stock_collect, stock_confidence, stock_levels, stock_positions,
-                 stock_scoring, stock_store, store)
+from app import (notify, stock_api, stock_collect, stock_confidence, stock_levels,
+                 stock_positions, stock_scoring, stock_store, store)
 from app.config import load_config
 
 CFG = load_config()
@@ -419,11 +420,13 @@ def test_shortvol_baseline_excludes_today_and_needs_history():
 
 # --- position lifecycle: pending fill / expiry / rebase / void -----------------
 
-def _pending(conn, ticker="AAA", sig_ts=100 * DAY, atr=2.0):
+def _pending(conn, ticker="AAA", sig_ts=100 * DAY, atr=2.0, entry_bar_close=100.0,
+             structure_stop=None):
     return stock_store.insert_position(
         conn, ticker=ticker, opened_run_ts="r0", opened_ts=sig_ts, direction="BUY",
         archetype="momentum", confidence=0.6, entry=100.0, stop=95.0, t1=104.0,
-        t2=107.0, atr=atr, time_stop_days=20, status="PENDING", entry_venue="test")
+        t2=107.0, atr=atr, time_stop_days=20, status="PENDING", entry_venue="test",
+        entry_bar_close=entry_bar_close, structure_stop=structure_stop)
 
 
 def test_pending_fills_at_next_bar_open():
@@ -475,6 +478,75 @@ def test_pending_expires_when_first_bar_is_too_late():
                                      {"AAA": bars}, {"AAA": "test"}, False)
     assert not stock_store.pending_positions(conn)
     assert not stock_store.open_positions(conn)
+    conn.close()
+
+
+def test_pending_fill_rescales_frozen_frame_after_split_in_gap():
+    conn = _conn_mem()
+    sig_ts = 100 * DAY
+    # signal-day basis: close 100, atr 2.0, structure stop 96 frozen on the row
+    _pending(conn, sig_ts=sig_ts, atr=2.0, entry_bar_close=100.0, structure_stop=96.0)
+    # a 10:1 split becomes effective during the pending gap: the fill-run series is
+    # served entirely in post-split units (the signal bar's close now reads 10.0)
+    bars = [{"ts": sig_ts, "open": 9.9, "high": 10.1, "low": 9.8, "close": 10.0, "volume": 1e7},
+            {"ts": sig_ts + DAY, "open": 10.2, "high": 10.4, "low": 10.1, "close": 10.3, "volume": 1e7}]
+    events = stock_collect._advance_positions(conn, CFG, "r1", sig_ts + 2 * DAY,
+                                              {"AAA": bars}, {"AAA": "test"}, False)
+    assert events == []
+    pos = stock_store.open_positions(conn)[0]
+    assert pos["entry"] == 10.2                    # fill at the next bar's open
+    assert abs(pos["atr"] - 0.2) < 1e-9            # atr re-expressed post-split
+    assert abs(pos["structure_stop"] - 9.6) < 1e-9
+    # momentum stop = entry - 2.5*atr with the RESCALED atr (9.7), not the
+    # pre-split-frame 10.2 - 5.0 = 5.2 (~50% below entry)
+    assert abs(pos["stop"] - 9.7) < 1e-9
+    # the reprice-side re-base guard re-anchors at the FILL bar's close
+    assert abs(pos["entry_bar_close"] - 10.3) < 1e-9
+    conn.close()
+
+
+def test_pending_expires_data_gap_when_signal_bar_missing():
+    conn = _conn_mem()
+    sig_ts = 100 * DAY
+    _pending(conn, sig_ts=sig_ts)
+    # the fill-run series no longer contains the signal bar -> basis unverifiable
+    bars = [{"ts": sig_ts + DAY, "open": 50, "high": 51, "low": 49, "close": 50, "volume": 1e6}]
+    events = stock_collect._advance_positions(conn, CFG, "r1", sig_ts + 2 * DAY,
+                                              {"AAA": bars}, {"AAA": "test"}, False)
+    assert events and events[0]["status"] == "EXPIRED"
+    assert events[0]["exit_reason"] == "data_gap"
+    assert not stock_store.pending_positions(conn)
+    assert not stock_store.open_positions(conn)
+    assert stock_store.closed_positions(conn) == []   # EXPIRED never enters the record
+    conn.close()
+
+
+def test_pending_without_signal_anchor_fills_legacy_path():
+    conn = _conn_mem()
+    sig_ts = 100 * DAY
+    # legacy PENDING row (created before entry_bar_close was stored at signal time)
+    _pending(conn, sig_ts=sig_ts, entry_bar_close=None)
+    bars = [{"ts": sig_ts + DAY, "open": 102, "high": 103, "low": 101, "close": 102.5,
+             "volume": 1e6}]
+    stock_collect._advance_positions(conn, CFG, "r1", sig_ts + 2 * DAY,
+                                     {"AAA": bars}, {"AAA": "test"}, False)
+    assert len(stock_store.open_positions(conn)) == 1   # no anchor -> no guard, fills
+    conn.close()
+
+
+def test_just_filled_position_advances_once_per_run():
+    conn = _conn_mem()
+    sig_ts = 100 * DAY
+    _pending(conn, sig_ts=sig_ts)
+    # fill bar rockets through T2 the same session: fill + close in ONE run must
+    # produce exactly one CLOSED event (the re-queried open loop skips just-filled)
+    bars = [{"ts": sig_ts, "open": 99, "high": 101, "low": 98, "close": 100, "volume": 1e6},
+            {"ts": sig_ts + DAY, "open": 102, "high": 200, "low": 101, "close": 190, "volume": 1e6}]
+    events = stock_collect._advance_positions(conn, CFG, "r1", sig_ts + 2 * DAY,
+                                              {"AAA": bars}, {"AAA": "test"}, False)
+    closed_events = [e for e in events if e.get("status") == "CLOSED"]
+    assert len(closed_events) == 1 and closed_events[0]["exit_reason"] == "t2"
+    assert len(stock_store.closed_positions(conn)) == 1
     conn.close()
 
 
@@ -556,6 +628,72 @@ def test_unsent_alert_does_not_arm_cooldown_and_retries_once():
     assert stock_store.unsent_stock_alerts(conn) == []
     assert stock_store.last_stock_alert(conn, "BBB", "momentum") is None
     conn.close()
+
+
+def _alert_payload(ticker="AAA"):
+    sig = {"ticker": ticker, "direction": "BUY", "archetype": "momentum", "entry": 10.0,
+           "stop": 9.0, "t1": 11.0, "t2": 12.0, "rr": 2.0, "confidence": 0.6}
+    detail = {"archetype_label": "Momentum breakout", "catalyst": "x",
+              "edge_class": "forward",
+              "confidence": {"prob": 0.6, "label": "backtested prior"},
+              "levels": {"risk_pct": 5.0}}
+    return {"sig": sig, "detail": detail, "ts": DAY}
+
+
+def test_alert_arms_cooldown_when_no_transport_configured(monkeypatch):
+    conn = _conn_mem()
+    now = datetime.now(timezone.utc)
+    # empty-.env mode: send() is a no-op returning False, but the alert row is the
+    # canonical record -> the cooldown must arm off creation (nothing to retry).
+    monkeypatch.setattr(stock_collect.notify, "send", lambda *a, **k: False)
+    monkeypatch.setattr(stock_collect.notify, "has_transport", lambda cfg: False)
+    stock_collect._maybe_alert(conn, CFG, [_alert_payload("AAA")], now, False)
+    assert stock_store.last_stock_alert(conn, "AAA", "momentum") is not None
+    assert stock_store.unsent_stock_alerts(conn) == []   # no dead retry queued
+    # a send FAILURE with a CONFIGURED transport keeps retry semantics: unarmed
+    monkeypatch.setattr(stock_collect.notify, "has_transport", lambda cfg: True)
+    stock_collect._maybe_alert(conn, CFG, [_alert_payload("BBB")], now, False)
+    assert stock_store.last_stock_alert(conn, "BBB", "momentum") is None
+    assert len(stock_store.unsent_stock_alerts(conn)) == 1
+    conn.close()
+
+
+def test_has_transport_predicate():
+    bare = dataclasses.replace(CFG, resend_api_key="", email_to="", ntfy_topic="",
+                               telegram_bot_token="", telegram_chat_id="")
+    assert notify.has_transport(bare) is False
+    assert notify.has_transport(dataclasses.replace(bare, ntfy_topic="t")) is True
+    assert notify.has_transport(
+        dataclasses.replace(bare, resend_api_key="k", email_to="a@b.c")) is True
+
+
+# --- API: per-setup maturity rung ------------------------------------------------
+
+def _signal_row(detail: dict) -> dict:
+    return {"ticker": "AAA", "rank": 1, "direction": "BUY", "archetype": "momentum",
+            "composite": 80.0, "confidence": 0.6, "pead": None, "technical": 0.7,
+            "insider": None, "shortvol": None, "revision": None, "price": 10.5,
+            "entry": 10.5, "stop": 9.5, "t1": 11.5, "t2": 12.5, "atr": 0.5, "rr": 2.0,
+            "detail": detail}
+
+
+def test_setup_serves_maturity_rung():
+    # the rung persisted at signal time (what the alert email used) is preferred
+    out = stock_api._setup_from_signal(_signal_row({"edge_class": "forward"}))
+    assert out["maturity"] == "forward" and out["edge_class"] == "forward"
+    assert stock_api._setup_from_signal(_signal_row({"edge_class": "edge"}))["maturity"] == "edge"
+    # pre-migration rows (no stored edge_class) derive from the loaded win-rates;
+    # the committed seed has no significant cells, so every archetype is 'forward'
+    legacy = stock_api._setup_from_signal(_signal_row({}))
+    assert legacy["maturity"] == "forward"
+    assert legacy["edge_class"] == "unproven"   # legacy default untouched
+
+
+def test_positions_annotated_with_maturity():
+    rows = [{"ticker": "AAA", "archetype": "momentum"},
+            {"ticker": "BBB", "archetype": "pead_drift"}]
+    out = stock_api._annotate_maturity(rows)
+    assert all(r["maturity"] in ("edge", "forward") for r in out)
 
 
 # --- estimate snapshot guard ---------------------------------------------------

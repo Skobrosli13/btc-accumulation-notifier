@@ -42,7 +42,9 @@ def test_long_term_forward_returns_and_window():
 
 def test_long_term_episode_collapse():
     # 5 consecutive ACCUMULATE runs = ONE episode (one market outcome, not five
-    # samples); a NEUTRAL break then a new stretch = a second episode.
+    # samples); a NEUTRAL break then a new stretch = a second episode. The two
+    # starts are only 8d apart, so under a 30d horizon their forward windows
+    # overlap -> episodes_effective collapses them to ONE.
     candles = _candles(1, 60)
     runs = ([{"run_ts": _iso(2 + i), "price": 100.0, "tier": "ACCUMULATE"} for i in range(5)]
             + [{"run_ts": _iso(8), "price": 100.0, "tier": "NEUTRAL"}]
@@ -50,28 +52,51 @@ def test_long_term_episode_collapse():
                {"run_ts": _iso(11), "price": 100.0, "tier": "ACCUMULATE"}])
     d30 = perf.long_term_performance(runs, candles, horizons_days=(30,))["horizons"]["30"]
     assert d30["n_signal"] == 7           # run-level count still served
-    assert d30["episodes"] == 2           # the honest n
+    assert d30["episodes"] == 2           # contiguous-stretch collapse
     assert d30["episode_hit_rate"] == 1.0
-    assert d30["ci"] is None              # <3 episodes -> no CI theater
+    assert d30["episodes_effective"] == 1  # starts 8d apart overlap a 30d window
+    assert d30["episode_hit_rate_effective"] == 1.0
+    assert d30["ci"] is None              # <3 spaced episodes -> no CI theater
 
 
-def test_long_term_tier_change_starts_new_episode():
+def test_long_term_tier_step_within_stretch_is_one_episode():
+    # An ACCUMULATE->DEEP_VALUE step INSIDE one contiguous signal stretch is one
+    # dip = one market outcome, not two episodes (matches scripts/calibrate.py).
     candles = _candles(1, 60)
     runs = [{"run_ts": _iso(2), "price": 100.0, "tier": "ACCUMULATE"},
             {"run_ts": _iso(3), "price": 100.0, "tier": "DEEP_VALUE"},
-            {"run_ts": _iso(4), "price": 100.0, "tier": "DEEP_VALUE"}]
+            {"run_ts": _iso(4), "price": 100.0, "tier": "ACCUMULATE"},
+            {"run_ts": _iso(5), "price": 100.0, "tier": "DEEP_VALUE"}]
     d30 = perf.long_term_performance(runs, candles, horizons_days=(30,))["horizons"]["30"]
-    assert d30["episodes"] == 2           # same-tier collapse, not any-signal collapse
+    assert d30["episodes"] == 1
+    assert d30["episodes_effective"] == 1
 
 
-def test_long_term_ci_present_with_enough_episodes():
+def test_long_term_ci_uses_spaced_episodes_only():
+    # 4 one-run episodes just DAYS apart under a 30d horizon: ~90% overlapping
+    # forward windows are one market outcome, so no CI may be served off them.
     candles = _candles(1, 80)
     runs = []
-    for start in (2, 6, 10, 14):          # 4 separated one-run episodes, all winners
+    for start in (2, 6, 10, 14):
         runs.append({"run_ts": _iso(start), "price": 100.0, "tier": "ACCUMULATE"})
         runs.append({"run_ts": _iso(start + 1), "price": 100.0, "tier": "NEUTRAL"})
     d30 = perf.long_term_performance(runs, candles, horizons_days=(30,))["horizons"]["30"]
-    assert d30["episodes"] == 4
+    assert d30["episodes"] == 4           # raw episode count still served
+    assert d30["episodes_effective"] == 1  # all four share one 30d window
+    assert d30["ci"] is None              # the spurious [1.0, 1.0] CI is gone
+
+
+def test_long_term_ci_present_with_enough_spaced_episodes():
+    # 3 episodes >= 30d apart (non-overlapping forward windows), all winners.
+    candles = _candles(1, 100)
+    runs = []
+    for start in (2, 34, 66):
+        runs.append({"run_ts": _iso(start), "price": 100.0, "tier": "ACCUMULATE"})
+        runs.append({"run_ts": _iso(start + 1), "price": 100.0, "tier": "NEUTRAL"})
+    d30 = perf.long_term_performance(runs, candles, horizons_days=(30,))["horizons"]["30"]
+    assert d30["episodes"] == 3
+    assert d30["episodes_effective"] == 3
+    assert d30["episode_hit_rate_effective"] == 1.0
     assert d30["ci"] == [1.0, 1.0]        # all-win outcomes -> degenerate CI at 1.0
 
 
@@ -155,6 +180,8 @@ def test_empty_inputs_safe():
     lt = perf.long_term_performance([], [], (30,))
     assert lt["horizons"]["30"]["signal_hit_rate"] is None
     assert lt["horizons"]["30"]["episodes"] == 0 and lt["horizons"]["30"]["ci"] is None
+    assert lt["horizons"]["30"]["episodes_effective"] == 0
+    assert lt["horizons"]["30"]["episode_hit_rate_effective"] is None
     assert lt["window"] == {"from": None, "to": None}
     st = perf.short_term_performance([], [])
     assert st["win_rate"] is None and st["n_events"] == 0 and st["base_rate"] is None

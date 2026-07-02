@@ -263,6 +263,7 @@ def _advance_positions(conn, cfg: Config, run_ts: str, now_ms: int,
     could actually get), never at the signal bar's close."""
     events: list[dict] = []
     to_reprice: list[tuple[dict, list[dict]]] = []
+    just_filled: set[int] = set()
 
     # -- pending: fill at the next bar's open, or expire unfilled --
     for pos in stock_store.pending_positions(conn):
@@ -281,6 +282,30 @@ def _advance_positions(conn, cfg: Config, run_ts: str, now_ms: int,
             continue
         if fill_bar is None:
             continue   # still waiting for the next bar
+        # Pending-gap re-base guard: atr/structure_stop were frozen in the SIGNAL
+        # day's price basis. A split effective during the 1-3 day pending window
+        # re-serves the whole series in post-split units, so the fill open would be
+        # paired with a 10x-wrong ATR/stop. Compare the signal bar's close in the
+        # fill-run series to the close stored at signal time and re-express the
+        # frozen frame; if the signal bar vanished, the basis is unverifiable ->
+        # expire the pending (data_gap), never guess.
+        sig_close = pos.get("entry_bar_close")
+        if sig_close:
+            sig_bar = next((b for b in bars if b["ts"] == pos["opened_ts"]), None)
+            if sig_bar is None or not sig_bar.get("close"):
+                if not dry_run:
+                    stock_store.expire_position(conn, pos["id"], closed_run_ts=run_ts,
+                                                closed_ts=now_ms, reason="data_gap")
+                events.append({"ticker": tk, "archetype": pos["archetype"],
+                               "status": "EXPIRED", "exit_reason": "data_gap"})
+                continue
+            ratio = sig_bar["close"] / sig_close
+            if abs(ratio - 1.0) > _REBASE_TOL:
+                for k in ("atr", "structure_stop"):
+                    if pos.get(k) is not None:
+                        pos[k] = pos[k] * ratio
+                log.info("re-based %s pending frame by %.4f before fill "
+                         "(split/adjustment in the pending gap)", tk, ratio)
         lv = stock_levels.compute(pos["direction"], fill_bar["open"], pos.get("atr"),
                                   pos["archetype"], cfg,
                                   structure_stop=pos.get("structure_stop"))
@@ -292,7 +317,10 @@ def _advance_positions(conn, cfg: Config, run_ts: str, now_ms: int,
                                       entry=lv["entry"], stop=lv["stop"], t1=lv["t1"],
                                       t2=lv["t2"], entry_venue=venue,
                                       entry_bar_close=fill_bar["close"],
-                                      last_reprice_ts=now_ms)
+                                      last_reprice_ts=now_ms,
+                                      atr=pos.get("atr"),
+                                      structure_stop=pos.get("structure_stop"))
+        just_filled.add(pos["id"])
         to_reprice.append(({**pos, "status": "OPEN", "filled_ts": fill_bar["ts"],
                             "entry": lv["entry"], "stop": lv["stop"], "t1": lv["t1"],
                             "t2": lv["t2"], "entry_venue": venue,
@@ -300,6 +328,8 @@ def _advance_positions(conn, cfg: Config, run_ts: str, now_ms: int,
 
     # -- open: venue-pinned bars for repricing --
     for pos in stock_store.open_positions(conn):
+        if pos["id"] in just_filled:
+            continue   # already queued by the fill pass above (now status OPEN in DB)
         run_bars = bars_by_ticker.get(pos["ticker"])
         if not run_bars:
             continue
@@ -498,12 +528,15 @@ def run(cfg: Config, *, dry_run: bool = False, limit: int | None = None,
             has_open = stock_store.has_open_position(conn, c.ticker, c.archetype)
             if cooled and not has_open:
                 if not dry_run:
+                    # entry_bar_close = the SIGNAL bar's close: the anchor the fill
+                    # pass uses to detect a split during the pending gap.
                     stock_store.insert_position(
                         conn, ticker=c.ticker, opened_run_ts=run_ts, opened_ts=feat["last_ts"],
                         direction=c.direction, archetype=c.archetype, confidence=conf["prob"],
                         entry=lv["entry"], stop=lv["stop"], t1=lv["t1"], t2=lv["t2"], atr=lv["atr"],
                         time_stop_days=lv["time_stop_days"], status="PENDING",
-                        structure_stop=structure, entry_venue=src_by_ticker.get(c.ticker))
+                        structure_stop=structure, entry_venue=src_by_ticker.get(c.ticker),
+                        entry_bar_close=feat["price"])
                 to_alert.append({"sig": sig, "detail": detail, "ts": feat["last_ts"]})
 
     # --- Advance existing positions (the forward-test) ---
@@ -581,7 +614,13 @@ def _maybe_alert(conn, cfg: Config, to_alert: list[dict], now, dry_run: bool) ->
         return [f"{a['sig']['ticker']}/{a['sig']['archetype']}" for a in to_alert]
     ok = notify.send(cfg, title, body)
     # The alert row is written EITHER way (sent=0 on failure) so a failed send is
-    # retried exactly once next run; only a sent=1 row arms the cooldown.
+    # retried exactly once next run; only a sent=1 row arms the cooldown. With NO
+    # transport configured (documented empty-.env mode) the row itself is the
+    # canonical "we alerted" record: arm the cooldown off creation, or the dead
+    # retry loop leaves stock_cooldown_days permanently unarmed and the tracker
+    # re-opens the same ticker/archetype the day after every close. A send FAILURE
+    # with a configured transport still stays unarmed (retry semantics unchanged).
+    armed = ok or not notify.has_transport(cfg)
     fired = []
     for a in to_alert:
         s = a["sig"]
@@ -589,10 +628,10 @@ def _maybe_alert(conn, cfg: Config, to_alert: list[dict], now, dry_run: bool) ->
             conn, ts=a["ts"], created_at=now.isoformat(), ticker=s["ticker"],
             archetype=s["archetype"], direction=s["direction"], entry=s["entry"],
             stop=s["stop"], t1=s["t1"], t2=s["t2"], confidence=s["confidence"],
-            message=body, sent=ok)
+            message=body, sent=armed)
         if ok:
             fired.append(f"{s['ticker']}/{s['archetype']}")
-    if not ok:
+    if not ok and notify.has_transport(cfg):
         log.warning("stock alert send failed; queued %d alerts for one retry next run",
                     len(to_alert))
     return fired

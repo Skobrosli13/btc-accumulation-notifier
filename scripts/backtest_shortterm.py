@@ -3,7 +3,10 @@
 This walks the closed-candle history and REPLAYS THE LIVE ALERT PATH
 (``app/collect_once.run``): regime suppression + the confluence gate + per-(key,
 timeframe) cooldown / same-candle dedup, recomputing indicators on the same
-~300-candle window the collector uses. It then reports per-trigger win-rates for
+~300-candle window the collector uses. (One residual gap: the replay's composite
+state has no funding component while live's does, so is_counter_trend gating of
+lone triggers can differ marginally from production — see
+``st_validation.replay_alerts``.) It then reports per-trigger win-rates for
 the ALERTED population (what the user actually receives) with a Wilson 95% CI and
 the unconditional base rate, and — clearly labeled — the RAW (pre-gate) numbers
 the old script reported, so the inflation is visible.
@@ -19,8 +22,9 @@ of edge. Triggers are chosen by economic logic, not curve-fit — but the trigge
 THRESHOLDS and the confluence gate were reactions to this same history, so the
 full-sample tables are in-sample by construction. The output therefore also splits
 at 2024-01-01: only the HOLDOUT table (2024+) could ever support an edge claim.
-Per-horizon cells are computed over de-correlated EPISODES (same-key fires within
-the horizon collapsed to the first) so overlapping forward windows don't inflate n.
+Per-horizon cells are computed over de-correlated EPISODES (a same-key fire
+starting fewer than ``horizon`` bars after the last KEPT episode is collapsed into
+it — st_validation.collapse_episodes) so overlapping forward windows don't inflate n.
 """
 from __future__ import annotations
 

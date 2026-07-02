@@ -72,7 +72,12 @@ def base_rate(archetype: str, winrates: dict | None) -> dict:
     if rec is None:
         return {**prior, "n": 0, "live_confirmed": False}
     n = int(rec["n"])
-    is_live = (winrates or {}).get("source") == "live"
+    # Per-cell tag first: a merged artifact ("live+seed") promotes archetypes
+    # individually, so one live-confirmed cell must not depend on every other
+    # archetype having crossed the threshold too. Top-level source stays as the
+    # legacy fallback for artifacts that predate per-cell tags.
+    is_live = (rec.get("source") == "live"
+               or (winrates or {}).get("source") == "live")
     # Shrink the empirical rates toward the prior with a pseudo-count so a handful
     # of trades can't swing the number around (Bayesian-ish smoothing). Expectancy
     # gets the SAME shrinkage — it is the noisier statistic (unbounded, fat-tailed

@@ -130,6 +130,40 @@ def test_playbook_endpoint(client):
     assert "playbook" in j and "what_to_do" in j and "tier" in j
 
 
+def test_lt_breakdown_prefers_run_cycle_ath():
+    # The cycle panel must derive ath date/price from the SAME ATH the run's
+    # multiplier used (readings["cycle_ath"], incl. the stored-history override),
+    # not the venue-window price_struct sitting next to it.
+    from datetime import date
+    cfg = make_config()
+    latest = {"readings": {
+        "cycle_multiplier": 1.01,
+        "cycle_ath": {"date": "2025-12-01", "price": 130000.0, "source": "stored"},
+        "price_struct": {"ath_date": "2025-10-06", "ath_price": 126000.0},
+    }}
+    cyc = api._lt_breakdown(latest, cfg)["cycle"]
+    assert cyc["ath_date"] == "2025-12-01"
+    assert cyc["ath_price"] == 130000.0
+    assert cyc["ath_source"] == "stored"
+    assert cyc["days_since_ath"] == (datetime.now(timezone.utc).date()
+                                     - date(2025, 12, 1)).days
+
+
+def test_lt_breakdown_cycle_ath_fallbacks():
+    cfg = make_config()
+    # pre-migration run (no cycle_ath persisted): the venue price_struct feeds it
+    latest = {"readings": {
+        "price_struct": {"ath_date": "2025-10-06", "ath_price": 126000.0}}}
+    cyc = api._lt_breakdown(latest, cfg)["cycle"]
+    assert cyc["ath_date"] == "2025-10-06"
+    assert cyc["ath_price"] == 126000.0
+    assert cyc["ath_source"] == "venue"
+    # nothing at all: config date
+    cyc2 = api._lt_breakdown({"readings": {}}, cfg)["cycle"]
+    assert cyc2["ath_date"] == cfg.ath_date.isoformat()
+    assert cyc2["ath_source"] == "config"
+
+
 def test_trigger_stats_unmeasured_marker():
     wr = {"ema_cross_bull": {"n": 124, "win_rate": 0.508}}
     assert api._trigger_stats(wr, "ema_cross_bull")["n"] == 124
@@ -172,8 +206,10 @@ def test_live_performance_contract(tmp_path):
     assert set(lt) == {"horizons", "window"}
     h30 = lt["horizons"]["30"]
     assert {"n_runs", "n_signal", "signal_hit_rate", "base_rate",
-            "episodes", "episode_hit_rate", "ci"} <= set(h30)
+            "episodes", "episode_hit_rate",
+            "episodes_effective", "episode_hit_rate_effective", "ci"} <= set(h30)
     assert h30["n_signal"] == 1 and h30["episodes"] == 1
+    assert h30["episodes_effective"] == 1     # spaced (honest) n passed through
     assert lt["window"]["from"] == run_iso
 
     st = j["short_term"]

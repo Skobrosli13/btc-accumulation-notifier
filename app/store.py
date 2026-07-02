@@ -273,6 +273,17 @@ def record_run(conn: sqlite3.Connection, *, run_ts: str, price: float | None,
 
 # --- Time-series capture (candles, derivs) -----------------------------------
 
+# Venue priority for the candle-upsert guard (higher = more trusted; matches the
+# fetch fallback order OKX -> Kraken -> Coinbase). Unknown/None sources rank 0.
+SOURCE_PRIORITY = {"okx": 3, "kraken": 2, "coinbase": 1}
+
+# SQL expression giving the STORED row's priority (NULL/unknown sources -> 0).
+_SOURCE_PRIORITY_CASE = ("CASE candles.source "
+                         + " ".join(f"WHEN '{s}' THEN {p}"
+                                    for s, p in SOURCE_PRIORITY.items())
+                         + " ELSE 0 END")
+
+
 def upsert_candles(conn: sqlite3.Connection, timeframe: str,
                    rows: list[tuple[int, float, float, float, float, float]],
                    source: str | None = None) -> None:
@@ -283,25 +294,32 @@ def upsert_candles(conn: sqlite3.Connection, timeframe: str,
     distinguishable downstream — recomputes that span a venue switch produce
     garbage volume-spike triggers and a price/volume seam in the chart.
 
-    An existing (timeframe, ts) row is never overwritten by a row from a
-    DIFFERENT source: stored candles are the price basis matured forward-test
-    outcomes are scored against, so a one-run venue fallback must not
-    retroactively rewrite history (and flip already-recorded win/losses).
-    Same-source re-upserts (the still-forming candle) still update, and rows
-    predating the ``source`` column (NULL) adopt the first sourced write.
+    Venue-priority guard: an existing (timeframe, ts) row is overwritten only
+    when the incoming row's venue priority (``SOURCE_PRIORITY``; unknown/None
+    -> 0) is >= the stored row's. Consequences, by design:
+
+    * same-source re-upserts (the still-forming candle) always update;
+    * NULL-source legacy rows (pre-migration) adopt any sourced write;
+    * the primary venue SELF-HEALS a partial/forming candle a fallback venue
+      created during a primary outage (OKX repairs Kraken/Coinbase rows) —
+      previously such a row was pinned forever and corrupted the never-pruned
+      1d forward-test price basis;
+    * a one-run fallback flap still can NOT retroactively rewrite
+      higher-priority history (and flip already-recorded win/losses).
     """
     if not rows:
         return
+    pri = SOURCE_PRIORITY.get(source, 0)
     conn.executemany(
-        """
+        f"""
         INSERT INTO candles (timeframe, ts, open, high, low, close, volume, source)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(timeframe, ts) DO UPDATE SET
           open = excluded.open, high = excluded.high, low = excluded.low,
           close = excluded.close, volume = excluded.volume, source = excluded.source
-        WHERE candles.source IS excluded.source OR candles.source IS NULL
+        WHERE ? >= {_SOURCE_PRIORITY_CASE}
         """,
-        [(timeframe, *r, source) for r in rows],
+        [(timeframe, *r, source, pri) for r in rows],
     )
     conn.commit()
 
@@ -681,28 +699,35 @@ def set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
 
 
 def try_acquire_lock(conn: sqlite3.Connection, key: str, now_ts: float,
-                     ttl_seconds: float) -> bool:
-    """Atomically claim a named single-instance lock in ``meta``. Returns True
-    when this caller now holds it.
+                     ttl_seconds: float) -> str | None:
+    """Atomically claim a named single-instance lock in ``meta``. Returns an
+    ownership TOKEN (the claim's stored value) when this caller now holds it,
+    None when another invocation does.
 
     Guards against overlapping cron invocations (a hung run interleaving writes
     and duplicate sends with the next one). The stored value is the claim's
     epoch-seconds timestamp; a claim older than ``ttl_seconds`` is treated as a
     crashed holder and stolen, so there is no stale lockfile to clean up.
-    Atomic because the single UPSERT runs under SQLite's writer lock."""
+    Atomic because the single UPSERT runs under SQLite's writer lock. The token
+    must be passed back to ``release_lock`` so a slow (not crashed) holder that
+    was stolen from can never release the NEW holder's claim."""
+    token = repr(float(now_ts))
     cur = conn.execute(
         "INSERT INTO meta (key, value) VALUES (?, ?) "
         "ON CONFLICT(key) DO UPDATE SET value = excluded.value "
         "WHERE ? - CAST(meta.value AS REAL) > ?",
-        (key, repr(float(now_ts)), float(now_ts), float(ttl_seconds)),
+        (key, token, float(now_ts), float(ttl_seconds)),
     )
     conn.commit()
-    return cur.rowcount > 0
+    return token if cur.rowcount > 0 else None
 
 
-def release_lock(conn: sqlite3.Connection, key: str) -> None:
-    """Release a lock taken with ``try_acquire_lock``. Idempotent."""
-    conn.execute("DELETE FROM meta WHERE key = ?", (key,))
+def release_lock(conn: sqlite3.Connection, key: str, token: str) -> None:
+    """Release a lock taken with ``try_acquire_lock``. Ownership-checked: the
+    row is deleted only while it still holds OUR claim ``token``, so an over-TTL
+    holder whose lock was stolen cannot free the current holder's claim (which
+    would let a third invocation overlap the second). Idempotent."""
+    conn.execute("DELETE FROM meta WHERE key = ? AND value = ?", (key, token))
     conn.commit()
 
 

@@ -128,7 +128,7 @@ CREATE TABLE IF NOT EXISTS stock_positions (
   realized_r    REAL,             -- NET (exit-entry)/risk minus costs, signed by direction
   gross_r       REAL,             -- realized R before costs
   cost_r        REAL,             -- round-trip cost charged, in R
-  exit_reason   TEXT,             -- stop | t1 | t2 | time | reversal | rebased | unfilled
+  exit_reason   TEXT,             -- stop | t1 | t2 | time | reversal | rebased | unfilled | data_gap
   mfe_r         REAL,             -- max favorable excursion in R (running)
   mae_r         REAL,             -- max adverse excursion in R (running)
   filled_ts     INTEGER,          -- ENTRY bar ts (the bar whose open filled the position)
@@ -490,19 +490,25 @@ def insert_position(conn: sqlite3.Connection, *, ticker: str, opened_run_ts: str
                     entry: float, stop: float, t1: float, t2: float, atr: float,
                     time_stop_days: int, status: str = "OPEN",
                     structure_stop: float | None = None,
-                    entry_venue: str | None = None) -> int:
+                    entry_venue: str | None = None,
+                    entry_bar_close: float | None = None) -> int:
     """``status='PENDING'`` inserts an unfilled setup: levels are provisional (the
-    signal close) until the next run fills at the following bar's open."""
+    signal close) until the next run fills at the following bar's open.
+
+    ``entry_bar_close`` on a PENDING row is the SIGNAL bar's close — the anchor
+    the fill pass uses to detect a split/adjustment during the pending gap. The
+    fill overwrites it with the FILL bar's close (the reprice-side re-base anchor)."""
     cur = conn.execute(
         """
         INSERT INTO stock_positions
           (ticker, opened_run_ts, opened_ts, direction, archetype, confidence,
            entry, stop, t1, t2, atr, time_stop_days, status, mfe_r, mae_r,
-           structure_stop, entry_venue)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?)
+           structure_stop, entry_venue, entry_bar_close)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?)
         """,
         (ticker, opened_run_ts, opened_ts, direction, archetype, confidence,
-         entry, stop, t1, t2, atr, time_stop_days, status, structure_stop, entry_venue),
+         entry, stop, t1, t2, atr, time_stop_days, status, structure_stop, entry_venue,
+         entry_bar_close),
     )
     conn.commit()
     return int(cur.lastrowid)
@@ -531,27 +537,36 @@ def has_open_position(conn: sqlite3.Connection, ticker: str, archetype: str) -> 
 
 def fill_position(conn: sqlite3.Connection, pos_id: int, *, filled_ts: int, entry: float,
                   stop: float, t1: float, t2: float, entry_venue: str | None,
-                  entry_bar_close: float, last_reprice_ts: int) -> None:
-    """PENDING -> OPEN at the next bar's open; levels are recomputed at the fill."""
+                  entry_bar_close: float, last_reprice_ts: int,
+                  atr: float | None = None,
+                  structure_stop: float | None = None) -> None:
+    """PENDING -> OPEN at the next bar's open; levels are recomputed at the fill.
+
+    ``atr``/``structure_stop`` persist the (possibly re-based) signal-time frame the
+    levels were computed from — a split during the pending gap re-expresses both in
+    the fill bar's units; ``None`` keeps the stored value (no re-base detected)."""
     conn.execute(
         """
         UPDATE stock_positions SET status='OPEN', filled_ts=?, entry=?, stop=?, t1=?, t2=?,
-          entry_venue=?, entry_bar_close=?, last_reprice_ts=?
+          entry_venue=?, entry_bar_close=?, last_reprice_ts=?,
+          atr=COALESCE(?, atr), structure_stop=COALESCE(?, structure_stop)
         WHERE id=?
         """,
         (filled_ts, entry, stop, t1, t2, entry_venue, entry_bar_close,
-         last_reprice_ts, pos_id),
+         last_reprice_ts, atr, structure_stop, pos_id),
     )
     conn.commit()
 
 
 def expire_position(conn: sqlite3.Connection, pos_id: int, *, closed_run_ts: str,
-                    closed_ts: int) -> None:
-    """A PENDING setup that never filled — never entered, never part of the record."""
+                    closed_ts: int, reason: str = "unfilled") -> None:
+    """A PENDING setup that never filled — never entered, never part of the record.
+    ``reason``: 'unfilled' (no bar arrived in the window) or 'data_gap' (the signal
+    bar vanished from the fill-run series, so the price basis is unverifiable)."""
     conn.execute(
         "UPDATE stock_positions SET status='EXPIRED', closed_run_ts=?, closed_ts=?, "
-        "exit_reason='unfilled' WHERE id=?",
-        (closed_run_ts, closed_ts, pos_id),
+        "exit_reason=? WHERE id=?",
+        (closed_run_ts, closed_ts, reason, pos_id),
     )
     conn.commit()
 

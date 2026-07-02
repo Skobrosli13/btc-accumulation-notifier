@@ -155,7 +155,7 @@ def test_collect_once_overlap_lock_skips(tmp_path, monkeypatch):
     store.init_db(conn)
     now_ts = datetime.now(timezone.utc).timestamp()
     assert store.try_acquire_lock(conn, collect_once._LOCK_KEY, now_ts,
-                                  collect_once._LOCK_TTL_S) is True
+                                  collect_once._LOCK_TTL_S) is not None
     conn.close()
     # any fetch would mean the lock failed to short-circuit
     monkeypatch.setattr(collect_once.price, "get_intraday_frames",

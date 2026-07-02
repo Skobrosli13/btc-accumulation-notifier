@@ -8,9 +8,13 @@ Honest-sample-size rules (mirrors scripts/calibrate.py):
 
 * Long-term runs are a 6h cadence, so consecutive signal runs share almost all
   of their forward window — one multi-week ACCUMULATE stretch is one market
-  outcome, not 80 samples. Consecutive same-tier signal runs therefore collapse
-  into EPISODES (sampled at the episode's first run) with a 90% bootstrap CI;
-  the raw run-level counts are still served, but the episode counts are the
+  outcome, not 80 samples. Each CONTIGUOUS stretch of signal-tier runs
+  (regardless of ACCUMULATE<->DEEP_VALUE steps inside it) therefore collapses
+  into ONE episode, sampled at its first run — the same collapse rule as
+  scripts/calibrate.py. Even episodes overlap at the longer horizons, so the
+  90% bootstrap CI is computed over the SPACED subset (episode starts >= the
+  horizon apart, mirroring calibrate._spaced) served as episodes_effective;
+  the raw run/episode counts are still served, but episodes_effective is the
   honest n.
 * Swing alerts are recorded one row per trigger per timeframe per batch, so a
   single market event is deduped to one sample per (direction, candle ts); the
@@ -68,6 +72,22 @@ def _iso_ms(iso: str | None) -> int | None:
         return None
 
 
+def _spaced(starts: list[int], ts_ms: list[int], h_days: int) -> list[int]:
+    """Greedy subset of episode-start indices whose timestamps are >= ``h_days``
+    apart (each compared against the last KEPT start), so the CI sample's
+    forward windows do NOT overlap — mirrors scripts/calibrate.py::_spaced.
+    Adjacent overlapping windows i.i.d.-resampled would overstate the evidence;
+    this small subset is the honest per-horizon sample."""
+    kept: list[int] = []
+    last: int | None = None
+    h_ms = h_days * _DAY_MS
+    for i in starts:
+        if last is None or ts_ms[i] - last >= h_ms:
+            kept.append(i)
+            last = ts_ms[i]
+    return kept
+
+
 def long_term_performance(runs: list[dict], candles: list[dict],
                           horizons_days=(30, 90, 180)) -> dict:
     """Forward return of each long-term run, bucketed by whether it was a signal
@@ -76,10 +96,12 @@ def long_term_performance(runs: list[dict], candles: list[dict],
     runs: [{run_ts iso, price, tier}] asc; candles: [{ts ms, close}] asc. Only
     runs old enough to have an N-day-forward price count. Returns
     {"horizons": {"30": {n_runs, n_signal, signal_hit_rate, base_rate,
-    signal_avg_return, episodes, episode_hit_rate, ci}, ...},
-    "window": {from, to}} — episode counts (one per consecutive same-tier
-    signal stretch) with a bootstrap CI are the numbers to trust; the run-level
-    n overstates independent evidence by ~2 orders of magnitude at 6h cadence.
+    signal_avg_return, episodes, episode_hit_rate, episodes_effective,
+    episode_hit_rate_effective, ci}, ...}, "window": {from, to}} —
+    episodes_effective (episode starts spaced >= the horizon, the population
+    the ci is bootstrapped over) is the number to trust; the run-level n
+    overstates independent evidence by ~2 orders of magnitude at 6h cadence,
+    and even raw episode counts overlap at the longer horizons.
     """
     cc = [(c["ts"], c["close"]) for c in candles if c.get("close") is not None]
     last_ms = cc[-1][0] if cc else 0
@@ -91,13 +113,18 @@ def long_term_performance(runs: list[dict], candles: list[dict],
             continue
         parsed.append((t0, r.get("price"), r.get("tier"), r.get("run_ts")))
 
-    # Episode starts: a signal run whose predecessor was not the same signal tier.
+    # Episode starts: a signal run whose predecessor was NOT a signal run — one
+    # contiguous signal stretch is one episode regardless of tier steps inside
+    # it (an ACCUMULATE->DEEP_VALUE->ACCUMULATE wobble within a single dip is
+    # one market outcome, not three). Same collapse rule as scripts/calibrate.py.
     episode_starts: list[int] = []
-    prev_tier: str | None = None
+    in_episode = False
     for i, (_t0, _entry, tier_, _ts) in enumerate(parsed):
-        if tier_ in _SIGNAL_TIERS and tier_ != prev_tier:
+        is_signal = tier_ in _SIGNAL_TIERS
+        if is_signal and not in_episode:
             episode_starts.append(i)
-        prev_tier = tier_
+        in_episode = is_signal
+    ts_list = [p[0] for p in parsed]
 
     def _fwd_return(idx: int, h: int) -> float | None:
         t0, entry, _tier, _ts = parsed[idx]
@@ -126,6 +153,14 @@ def long_term_performance(runs: list[dict], candles: list[dict],
             ret = _fwd_return(i, h)
             if ret is not None:
                 ep_outcomes.append(1 if ret > 0 else 0)
+        # Non-overlapping subset: episode starts spaced >= the horizon apart
+        # (mirrors scripts/calibrate.py), so the bootstrap below never resamples
+        # near-duplicate forward windows as independent evidence.
+        eff_outcomes = []
+        for i in _spaced(episode_starts, ts_list, h):
+            ret = _fwd_return(i, h)
+            if ret is not None:
+                eff_outcomes.append(1 if ret > 0 else 0)
         horizons[str(h)] = {
             "n_runs": len(allr),
             "n_signal": len(sig),
@@ -135,7 +170,11 @@ def long_term_performance(runs: list[dict], candles: list[dict],
             "episodes": len(ep_outcomes),
             "episode_hit_rate": (round(sum(ep_outcomes) / len(ep_outcomes), 3)
                                  if ep_outcomes else None),
-            "ci": _bootstrap_ci(ep_outcomes),
+            "episodes_effective": len(eff_outcomes),
+            "episode_hit_rate_effective": (round(sum(eff_outcomes) / len(eff_outcomes), 3)
+                                           if eff_outcomes else None),
+            # 90% bootstrap CI over the NON-OVERLAPPING (spaced) episode outcomes.
+            "ci": _bootstrap_ci(eff_outcomes),
         }
     return {
         "horizons": horizons,

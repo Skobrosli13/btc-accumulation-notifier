@@ -1,8 +1,10 @@
 """Shared, network-free validation logic for the short-term swing backtests.
 
 Both ``scripts/backtest_shortterm.py`` and ``scripts/st_calibrate.py`` import
-from here so they measure EXACTLY what the live collector (``app/collect_once``)
-does. Everything in this module is pure (no I/O) and works on plain pandas
+from here so they measure what the live collector (``app/collect_once``) does —
+gate-for-gate, with one residual gap: the replay's composite state carries no
+funding component (see ``replay_alerts``), so is_counter_trend gating can differ
+marginally from live. Everything in this module is pure (no I/O) and works on plain pandas
 frames + python lists, so ``tests/test_st_calibrate.py`` exercises it over
 synthetic data with no network.
 
@@ -200,12 +202,18 @@ def replay_alerts(df, cfg: Config, timeframe: str, *,
                                dirs.count(direction), regime_aligned, is_counter_trend)
       3. cooldown / same-candle dedup per (trigger_key, timeframe)
 
-    The replay detects CANDLE triggers only (no funding/OI/flow inputs) — which is
-    also the live confluence population: collect_once counts only candle triggers
-    toward the direction count (funding_spike_*/oi_surge_*/flow triggers are
-    context, excluded from the gate), so the alerted set here matches production.
-    Those non-candle trigger TYPES are not measured here at all; st_calibrate lists
-    them under ``unmeasured_keys``.
+    The replay detects CANDLE triggers only (no funding/OI/flow inputs). The
+    confluence COUNT matches production exactly: collect_once counts only candle
+    triggers toward the direction count (funding_spike_*/oi_surge_*/flow triggers
+    are context, excluded from the gate). One RESIDUAL divergence remains: live
+    computes the composite state via ``shortterm.evaluate(..., funding=...)``,
+    whose st_composite includes a funding component this replay never sees (no
+    historical funding series). Near the st_state band edges that component can
+    flip ``alerting.is_counter_trend`` and thereby admit/suppress a LONE
+    regime-aligned trigger through the confluence gate differently than live —
+    so the alerted set here matches production only up to that funding-state
+    margin, not exactly. Those non-candle trigger TYPES are not measured here at
+    all; st_calibrate lists them under ``unmeasured_keys``.
 
     Cooldown 'now' is the candle's own close time (open_time + one timeframe), which
     is when the collector would have evaluated it — deterministic and network-free.
@@ -241,6 +249,10 @@ def replay_alerts(df, cfg: Config, timeframe: str, *,
         now_ms = candle_ts + tf_ms  # collector evaluates after the candle closes
         eval_ts = closed["open_time"].iloc[i] + pd.Timedelta(milliseconds=tf_ms)
         regime = _regime_at(regime_series, eval_ts) if regime_series is not None else "unknown"
+        # Deliberately funding-less: live st_composite gets a funding component via
+        # shortterm.evaluate(..., funding=...) that this replay has no history for.
+        # This state feeds is_counter_trend below — the residual-parity caveat in
+        # the docstring (and in st_winrates.json's caveats) documents the skew.
         score, _ = shortterm.st_composite(window, cfg)
         state = shortterm.st_state(score, cfg)
         dirs = [t.direction for t in triggers]
@@ -265,8 +277,17 @@ def replay_alerts(df, cfg: Config, timeframe: str, *,
 
 
 def collapse_episodes(events: list[AlertEvent], gap_bars: int) -> list[AlertEvent]:
-    """Collapse consecutive same-direction same-key fires within ``gap_bars`` into
-    one episode (keep the first), the way calibrate.py collapses signal runs.
+    """Collapse same-key same-direction fires into de-correlated episodes: keep an
+    event only when it starts >= ``gap_bars`` after the last KEPT event of that
+    key — the same semantics as ``scripts.calibrate._spaced`` (compare against the
+    last kept episode, inclusive ``>=``, so two fires exactly one forward horizon
+    apart have disjoint close-to-close windows and both count).
+
+    Comparing against the last kept event (NOT the last seen one) matters: a slow
+    drip of fires every k < gap_bars bars must still open a new episode once the
+    distance from the last kept fire reaches the horizon — chaining last_idx across
+    dropped events would collapse arbitrarily long spans of independent forward
+    windows into a single episode and understate n.
 
     Overlapping forward windows are autocorrelated, so counting every fire inflates
     the effective sample size and tightens the CI dishonestly. After cooldown the
@@ -279,11 +300,11 @@ def collapse_episodes(events: list[AlertEvent], gap_bars: int) -> list[AlertEven
     kept: list[AlertEvent] = []
     for evs in by_key.values():
         evs = sorted(evs, key=lambda e: e.index)
-        last_idx = None
+        last_kept = None
         for e in evs:
-            if last_idx is None or (e.index - last_idx) > gap_bars:
+            if last_kept is None or (e.index - last_kept) >= gap_bars:
                 kept.append(e)
-            last_idx = e.index
+                last_kept = e.index
     return sorted(kept, key=lambda e: e.index)
 
 

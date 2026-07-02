@@ -125,8 +125,8 @@ def test_prune_keeps_1d_and_st_signals_drops_intraday(conn):
 
 def test_upsert_candles_source_guard(conn):
     store.upsert_candles(conn, "1d", [(_ms(1), 1, 1, 1, 100.0, 10)], source="okx")
-    # a fallback-venue batch must NOT rewrite an existing row (price basis of
-    # matured forward-test outcomes)
+    # a LOWER-priority fallback batch must NOT rewrite an existing row (price
+    # basis of matured forward-test outcomes)
     store.upsert_candles(conn, "1d", [(_ms(1), 1, 1, 1, 90.0, 99)], source="kraken")
     row = store.recent_candles(conn, "1d")[0]
     assert row["close"] == pytest.approx(100.0) and row["source"] == "okx"
@@ -137,6 +137,31 @@ def test_upsert_candles_source_guard(conn):
     store.upsert_candles(conn, "1d", [(_ms(2), 1, 1, 1, 50.0, 1)])
     store.upsert_candles(conn, "1d", [(_ms(2), 1, 1, 1, 55.0, 1)], source="okx")
     assert store.recent_candles(conn, "1d")[-1]["close"] == pytest.approx(55.0)
+
+
+def test_upsert_candles_priority_self_heals_fallback_rows(conn):
+    # OKX down at the first collect after a period opens: kraken CREATES the
+    # row with a partial forming candle...
+    store.upsert_candles(conn, "1d", [(_ms(1), 1, 1, 1, 50.0, 0.5)], source="kraken")
+    # ...and the recovered primary venue must REPAIR it (priority okx >= kraken),
+    # not be pinned out forever by a same-source-only guard.
+    store.upsert_candles(conn, "1d", [(_ms(1), 1, 2, 0.5, 75.0, 20.0)], source="okx")
+    row = store.recent_candles(conn, "1d")[0]
+    assert row["close"] == pytest.approx(75.0) and row["source"] == "okx"
+    assert row["volume"] == pytest.approx(20.0)
+    # the repaired row is now okx history: a later kraken flap can't rewrite it
+    store.upsert_candles(conn, "1d", [(_ms(1), 1, 1, 1, 60.0, 1)], source="kraken")
+    assert store.recent_candles(conn, "1d")[0]["close"] == pytest.approx(75.0)
+    # priority ladder holds further down: kraken repairs coinbase, not vice versa
+    store.upsert_candles(conn, "1d", [(_ms(2), 1, 1, 1, 10.0, 1)], source="coinbase")
+    store.upsert_candles(conn, "1d", [(_ms(2), 1, 1, 1, 12.0, 1)], source="kraken")
+    row2 = store.recent_candles(conn, "1d")[-1]
+    assert row2["close"] == pytest.approx(12.0) and row2["source"] == "kraken"
+    store.upsert_candles(conn, "1d", [(_ms(2), 1, 1, 1, 11.0, 1)], source="coinbase")
+    assert store.recent_candles(conn, "1d")[-1]["close"] == pytest.approx(12.0)
+    # an UNKNOWN/None source ranks 0: it can never overwrite a ranked row
+    store.upsert_candles(conn, "1d", [(_ms(2), 1, 1, 1, 9.0, 1)])
+    assert store.recent_candles(conn, "1d")[-1]["close"] == pytest.approx(12.0)
 
 
 def test_candles_since_and_alerts_since(conn):
@@ -162,14 +187,20 @@ def test_candle_ath(conn):
 
 
 def test_overlap_lock(conn):
-    assert store.try_acquire_lock(conn, "L", 1000.0, ttl_seconds=600) is True
+    tok1 = store.try_acquire_lock(conn, "L", 1000.0, ttl_seconds=600)
+    assert tok1 is not None
     # a second claimant within the TTL is refused
-    assert store.try_acquire_lock(conn, "L", 1100.0, ttl_seconds=600) is False
+    assert store.try_acquire_lock(conn, "L", 1100.0, ttl_seconds=600) is None
     # a crashed holder's claim is stolen once the TTL expires
-    assert store.try_acquire_lock(conn, "L", 1601.5, ttl_seconds=600) is True
-    # release frees it immediately
-    store.release_lock(conn, "L")
-    assert store.try_acquire_lock(conn, "L", 1602.0, ttl_seconds=600) is True
+    tok2 = store.try_acquire_lock(conn, "L", 1601.5, ttl_seconds=600)
+    assert tok2 is not None and tok2 != tok1
+    # the STOLEN-FROM holder finishing late must NOT free the new holder's
+    # claim (that would let a third invocation overlap the second)
+    store.release_lock(conn, "L", tok1)
+    assert store.try_acquire_lock(conn, "L", 1602.0, ttl_seconds=600) is None
+    # the current owner's release frees it immediately
+    store.release_lock(conn, "L", tok2)
+    assert store.try_acquire_lock(conn, "L", 1603.0, ttl_seconds=600) is not None
 
 
 def test_recent_run_readings(conn):

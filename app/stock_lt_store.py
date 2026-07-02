@@ -60,7 +60,10 @@ CREATE TABLE IF NOT EXISTS stock_lt_holdings (
   spy_exit      REAL,
   excess_return REAL,              -- (name % change) - (SPY % change) over the hold
   exit_reason   TEXT,              -- dropped_by_conviction | data_gap
-  entry_ts      INTEGER            -- bar ts of the entry close (split re-base anchor)
+  entry_ts      INTEGER,           -- bar ts of the entry close (split re-base anchor)
+  entry_close   REAL               -- entry bar's close, ROLLED to the venue's current
+                                   -- basis each run while the bar is in retention
+                                   -- (survives the ~500-day stock_prices prune)
 );
 CREATE INDEX IF NOT EXISTS ix_stock_lt_holdings_status ON stock_lt_holdings(status, ticker);
 """
@@ -70,6 +73,7 @@ def init_stock_lt_db(conn: sqlite3.Connection) -> None:
     conn.executescript(_SCHEMA)
     _add_column_if_missing(conn, "stock_lt_holdings", "exit_reason", "TEXT")
     _add_column_if_missing(conn, "stock_lt_holdings", "entry_ts", "INTEGER")
+    _add_column_if_missing(conn, "stock_lt_holdings", "entry_close", "REAL")
     conn.commit()
 
 
@@ -187,12 +191,22 @@ def open_lt_holdings(conn: sqlite3.Connection) -> list[dict]:
 
 def open_lt_holding(conn: sqlite3.Connection, *, ticker: str, opened_run_ts: str, opened_ts: int,
                     entry: float, spy_entry: float, conviction: float,
-                    entry_ts: int | None = None) -> None:
+                    entry_ts: int | None = None,
+                    entry_close: float | None = None) -> None:
     conn.execute(
         "INSERT INTO stock_lt_holdings (ticker, opened_run_ts, opened_ts, entry, spy_entry, "
-        "conviction, status, entry_ts) VALUES (?, ?, ?, ?, ?, ?, 'OPEN', ?)",
-        (ticker, opened_run_ts, opened_ts, entry, spy_entry, conviction, entry_ts),
+        "conviction, status, entry_ts, entry_close) VALUES (?, ?, ?, ?, ?, ?, 'OPEN', ?, ?)",
+        (ticker, opened_run_ts, opened_ts, entry, spy_entry, conviction, entry_ts, entry_close),
     )
+    conn.commit()
+
+
+def update_lt_entry_close(conn: sqlite3.Connection, hid: int, entry_close: float) -> None:
+    """Roll the split-guard anchor forward: the entry bar's close on the venue's
+    CURRENT adjustment basis, refreshed each run while the bar is still stored so
+    the anchor outlives the ~500-day stock_prices prune."""
+    conn.execute("UPDATE stock_lt_holdings SET entry_close = ? WHERE id = ?",
+                 (entry_close, hid))
     conn.commit()
 
 
