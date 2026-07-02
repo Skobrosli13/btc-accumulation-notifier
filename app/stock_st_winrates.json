@@ -1,22 +1,66 @@
 {
-  "generated_at": "2026-07-01T03:52:39.313672+00:00",
+  "generated_at": "2026-07-02T21:11:10.400240+00:00",
   "source": "backtest",
-  "note": "In-sample walk-forward seed (survivorship-biased).",
-  "archetypes": {
-    "momentum": {
-      "n": 1010,
-      "win_rate": 0.494,
-      "expectancy_r": 0.099
-    },
+  "n_tickers": 533,
+  "note": "In-sample cross-sectional seed (survivorship-biased); measures the SURFACED population (rank -> priority -> sample-scaled top-N -> cooldown), context fixed at 0.",
+  "method": "cross-sectional replay of the live selection (rank -> expectancy-weighted priority -> top-N -> cooldown) with the top-N scaled by sample fraction (top_n_eff = max(1, round(stock_top_n * n_tickers / 536)) so a sampled universe keeps live selectivity), next-bar-open fills \u2014 entries whose next bar is >5 calendar days after the decision bar are skipped as unfilled (mirror of the live PENDING expiry; skips logged) \u2014 net of costs; PEAD aligned to announcement dates (quarter-end-dominated maps rejected; candidate window mirrors the live lookback+4d calendar fetch, with the shared trading-bar bars_since gate doing the eligibility cut); effective-n = n_months (distinct entry months; trades are serially correlated so raw n overstates the sample); dispersion = stdev of per-month mean R; baseline = random_entry control (same liquidity filter and per-archetype R-frames, uniformly sampled entry dates) with per-cell delta_* fields vs that baseline (trade-weighted, display only); significance is fully month-clustered on BOTH arms: delta of per-month mean R (archetype minus baseline) must exceed 2*SE with SE = sqrt(var(arch months)/n_a + var(base months)/n_b), >= 6 months on each arm, and a positive month-clustered win-rate delta",
+  "baseline": {
     "pead_drift": {
-      "n": 159,
-      "win_rate": 0.673,
-      "expectancy_r": 0.408
+      "n": 29348,
+      "win_rate": 0.488,
+      "expectancy_r": 0.013
+    },
+    "momentum": {
+      "n": 29198,
+      "win_rate": 0.482,
+      "expectancy_r": 0.021
     },
     "mean_reversion": {
-      "n": 24,
-      "win_rate": 0.625,
-      "expectancy_r": 0.257
+      "n": 29473,
+      "win_rate": 0.471,
+      "expectancy_r": -0.007
+    }
+  },
+  "archetypes": {
+    "momentum": {
+      "n": 2447,
+      "win_rate": 0.482,
+      "expectancy_r": 0.025,
+      "n_months": 57,
+      "expectancy_r_month_std": 0.35,
+      "baseline_n": 29198,
+      "baseline_win_rate": 0.482,
+      "baseline_expectancy_r": 0.021,
+      "delta_win_rate": 0.0,
+      "delta_expectancy_r": 0.004,
+      "not_significant": true
+    },
+    "mean_reversion": {
+      "n": 16,
+      "win_rate": 0.562,
+      "expectancy_r": 0.483,
+      "n_months": 3,
+      "expectancy_r_month_std": 0.232,
+      "baseline_n": 29473,
+      "baseline_win_rate": 0.471,
+      "baseline_expectancy_r": -0.007,
+      "delta_win_rate": 0.091,
+      "delta_expectancy_r": 0.49,
+      "not_significant": true
+    },
+    "pead_drift": {
+      "n": 14,
+      "win_rate": 0.429,
+      "expectancy_r": -0.038,
+      "n_months": 7,
+      "expectancy_r_month_std": 0.878,
+      "baseline_n": 29348,
+      "baseline_win_rate": 0.488,
+      "baseline_expectancy_r": 0.013,
+      "delta_win_rate": -0.059,
+      "delta_expectancy_r": -0.051,
+      "not_significant": true,
+      "alignment": "announcement_date"
     }
   }
 }

@@ -97,7 +97,8 @@ def _earnings_by_ts(ticker: str, cfg, years: float) -> dict[int, dict]:
     dark for the ticker rather than fabricating an edge."""
     if not cfg.finnhub_active:
         return {}
-    rows = earnings_src.surprise_history(ticker, cfg.finnhub_api_key, years=years)
+    rows = earnings_src.surprise_history(ticker, cfg.finnhub_api_key, years=years,
+                                         sec_user_agent=cfg.sec_user_agent)
     rows = [r for r in rows if r.get("surprise_pct") is not None]
     if not rows:
         return {}
