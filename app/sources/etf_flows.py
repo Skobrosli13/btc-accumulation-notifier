@@ -1,64 +1,26 @@
-"""US spot-BTC-ETF net flows (best-effort).
+"""US spot-BTC-ETF net flows (best-effort, free-only).
 
 Order of preference:
-  1. SoSoValue API  (if SOSOVALUE_API_KEY is set)
-  2. Farside scrape (https://farside.co.uk/btc/ — an HTML page, no clean API)
-  3. skip (return None)
+  1. Farside scrape (https://farside.co.uk/btc/ — an HTML page, no clean API)
+  2. skip (return None)
 
 Reading is the trailing ~30-day net flow in USD billions; persistent inflows
 during a drawdown are bullish. This indicator is the flakiest of the free set —
 it must never break the run, and silently degrades to None.
+
+(The paid SoSoValue path was removed in Phase 0 — BTC data is free-only by owner
+decision; the ``btc_etf_flow`` ALPHA study sources flows the same free way.)
 """
 from __future__ import annotations
 
 import logging
 
-from ._http import get_text, post_json
+from ._http import get_text
 
 log = logging.getLogger(__name__)
 
-# SoSoValue's historical-inflow chart is a POST endpoint (JSON body + api-key
-# header), NOT a GET with query params.
-SOSOVALUE_URL = "https://api.sosovalue.xyz/openapi/v2/etf/historicalInflowChart"
 FARSIDE_URL = "https://farside.co.uk/btc/"
 _TRAILING_DAYS = 30
-
-
-def _from_sosovalue(api_key: str) -> float | None:
-    """Best-effort SoSoValue call. Returns trailing net flow in $bn or None.
-
-    v2/etf/historicalInflowChart is a POST: JSON body ``{"type": "us-btc-spot"}``
-    and an ``x-soso-api-key`` header. Any failure returns None so we fall through
-    to the Farside scrape.
-    """
-    data = post_json(
-        SOSOVALUE_URL,
-        json_body={"type": "us-btc-spot"},
-        headers={"x-soso-api-key": api_key, "Content-Type": "application/json"},
-    )
-    if not data:
-        return None
-    try:
-        # API shape varies; accept a list of {date, totalNetInflow} under data/result.
-        rows = data.get("data") or data.get("result") or []
-        if isinstance(rows, dict):
-            rows = rows.get("list") or rows.get("data") or []
-        if not isinstance(rows, (list, tuple)):
-            return None
-        vals = []
-        for r in rows[-_TRAILING_DAYS:]:
-            if not isinstance(r, dict):
-                continue
-            v = r.get("totalNetInflow", r.get("netInflow"))
-            if v is not None:
-                vals.append(float(v))
-        if not vals:
-            return None
-        # SoSoValue reports USD; convert to $bn.
-        return sum(vals) / 1e9
-    except Exception as exc:  # noqa: BLE001 - never let a shape surprise break the run
-        log.info("SoSoValue parse failed (%s); falling back", exc)
-        return None
 
 
 def _from_farside() -> float | None:
@@ -127,13 +89,6 @@ def etf_flows() -> dict:
     (never raise) into run_once.gather_readings — matching onchain()/derivatives().
     """
     try:
-        from ..config import load_config
-
-        cfg = load_config()
-        if cfg.sosovalue_api_key:
-            val = _from_sosovalue(cfg.sosovalue_api_key)
-            if val is not None:
-                return {"etf_flow": val}
         return {"etf_flow": _from_farside()}
     except Exception as exc:  # noqa: BLE001 - fail soft; never break the long-term run
         log.warning("etf_flows() failed (%s); ETF flow reading skipped", exc)

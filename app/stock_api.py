@@ -85,7 +85,6 @@ def health(cfg: Config = Depends(_cfg), _=Depends(_require_token)) -> dict:
             "earnings_pead": cfg.finnhub_active,
             "insider": cfg.stock_insider_active,
             "shortvol": cfg.stock_shortvol_active,
-            "congress": False,  # retired: upstream house-stock-watcher mirror unmaintained
         },
         "layer_status": {}, "degraded_layers": [],
         "db_ok": False, "last_run": None, "run_age_hours": None, "stale": True,
@@ -113,7 +112,6 @@ def health(cfg: Config = Depends(_cfg), _=Depends(_require_token)) -> dict:
         active = {"prices": True, "earnings_pead": cfg.finnhub_active,
                   "insider": cfg.stock_insider_active, "shortvol": cfg.stock_shortvol_active}
         out["layer_status"] = {k: _layer_status(runs, k, v) for k, v in active.items()}
-        out["layer_status"]["congress"] = "retired"
         out["degraded_layers"] = [k for k, v in out["layer_status"].items() if v == "degraded"]
         # Open positions whose ticker hasn't repriced in ~5 trading days: a silent
         # per-name fetch failure freezes the forward-test without any other alarm.

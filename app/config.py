@@ -107,9 +107,7 @@ class Config:
 
     # Paid drop-ins (presence toggles the layer)
     glassnode_api_key: str | None
-    cryptoquant_api_key: str | None
     coinglass_api_key: str | None
-    sosovalue_api_key: str | None
 
     # Free on-chain default (bitcoin-data.com / BGeometrics) — on unless disabled.
     onchain_free_enabled: bool
@@ -176,7 +174,6 @@ class Config:
     sec_user_agent: str = "riverviewweb-signal stock tracker admin@riverviewweb.com"
     stock_insider_enabled: bool = True
     stock_shortvol_enabled: bool = True
-    stock_congress_enabled: bool = False
     stock_universe_path: str = "app/stock_universe.json"
     stock_top_n: int = 15
     stock_pead_lookback_days: int = 10
@@ -279,10 +276,6 @@ class Config:
     def stock_shortvol_active(self) -> bool:
         return self.stock_shortvol_enabled  # keyless
 
-    @property
-    def stock_congress_active(self) -> bool:
-        return self.stock_congress_enabled  # keyless (Phase 3 forward-test)
-
     def notifications_configured(self) -> bool:
         return bool(
             self.email_active
@@ -316,9 +309,7 @@ def load_config() -> Config:
         flow_oi_bar_surge_pct=_get_float("FLOW_OI_BAR_SURGE_PCT", 3.0),
         flow_liq_min_usd=_get_float("FLOW_LIQ_MIN_USD", 500_000.0),
         glassnode_api_key=_opt("GLASSNODE_API_KEY"),
-        cryptoquant_api_key=_opt("CRYPTOQUANT_API_KEY"),
         coinglass_api_key=_opt("COINGLASS_API_KEY"),
-        sosovalue_api_key=_opt("SOSOVALUE_API_KEY"),
         onchain_free_enabled=_get_bool("ONCHAIN_FREE", True),
         oi_flush_window_hours=_get_float("OI_FLUSH_WINDOW_HOURS", 24.0),
         exchange=_get("EXCHANGE", "okx").lower(),
@@ -367,7 +358,6 @@ def load_config() -> Config:
                             "riverviewweb-signal stock tracker admin@riverviewweb.com"),
         stock_insider_enabled=_get_bool("STOCK_INSIDER", True),
         stock_shortvol_enabled=_get_bool("STOCK_SHORTVOL", True),
-        stock_congress_enabled=_get_bool("STOCK_CONGRESS", False),
         stock_universe_path=_get("STOCK_UNIVERSE_PATH", "app/stock_universe.json"),
         stock_top_n=_get_int("STOCK_TOP_N", 15),
         stock_pead_lookback_days=_get_int("STOCK_PEAD_LOOKBACK_DAYS", 10),

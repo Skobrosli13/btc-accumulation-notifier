@@ -1,4 +1,8 @@
-"""ETF-flow source: Farside footer-row exclusion + SoSoValue POST + fail-soft."""
+"""ETF-flow source: Farside footer-row exclusion + fail-soft (free-only).
+
+The paid SoSoValue path was removed in Phase 0 (BTC data is free-only); the
+free Farside scrape is the sole source.
+"""
 from __future__ import annotations
 
 import pytest
@@ -49,51 +53,9 @@ def test_farside_none_when_no_html(monkeypatch):
     assert etf_flows._from_farside() is None
 
 
-def test_sosovalue_uses_post(monkeypatch):
-    captured = {}
-
-    def fake_post(url, json_body=None, params=None, headers=None, timeout=20):
-        captured["url"] = url
-        captured["json_body"] = json_body
-        captured["headers"] = headers
-        return {"data": [{"date": "2026-06-08", "totalNetInflow": 1_000_000_000.0}]}
-
-    monkeypatch.setattr(etf_flows, "post_json", fake_post)
-    val = etf_flows._from_sosovalue("sk-test")
-    assert val == pytest.approx(1.0)  # $1bn / 1e9
-    assert captured["json_body"] == {"type": "us-btc-spot"}
-    assert captured["headers"]["x-soso-api-key"] == "sk-test"
-    assert "historicalInflowChart" in captured["url"]
-
-
-def test_sosovalue_fails_soft_on_none(monkeypatch):
-    monkeypatch.setattr(etf_flows, "post_json", lambda *a, **k: None)
-    assert etf_flows._from_sosovalue("sk-test") is None
-
-
-def test_sosovalue_fails_soft_on_list_response(monkeypatch):
-    # A top-level LIST response must not raise AttributeError on .get(...).
-    monkeypatch.setattr(etf_flows, "post_json", lambda *a, **k: [1, 2, 3])
-    assert etf_flows._from_sosovalue("sk-test") is None
-
-
-def test_etf_flows_never_raises_on_list_response(monkeypatch):
-    # The public entry point must fail soft even if a leaf returns a surprising
-    # shape; it can only ever return {'etf_flow': <num or None>}.
-    monkeypatch.setattr(etf_flows, "post_json", lambda *a, **k: {"unexpected": 1})
+def test_etf_flows_never_raises(monkeypatch):
+    # The public entry point can only ever return {'etf_flow': <num or None>};
+    # even a scrape returning nothing must fail soft.
     monkeypatch.setattr(etf_flows, "get_text", lambda *a, **k: None)
-    monkeypatch.setenv("SOSOVALUE_API_KEY", "sk-test")
     out = etf_flows.etf_flows()
     assert out == {"etf_flow": None}
-
-
-def test_etf_flows_prefers_sosovalue(monkeypatch):
-    monkeypatch.setenv("SOSOVALUE_API_KEY", "sk-test")
-    monkeypatch.setattr(
-        etf_flows, "post_json",
-        lambda *a, **k: {"data": [{"totalNetInflow": 2_000_000_000.0}]})
-    # Farside should not be consulted when SoSoValue yields a value.
-    monkeypatch.setattr(etf_flows, "get_text",
-                        lambda *a, **k: pytest.fail("Farside hit despite SoSoValue value"))
-    out = etf_flows.etf_flows()
-    assert out == {"etf_flow": pytest.approx(2.0)}

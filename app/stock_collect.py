@@ -666,9 +666,6 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--limit", type=int, default=None, help="cap the universe (testing)")
     p.add_argument("--skip-insider", action="store_true", help="skip the SEC insider layer")
     p.add_argument("--skip-estimates", action="store_true", help="skip Finnhub estimate snapshots")
-    # Retired layer (upstream house-stock-watcher mirror is unmaintained); the flag
-    # stays a no-op so existing cron lines don't break.
-    p.add_argument("--skip-congress", action="store_true", help=argparse.SUPPRESS)
     args = p.parse_args(argv)
     cfg = load_config()
     try:
