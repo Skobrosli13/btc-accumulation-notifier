@@ -70,6 +70,29 @@ def test_meanrev_fires_on_oversold_dip_in_uptrend():
     assert c is not None and c.archetype == "mean_reversion" and c.direction == "BUY"
 
 
+def test_momentum_and_meanrev_demoted_from_pick_candidate():
+    # Phase 0 §0.4: momentum/mean_reversion still COMPUTE (features + candidate
+    # functions), but pick_candidate no longer surfaces them as live setups.
+    closes = [50 + i * 0.5 - (2.0 if i % 4 == 0 else 0.0) for i in range(220)]
+    bars = _bars(closes)
+    feat = stock_scoring.features(bars)
+    assert stock_scoring.momentum_candidate("X", feat, CFG) is not None
+    assert stock_scoring.pick_candidate("X", feat, bars, None, CFG) is None  # no setup
+
+    mr_closes = _uptrend(200, base=50, step=0.6) + [170, 158, 148, 140, 134]
+    mr_bars = _bars(mr_closes)
+    mr_feat = stock_scoring.features(mr_bars)
+    assert stock_scoring.meanrev_candidate("X", mr_feat, CFG) is not None
+    assert stock_scoring.pick_candidate("X", mr_feat, mr_bars, None, CFG) is None
+
+
+def test_pick_candidate_still_surfaces_pead():
+    bars, report_ts = _pead_scenario(0.06)
+    good = {"report_ts": report_ts, "surprise_pct": 9.0, "hour": "", "actual": 1.1, "estimate": 1.0}
+    c = stock_scoring.pick_candidate("X", stock_scoring.features(bars), bars, good, CFG)
+    assert c is not None and c.archetype == "pead_drift"
+
+
 def test_pead_requires_confirming_reaction():
     closes = _uptrend(210, base=40, step=0.2)
     closes[-6] = closes[-7] * 1.06  # +6% reaction day (report at index -6)

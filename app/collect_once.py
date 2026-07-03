@@ -227,6 +227,12 @@ def _run_locked(cfg: Config, conn, now: datetime, *, dry_run: bool) -> dict:
         # alerts from a population the calibration never measured.
         dirs = shortterm.confluence_directions(ev["triggers"], flow.FLOW_TRIGGER_KEYS)
         for trig in ev["triggers"]:
+            # Phase 0 (§0.4): swing triggers are demoted from alert generators —
+            # measured-<=0 keys are features, microstructure keys are event
+            # candidates recording for the harness. Neither emails until a study
+            # PROMOTES (allowlist empty at M0). They are still stored/displayed.
+            if trig.key not in shortterm.ALERT_ELIGIBLE_TRIGGER_KEYS:
+                continue
             if cfg.st_regime_suppress and shortterm.regime_aligned(trig.direction, regime) is False:
                 log.info("%s/%s suppressed (counter-%s-regime)", tf, trig.key, regime)
                 continue

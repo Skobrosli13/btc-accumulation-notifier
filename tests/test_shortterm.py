@@ -96,6 +96,18 @@ def test_funding_spike_triggers_two_sided():
         st.detect_triggers(df, cfg, funding=0.0001))
 
 
+def test_all_triggers_are_demoted_from_alerting():
+    """Phase 0 §0.4: triggers still DETECT (stored/displayed/recorded) but the
+    collector's alert allowlist is empty, so none of them may email."""
+    assert st.ALERT_ELIGIBLE_TRIGGER_KEYS == frozenset()
+    cfg = make_config()
+    # A frame + funding that fires several distinct triggers; none is eligible.
+    df = _df([100.0] * 30 + [101.0])
+    fired = _keys(st.detect_triggers(df, cfg, funding=-0.001))
+    assert fired  # detection is unchanged
+    assert not (fired & st.ALERT_ELIGIBLE_TRIGGER_KEYS)
+
+
 def test_volume_flush_down_is_buy():
     cfg = make_config()
     df = _df([100.0] * 30 + [99.0], volumes=[1.0] * 30 + [5.0])

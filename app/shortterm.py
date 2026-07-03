@@ -226,6 +226,22 @@ UNVALIDATED_TRIGGER_KEYS = frozenset({
 })
 
 
+# Phase 0 (§0.4): the short-term swing triggers are DEMOTED from alert
+# generators. Two groups, both non-alerting now:
+#   * measured <=0 (macd_*_cross, ema_cross_*, vol_flush_*, and the RSI/BB
+#     reclaim/reject triggers) -> pure FEATURES: still computed, stored and
+#     shown on the dashboard, but they no longer email.
+#   * unmeasured-but-priored microstructure (funding_spike_*, oi_surge_*, plus
+#     the Coinalyze liquidation-flush flow triggers) -> EVENT CANDIDATES that
+#     record forward (Phase-2 events table) and must clear the harness (t>=3,
+#     Phase 3) before they may alert again.
+# The whole alerted swing population was statistically a coin flip (st_winrates),
+# so until a study PROMOTES, NO short-term trigger emails. This allowlist is the
+# single gate the collector consults; empty by design at M0. Detection,
+# scoring, storage and display are all unchanged — only email emission stops.
+ALERT_ELIGIBLE_TRIGGER_KEYS: frozenset = frozenset()
+
+
 def confluence_directions(triggers: list[Trigger],
                           extra_context_keys: frozenset = frozenset()) -> list[str]:
     """Directions of the triggers that COUNT toward the confluence tally: candle

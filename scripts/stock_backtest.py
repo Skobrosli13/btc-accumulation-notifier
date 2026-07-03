@@ -219,7 +219,10 @@ def run_backtest(bars_by_ticker: dict[str, list[dict]],
             if not feat.get("atr"):
                 continue   # live drops level-less candidates before they take a top-N slot
             earn = _latest_earnings(earnings_by_ticker.get(tk) or {}, feat["last_ts"], cfg)
-            cand = stock_scoring.pick_candidate(tk, feat, window, earn, cfg)
+            # All-archetype selector: the backtest still measures momentum/
+            # mean_reversion mechanics even though the LIVE screener demoted them
+            # to features (§0.4). Retired with this script at M2.
+            cand = stock_scoring.pick_candidate_all(tk, feat, window, earn, cfg)
             if cand is None:
                 continue
             if cand.direction == "SELL" and not cfg.stock_allow_shorts:

@@ -5,11 +5,12 @@ network. The shape differs from the BTC side — instead of one asset's absolute
 0..100, this ranks a *universe* of tickers each close and surfaces the strongest
 setups. Reuses the shared indicator primitives (``core.indicators``).
 
-Three archetypes, chosen per ticker by priority (PEAD > momentum > mean-reversion):
-- **pead_drift** — fresh earnings surprise whose price reaction confirms the sign;
-  the one documented free edge. Needs a Finnhub earnings feed.
-- **momentum** — trend-aligned relative strength (keyless; prices only).
-- **mean_reversion** — oversold dip inside an uptrend (keyless; tight/fast).
+Archetypes (Phase 0 §0.4): only **pead_drift** now surfaces a live setup — the
+one documented free edge (fresh earnings surprise whose price reaction confirms
+the sign; needs an earnings feed). **momentum** and **mean_reversion** are
+DEMOTED to feature-only (measured no-edge): their computations survive in
+``features()`` and the ``*_candidate`` functions remain for reference/tests, but
+``pick_candidate`` no longer emits them until the harness validates them.
 
 Insider cluster, short-volume and revision reads are *context* modifiers only —
 they nudge the composite/confidence but never create a setup on their own (Phase-2
@@ -244,7 +245,27 @@ def meanrev_candidate(ticker: str, feat: dict, cfg: Config) -> Candidate | None:
 
 def pick_candidate(ticker: str, feat: dict, bars: list[dict], earnings: dict | None,
                    cfg: Config) -> Candidate | None:
-    """Highest-priority archetype that fires for this ticker (or None)."""
+    """The one archetype that surfaces a tradeable setup for this ticker (or None).
+
+    Phase 0 (§0.4): ``momentum`` and ``mean_reversion`` are DEMOTED from alert
+    generators — measured no-edge (momentum +0.004R vs random-entry, ns;
+    mean_reversion n=16). Their feature computations survive (``features()``
+    keeps ret_5/20/63, dma50/200, rsi, from_52w_high; the ``*_candidate``
+    functions stay for reference/tests), but only ``pead_drift`` — the one
+    documented free edge — produces a live setup, until the harness validates
+    others (Phase 3). This is deliberately narrow; the screener surfaces little
+    until SRW-SUE PEAD (§4.5) and the event studies come online.
+    """
+    return pead_candidate(ticker, feat, bars, earnings, cfg)
+
+
+def pick_candidate_all(ticker: str, feat: dict, bars: list[dict],
+                       earnings: dict | None, cfg: Config) -> Candidate | None:
+    """All-archetype selector (PEAD > momentum > mean-reversion) — the pre-§0.4
+    behaviour, retained ONLY for the offline backtest (``scripts/stock_backtest``,
+    retired at M2). The LIVE screener uses :func:`pick_candidate` (pead-only); this
+    lets the backtest keep measuring the demoted archetypes' historical mechanics
+    until the harness supersedes it."""
     for fn in (lambda: pead_candidate(ticker, feat, bars, earnings, cfg),
                lambda: momentum_candidate(ticker, feat, cfg),
                lambda: meanrev_candidate(ticker, feat, cfg)):
