@@ -27,7 +27,7 @@ from pathlib import Path
 from . import (maturity, notify, stock_confidence, stock_levels, stock_positions,
                stock_scoring, stock_store, store)
 from .config import Config, load_config
-from .sources.stocks import earnings, estimates, insider, prices, shortvol, universe
+from .sources.stocks import earnings, estimates, insider, prices, universe
 
 log = logging.getLogger("stock-collect")
 
@@ -38,7 +38,6 @@ _MIN_PRICE_COVERAGE = 0.80   # below this the cross-section is biased -> degrade
 _PENDING_EXPIRY_MS = 5 * 86_400_000   # ~3 trading days (incl. weekend): unfilled pending expires
 _REBASE_TOL = 0.02         # entry-bar close drift beyond this => split/adjustment re-base
 _YAHOO_DELAY_S = 0.15      # keyless-path politeness delay (+ jitter) between chart calls
-_SHORTVOL_BASELINE_N = 5   # min prior sessions before a short-vol anomaly read exists
 
 
 def _winrates() -> dict:
@@ -117,29 +116,6 @@ def _fetch_earnings(conn, cfg: Config, tickers: set[str], dry_run: bool
     return latest, len(rows)
 
 
-def _fetch_shortvol(conn, cfg: Config, tickers: set[str], dry_run: bool) -> dict[str, dict]:
-    if not cfg.stock_shortvol_active:
-        return {}
-    res = shortvol.latest_short_volume(cfg.sec_user_agent)
-    if not res:
-        return {}
-    ts, table = res
-    out: dict[str, dict] = {}
-    rows = []
-    for tk in tickers:
-        row = table.get(tk)
-        if not row:
-            continue
-        ratio = shortvol.short_ratio(row)
-        out[tk] = {**row, "short_ratio": ratio, "ts": ts}
-        rows.append({"ticker": tk, "ts": ts, "short_vol": row["short_vol"],
-                     "short_exempt": row["short_exempt"], "total_vol": row["total_vol"]})
-    if not dry_run and rows:
-        stock_store.upsert_shortvol(conn, rows)
-    log.info("shortvol: %d/%d tickers matched in FINRA file", len(out), len(tickers))
-    return out
-
-
 def _fetch_insider(conn, cfg: Config, universe_rows: list[dict], dry_run: bool
                    ) -> tuple[dict[str, dict], int, int]:
     """Returns (buy-clusters per ticker, CIKs attempted, CIKs that returned rows)."""
@@ -201,19 +177,6 @@ def _snapshot_estimates(conn, cfg: Config, tickers: list[str]) -> dict[str, dict
         if d:
             deltas[tk] = d
     return deltas
-
-
-def _shortvol_baseline(conn, ticker: str, today_ts: int | None) -> float | None:
-    """The ticker's trailing ~30-session mean short-volume ratio (excluding today) —
-    the per-symbol baseline the anomaly bonus is measured against. None until enough
-    history has accrued (the context read stays neutral)."""
-    rows = stock_store.recent_shortvol(conn, ticker, 31)
-    prior = [shortvol.short_ratio(r) for r in rows
-             if r.get("total_vol") and (today_ts is None or r["ts"] < today_ts)]
-    prior = [p for p in prior if p is not None]
-    if len(prior) < _SHORTVOL_BASELINE_N:
-        return None
-    return sum(prior) / len(prior)
 
 
 def _market_regime(cfg: Config) -> str:
@@ -425,7 +388,6 @@ def run(cfg: Config, *, dry_run: bool = False, limit: int | None = None,
                     coverage * 100, _MIN_PRICE_COVERAGE * 100)
 
     earnings_by, earnings_rows_n = _fetch_earnings(conn, cfg, tset, dry_run)
-    shortvol_by = _fetch_shortvol(conn, cfg, tset, dry_run)
     insider_by, insider_attempted, insider_ok = (
         ({}, 0, 0) if skip_insider else _fetch_insider(conn, cfg, universe_rows, dry_run))
     # Estimate snapshots are 1 Finnhub call/ticker -> only snapshot names that just
@@ -451,15 +413,8 @@ def run(cfg: Config, *, dry_run: bool = False, limit: int | None = None,
         # Phase 1 is long-only; skip short setups (e.g. negative-PEAD) unless enabled.
         if cand.direction == "SELL" and not cfg.stock_allow_shorts:
             continue
-        # Short volume is a per-symbol anomaly vs its own trailing baseline, and a
-        # long-side (squeeze-fuel) read only — a normal 40-50% ratio earns nothing.
-        sv = shortvol_by.get(tk)
-        sv_read = None
-        if sv and cand.direction == "BUY" and sv.get("short_ratio") is not None:
-            sv_read = {"short_ratio": sv["short_ratio"],
-                       "baseline_ratio": _shortvol_baseline(conn, tk, sv.get("ts"))}
         ctx_score, ctx_parts = stock_scoring.context_score(
-            insider_by.get(tk), sv_read, revision_by.get(tk))
+            insider_by.get(tk), revision_by.get(tk))
         cand.context = ctx_score
         cand.detail["context"] = ctx_parts
         cand.detail["feat"] = {"price": feat["price"], "atr": feat["atr"],
@@ -510,7 +465,6 @@ def run(cfg: Config, *, dry_run: bool = False, limit: int | None = None,
             "pead": (round(c.primary, 3) if c.archetype == "pead_drift" else None),
             "technical": (round(c.primary, 3) if c.archetype != "pead_drift" else None),
             "insider": c.detail.get("context", {}).get("insider"),
-            "shortvol": c.detail.get("context", {}).get("shortvol"),
             "revision": c.detail.get("context", {}).get("revision"),
             "price": round(feat["price"], 4), "entry": lv["entry"], "stop": lv["stop"],
             "t1": lv["t1"], "t2": lv["t2"], "atr": lv["atr"], "rr": lv["rr"],
@@ -552,7 +506,6 @@ def run(cfg: Config, *, dry_run: bool = False, limit: int | None = None,
         "prices_attempted": len(fetch_tks),
         "prices_fetched": len(bars_by_ticker),
         "earnings_rows": earnings_rows_n if cfg.finnhub_active else None,
-        "shortvol_matched": len(shortvol_by) if cfg.stock_shortvol_active else None,
         "insider_attempted": (insider_attempted
                               if (cfg.stock_insider_active and not skip_insider) else None),
         "insider_ok": insider_ok if (cfg.stock_insider_active and not skip_insider) else None,
@@ -561,7 +514,6 @@ def run(cfg: Config, *, dry_run: bool = False, limit: int | None = None,
                 "coverage": round(coverage, 3), "degraded": degraded, "counts": counts,
                 "layers": {"prices": bool(bars_by_ticker), "earnings": cfg.finnhub_active,
                            "insider": cfg.stock_insider_active and not skip_insider,
-                           "shortvol": cfg.stock_shortvol_active,
                            "revision": bool(revision_by)},
                 "price_source": cfg.stock_price_source,   # config preference
                 "price_venues": venue_counts}             # venues actually used

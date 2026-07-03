@@ -50,7 +50,6 @@ _LAYER_COUNT_KEYS = {
     "prices": "prices_fetched",
     "earnings_pead": "earnings_rows",
     "insider": "insider_ok",
-    "shortvol": "shortvol_matched",
 }
 
 
@@ -84,7 +83,6 @@ def health(cfg: Config = Depends(_cfg), _=Depends(_require_token)) -> dict:
             "prices": False,  # proven by data flow below, not asserted
             "earnings_pead": cfg.finnhub_active,
             "insider": cfg.stock_insider_active,
-            "shortvol": cfg.stock_shortvol_active,
         },
         "layer_status": {}, "degraded_layers": [],
         "db_ok": False, "last_run": None, "run_age_hours": None, "stale": True,
@@ -110,7 +108,7 @@ def health(cfg: Config = Depends(_cfg), _=Depends(_require_token)) -> dict:
         out["layers"]["prices"] = bool(counts.get("prices_fetched") or
                                        (readings.get("layers") or {}).get("prices"))
         active = {"prices": True, "earnings_pead": cfg.finnhub_active,
-                  "insider": cfg.stock_insider_active, "shortvol": cfg.stock_shortvol_active}
+                  "insider": cfg.stock_insider_active}
         out["layer_status"] = {k: _layer_status(runs, k, v) for k, v in active.items()}
         out["degraded_layers"] = [k for k, v in out["layer_status"].items() if v == "degraded"]
         # Open positions whose ticker hasn't repriced in ~5 trading days: a silent
@@ -175,8 +173,7 @@ def _setup_from_signal(s: dict) -> dict:
             "risk_pct": lv.get("risk_pct"), "time_stop_days": lv.get("time_stop_days"),
         },
         "components": {"pead": s.get("pead"), "technical": s.get("technical"),
-                       "insider": s.get("insider"), "shortvol": s.get("shortvol"),
-                       "revision": s.get("revision")},
+                       "insider": s.get("insider"), "revision": s.get("revision")},
         "context": d.get("context") or {},
         "rel": d.get("rel"), "regime": d.get("regime_state"),
         "pead_detail": {k: d.get(k) for k in
@@ -264,9 +261,8 @@ def ticker(sym: str, cfg: Config = Depends(_cfg), _=Depends(_require_token)) -> 
         signals = stock_store.latest_stock_signals(conn)
         sig = next((s for s in signals if s["ticker"] == sym), None)
         prices = stock_store.recent_prices(conn, sym, 180)
-        sv = stock_store.recent_shortvol(conn, sym, 20)
     finally:
         conn.close()
     return {"ticker": sym,
             "setup": _setup_from_signal(sig) if sig else None,
-            "candles": prices, "shortvol": sv}
+            "candles": prices}

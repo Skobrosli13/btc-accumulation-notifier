@@ -6,6 +6,6 @@ layer renormalizes away instead of darkening a whole run. Prices are the one
 near-mandatory feed (a name with no bars is simply skipped, not fatal).
 
 Free/keyless by default: ``universe`` (SEC ticker map) and ``prices`` (Stooq CSV),
-``insider`` (SEC EDGAR), ``shortvol`` (FINRA). ``earnings``/``estimates`` need a
-free Finnhub key; ``prices`` optionally upgrades to Alpaca/Tiingo when keyed.
+``insider`` (SEC EDGAR). ``earnings``/``estimates`` need a free Finnhub key;
+``prices`` optionally upgrades to Alpaca/Tiingo when keyed.
 """

@@ -173,7 +173,6 @@ class Config:
     tiingo_api_key: str | None = None
     sec_user_agent: str = "riverviewweb-signal stock tracker admin@riverviewweb.com"
     stock_insider_enabled: bool = True
-    stock_shortvol_enabled: bool = True
     stock_universe_path: str = "app/stock_universe.json"
     stock_top_n: int = 15
     stock_pead_lookback_days: int = 10
@@ -272,10 +271,6 @@ class Config:
     def stock_insider_active(self) -> bool:
         return self.stock_insider_enabled  # keyless
 
-    @property
-    def stock_shortvol_active(self) -> bool:
-        return self.stock_shortvol_enabled  # keyless
-
     def notifications_configured(self) -> bool:
         return bool(
             self.email_active
@@ -357,7 +352,6 @@ def load_config() -> Config:
         sec_user_agent=_get("SEC_USER_AGENT",
                             "riverviewweb-signal stock tracker admin@riverviewweb.com"),
         stock_insider_enabled=_get_bool("STOCK_INSIDER", True),
-        stock_shortvol_enabled=_get_bool("STOCK_SHORTVOL", True),
         stock_universe_path=_get("STOCK_UNIVERSE_PATH", "app/stock_universe.json"),
         stock_top_n=_get_int("STOCK_TOP_N", 15),
         stock_pead_lookback_days=_get_int("STOCK_PEAD_LOOKBACK_DAYS", 10),

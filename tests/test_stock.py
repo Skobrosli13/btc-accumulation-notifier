@@ -383,38 +383,11 @@ def test_store_roundtrip():
     stock_store.record_stock_signals(conn, "r1", [{
         "ticker": "AAA", "rank": 1, "direction": "BUY", "archetype": "momentum",
         "composite": 80.0, "confidence": 0.6, "pead": None, "technical": 0.7,
-        "insider": None, "shortvol": None, "revision": None, "price": 10.5,
+        "insider": None, "revision": None, "price": 10.5,
         "entry": 10.5, "stop": 9.5, "t1": 11.5, "t2": 12.5, "atr": 0.5, "rr": 2.0,
         "detail_json": '{"catalyst":"x"}'}])
     sigs = stock_store.latest_stock_signals(conn)
     assert sigs[0]["ticker"] == "AAA" and sigs[0]["detail"]["catalyst"] == "x"
-    conn.close()
-
-
-# --- short-volume anomaly context ---------------------------------------------
-
-def test_shortvol_context_is_anomaly_vs_own_baseline():
-    # no trailing baseline -> neutral (no bonus at all)
-    s, parts = stock_scoring.context_score(None, {"short_ratio": 0.55}, None)
-    assert "shortvol" not in parts and s == 0.0
-    # sitting AT its own baseline (a perfectly normal 45% ratio) -> zero bonus
-    _, parts2 = stock_scoring.context_score(
-        None, {"short_ratio": 0.45, "baseline_ratio": 0.45}, None)
-    assert parts2.get("shortvol", 0.0) == 0.0
-    # a genuine outlier vs its own history earns the bonus
-    _, parts3 = stock_scoring.context_score(
-        None, {"short_ratio": 0.60, "baseline_ratio": 0.45}, None)
-    assert parts3["shortvol"] > 0.5
-
-
-def test_shortvol_baseline_excludes_today_and_needs_history():
-    conn = _conn_mem()
-    rows = [{"ticker": "AAA", "ts": i * DAY, "short_vol": 45.0, "short_exempt": 0.0,
-             "total_vol": 100.0} for i in range(1, 7)]
-    stock_store.upsert_shortvol(conn, rows)
-    base = stock_collect._shortvol_baseline(conn, "AAA", 6 * DAY)   # 5 prior sessions
-    assert base is not None and abs(base - 0.45) < 1e-9
-    assert stock_collect._shortvol_baseline(conn, "AAA", 3 * DAY) is None  # too little history
     conn.close()
 
 
@@ -672,7 +645,7 @@ def test_has_transport_predicate():
 def _signal_row(detail: dict) -> dict:
     return {"ticker": "AAA", "rank": 1, "direction": "BUY", "archetype": "momentum",
             "composite": 80.0, "confidence": 0.6, "pead": None, "technical": 0.7,
-            "insider": None, "shortvol": None, "revision": None, "price": 10.5,
+            "insider": None, "revision": None, "price": 10.5,
             "entry": 10.5, "stop": 9.5, "t1": 11.5, "t2": 12.5, "atr": 0.5, "rr": 2.0,
             "detail": detail}
 

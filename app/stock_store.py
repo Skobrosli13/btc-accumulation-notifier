@@ -79,15 +79,6 @@ CREATE TABLE IF NOT EXISTS stock_insider (
 );
 CREATE INDEX IF NOT EXISTS ix_stock_insider_tk_ts ON stock_insider(ticker, txn_ts DESC);
 
-CREATE TABLE IF NOT EXISTS stock_shortvol (
-  ticker        TEXT,
-  ts            INTEGER,          -- trade date, epoch ms (UTC midnight)
-  short_vol     REAL,
-  short_exempt  REAL,
-  total_vol     REAL,
-  PRIMARY KEY (ticker, ts)
-);
-
 CREATE TABLE IF NOT EXISTS stock_runs (
   run_ts        TEXT PRIMARY KEY, -- ISO (UTC)
   universe_n    INTEGER,          -- names in the universe this run
@@ -103,7 +94,7 @@ CREATE TABLE IF NOT EXISTS stock_signals (
   archetype   TEXT,               -- pead_drift | momentum | mean_reversion
   composite   REAL,               -- 0..100 ranked blend
   confidence  REAL,               -- 0..1 calibrated prior
-  pead        REAL, technical REAL, insider REAL, shortvol REAL, revision REAL,  -- component subscores
+  pead        REAL, technical REAL, insider REAL, revision REAL,  -- component subscores
   price       REAL,
   entry       REAL, stop REAL, t1 REAL, t2 REAL, atr REAL, rr REAL,
   detail_json TEXT,               -- catalyst detail + per-signal breakdown for the card
@@ -370,31 +361,6 @@ def insider_cluster(conn: sqlite3.Connection, ticker: str, since_ts: int) -> dic
             "last_ts": d.get("last_ts")}
 
 
-# --- Short volume (FINRA) ----------------------------------------------------
-
-def upsert_shortvol(conn: sqlite3.Connection, rows: list[dict]) -> None:
-    if not rows:
-        return
-    conn.executemany(
-        """
-        INSERT OR REPLACE INTO stock_shortvol (ticker, ts, short_vol, short_exempt, total_vol)
-        VALUES (:ticker, :ts, :short_vol, :short_exempt, :total_vol)
-        """,
-        rows,
-    )
-    conn.commit()
-
-
-def recent_shortvol(conn: sqlite3.Connection, ticker: str, limit: int = 20) -> list[dict]:
-    rows = conn.execute(
-        "SELECT ts, short_vol, short_exempt, total_vol FROM ("
-        "  SELECT * FROM stock_shortvol WHERE ticker = ? ORDER BY ts DESC LIMIT ?"
-        ") ORDER BY ts ASC",
-        (ticker, limit),
-    ).fetchall()
-    return [dict(r) for r in rows]
-
-
 # --- Runs + signals ----------------------------------------------------------
 
 def record_stock_run(conn: sqlite3.Connection, *, run_ts: str, universe_n: int,
@@ -414,10 +380,10 @@ def record_stock_signals(conn: sqlite3.Connection, run_ts: str, signals: list[di
         """
         INSERT OR REPLACE INTO stock_signals
           (run_ts, ticker, rank, direction, archetype, composite, confidence,
-           pead, technical, insider, shortvol, revision, price, entry, stop, t1, t2,
+           pead, technical, insider, revision, price, entry, stop, t1, t2,
            atr, rr, detail_json)
         VALUES (:run_ts, :ticker, :rank, :direction, :archetype, :composite, :confidence,
-                :pead, :technical, :insider, :shortvol, :revision, :price, :entry, :stop,
+                :pead, :technical, :insider, :revision, :price, :entry, :stop,
                 :t1, :t2, :atr, :rr, :detail_json)
         """,
         [{**s, "run_ts": run_ts} for s in signals],
@@ -696,5 +662,4 @@ def prune_stock(conn: sqlite3.Connection, days: int = 500) -> None:
     """Drop old high-volume rows; keep runs/signals/positions/alerts (valuable history)."""
     cutoff_ms = int((datetime.now(timezone.utc).timestamp() - days * 86400) * 1000)
     conn.execute("DELETE FROM stock_prices WHERE ts < ?", (cutoff_ms,))
-    conn.execute("DELETE FROM stock_shortvol WHERE ts < ?", (cutoff_ms,))
     conn.commit()
