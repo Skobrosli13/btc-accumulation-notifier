@@ -1,89 +1,30 @@
-"""Read-only JSON API for the dashboard (FastAPI + uvicorn).
+"""BTC signal endpoints: long-term accumulation composite, short-term swing,
+candles/indicators/derivs, alerts, and the live forward-test / track record.
 
-Bound to localhost in production; the co-hosted Next.js server reads it over
-127.0.0.1 and the human-facing gate is nginx HTTP basic auth in front of the
-dashboard (Let's Encrypt TLS). A bearer token (cfg.api_token) is an internal
-dashboard<->API secret: enforced when set, open when unset (local dev /
-localhost-only).
-
-The DB is opened READ-ONLY per request so the API can never corrupt collector
-writes (WAL allows concurrent reads).
-
-Run:  uvicorn app.api:app --host 127.0.0.1 --port 8000
+Read-only: every handler opens the DB read-only (``conn_ro``) so the API can
+never corrupt collector writes. Display labels live here as the single
+server-side source of truth (the dashboard never re-derives them).
 """
 from __future__ import annotations
 
-import html
 import json
-import re
-import secrets
-import sqlite3
-from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 
 import pandas as pd
-from fastapi import (BackgroundTasks, Depends, FastAPI, HTTPException, Query)
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
-from pydantic import BaseModel
+from fastapi import APIRouter, Depends, HTTPException, Query
 
-from . import (alerting, notify_email, perf, scoring, shortterm, stock_api,
-               stock_lt_api, stock_lt_store, stock_store, store)
-from .api_deps import conn_ro as _conn, conn_rw as _conn_rw, get_config, require_token
-from .config import Config, load_config
-from .sources import exchange
+from .. import alerting, perf, scoring, shortterm, store
+from ..api_deps import conn_ro as _conn
+from ..api_deps import get_config, require_token
+from ..config import Config
+from ..sources import exchange
 
-# Reflected into the unsubscribe HTML — reject any address carrying characters
-# that could break out of an HTML attribute/text node (belt-and-suspenders with
-# html.escape at render time; also stops such rows entering the DB via subscribe).
-_EMAIL_RE = re.compile(r"^[^@\s<>\"'&]+@[^@\s<>\"'&]+\.[^@\s<>\"'&]+$")
-# Subscriber tokens are secrets.token_urlsafe(32) -> URL-safe base64 [A-Za-z0-9_-].
-# Only render the unsubscribe form for a well-formed token; anything else is a
-# malformed/hostile link and gets the "invalid" page (no form, no reflection).
-_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{16,}$")
+router = APIRouter()
 
-def _ensure_schema() -> None:
-    """Best-effort: create both schemas so the READ-ONLY endpoints never hit a
-    missing table on a fresh box (before the first collector cron has run). The
-    API already writes for subscribe (_conn_rw/init_db), so this needs no new
-    privilege; the stock tables are additive and idempotent."""
-    try:
-        conn = store.connect(load_config().db_path)
-        store.init_db(conn)
-        stock_store.init_stock_db(conn)
-        stock_lt_store.init_stock_lt_db(conn)
-        conn.close()
-    except Exception:  # noqa: BLE001 - never block startup on schema init
-        pass
-
-
-@asynccontextmanager
-async def lifespan(_app: FastAPI):
-    """Startup work, run by the ASGI server — NOT at import (§0.5: no import-time
-    side effects). Merely importing ``app.api`` (tests, tooling) now touches no
-    database; the schema is ensured when the server actually starts."""
-    _ensure_schema()
-    yield
-
-
-app = FastAPI(title="BTC Signal API", version="1.0.0", lifespan=lifespan)
-
-# Stock swing tracker (second asset) — namespaced under /api/stock/*.
-app.include_router(stock_api.router)
-# Long-term stock "long buys" engine — /api/stock/longterm/*.
-app.include_router(stock_lt_api.router)
-
-# CORS only matters if the dashboard is served cross-origin (it usually isn't).
-# Read config here (cheap, cached, no I/O) rather than holding a module global.
-if get_config().api_cors_origin:
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=[get_config().api_cors_origin],
-        allow_methods=["GET"],
-        allow_headers=["*"],
-    )
+# The committed calibration JSONs live in app/ (one level up from app/api/).
+_APP_DIR = Path(__file__).resolve().parent.parent
 
 # Display labels (server-side single source of truth; the dashboard never re-derives).
 _CATEGORY_LABELS = {
@@ -96,94 +37,11 @@ _COMPONENT_LABELS = {
 }
 
 
-# Long-term runs are a 6h cron; allow ~2 cadences + slack before "stale" so a
-# single missed run isn't flagged, but a dead run_once (which the 10-min collector
-# would otherwise mask) is caught.
-_RUN_STALE_HOURS = 13.0
-
-# How many recent runs (~2 days at the 6h cadence) the per-indicator availability
-# check inspects: an indicator None across all of them is reported dark.
-_INDICATOR_HEALTH_RUNS = 8
-
-
-@app.get("/api/health")
-def health(cfg: Config = Depends(get_config), _=Depends(require_token)) -> dict:
-    now = datetime.now(timezone.utc)
-    out = {
-        "ok": True,
-        "now": now.isoformat(),
-        "exchange": cfg.exchange,
-        "symbol": cfg.symbol,
-        "timeframes": list(cfg.st_timeframes),
-        "layers": {
-            "onchain": cfg.onchain_active,
-            "macro": cfg.macro_active,
-            "derivs_paid": cfg.derivs_paid_active,
-            "flow": cfg.coinalyze_active,   # free Coinalyze order-flow layer (CVD/OI/liq)
-            "email": cfg.email_active,
-        },
-        "onchain_source": cfg.onchain_source,
-        "db_ok": False,
-        "last_collect": None,
-        "last_run": None,
-        "collect_age_hours": None,
-        "run_age_hours": None,
-        # Default to stale=True so a DB error never renders as "healthy".
-        "collect_stale": True,
-        "run_stale": True,
-        "stale": True,
-    }
-    try:
-        conn = store.connect_readonly(cfg.db_path)
-        lc = store.last_collect_ts(conn)
-        lr = store.last_run_ts(conn)
-        # Per-indicator availability from the persisted run readings: the config
-        # `layers` above only say what is CONFIGURED; a scored source that fails
-        # soft to None forever (a dead upstream) is otherwise invisible because
-        # the composite renormalizes around it with no alert.
-        recent_reads = store.recent_run_readings(conn, _INDICATOR_HEALTH_RUNS)
-        conn.close()
-        inds = {}
-        for name in scoring.THRESHOLDS:
-            seen = [r["run_ts"] for r in recent_reads
-                    if scoring._finite(r["raw"].get(name)) is not None]
-            inds[name] = {
-                # data present in the LATEST run
-                "available": bool(recent_reads and seen
-                                  and seen[0] == recent_reads[0]["run_ts"]),
-                "runs_with_data": len(seen),
-                "runs_checked": len(recent_reads),
-                "last_seen": seen[0] if seen else None,
-            }
-        out["indicators"] = inds
-        # Scored indicators dark across every checked run — a likely dead source,
-        # not a one-run blip (empty until at least one run exists).
-        out["dark_indicators"] = (sorted(n for n, v in inds.items()
-                                         if v["runs_with_data"] == 0)
-                                  if recent_reads else [])
-        out["db_ok"] = True
-        out["last_collect"] = lc.isoformat() if lc else None
-        out["last_run"] = lr.isoformat() if lr else None
-        collect_age = (now - lc).total_seconds() / 3600.0 if lc else None
-        run_age = (now - lr).total_seconds() / 3600.0 if lr else None
-        out["collect_age_hours"] = round(collect_age, 2) if collect_age is not None else None
-        out["run_age_hours"] = round(run_age, 2) if run_age is not None else None
-        # Each pipeline is judged against its OWN cadence: the fresh 10-min collector
-        # must not hide a dead 6h long-term run (and vice versa).
-        out["collect_stale"] = collect_age is None or collect_age > cfg.watchdog_stale_hours
-        out["run_stale"] = run_age is None or run_age > _RUN_STALE_HOURS
-        out["stale"] = out["collect_stale"] or out["run_stale"]
-    except sqlite3.Error as exc:
-        out["ok"] = False
-        out["error"] = str(exc)
-    return out
-
-
 @lru_cache(maxsize=1)
 def _st_winrates() -> dict:
     """Read app/st_winrates.json once (emitted by scripts/st_calibrate.py). {} if absent."""
     try:
-        return json.loads(Path(__file__).with_name("st_winrates.json").read_text())
+        return json.loads((_APP_DIR / "st_winrates.json").read_text())
     except (OSError, json.JSONDecodeError):
         return {}
 
@@ -201,12 +59,12 @@ def _trigger_stats(wr: dict, key: str) -> dict:
 def _track_record_data() -> dict:
     """Read app/track_record.json once (emitted by scripts/calibrate.py). {} if absent."""
     try:
-        return json.loads(Path(__file__).with_name("track_record.json").read_text())
+        return json.loads((_APP_DIR / "track_record.json").read_text())
     except (OSError, json.JSONDecodeError):
         return {}
 
 
-@app.get("/api/live_performance")
+@router.get("/api/live_performance")
 def live_performance(cfg: Config = Depends(get_config), _=Depends(require_token)) -> dict:
     """Forward-tested record of the system's OWN past signals (out-of-sample; grows
     over time). Long-term runs + fired swing alerts priced against stored candles.
@@ -235,11 +93,11 @@ def live_performance(cfg: Config = Depends(get_config), _=Depends(require_token)
                  "episodes_effective (episode starts spaced >= the horizon; the CI's "
                  "population) is the honest sample size — raw run and episode counts "
                  "overlap; swing win rates are cost-adjusted and only meaningful "
-                 "against base_rate."),
+                 "once each cell has matured outcomes."),
     }
 
 
-@app.get("/api/track_record")
+@router.get("/api/track_record")
 def track_record(_=Depends(require_token)) -> dict:
     """Historical forward-return hit-rate of the percentile backbone (illustrative,
     not a forecast). {"available": false} until the calibration script has run."""
@@ -390,7 +248,7 @@ def _lt_breakdown(latest: dict, cfg: Config) -> dict:
     }
 
 
-@app.get("/api/longterm/latest")
+@router.get("/api/longterm/latest")
 def longterm_latest(cfg: Config = Depends(get_config), _=Depends(require_token)) -> dict:
     conn = _conn(cfg)
     try:
@@ -402,7 +260,7 @@ def longterm_latest(cfg: Config = Depends(get_config), _=Depends(require_token))
     return {"latest": latest}
 
 
-@app.get("/api/longterm/history")
+@router.get("/api/longterm/history")
 def longterm_history(limit: int = Query(0, ge=0, le=5000),
                      cfg: Config = Depends(get_config), _=Depends(require_token)) -> dict:
     """Composite/tier per long-term run, oldest->newest — the score-over-time
@@ -415,7 +273,7 @@ def longterm_history(limit: int = Query(0, ge=0, le=5000),
     return {"runs": rows}
 
 
-@app.get("/api/playbook")
+@router.get("/api/playbook")
 def playbook_latest(cfg: Config = Depends(get_config), _=Depends(require_token)) -> dict:
     """The latest run's illustrative playbook — ladder + unified 'what to do now'."""
     conn = _conn(cfg)
@@ -430,7 +288,7 @@ def playbook_latest(cfg: Config = Depends(get_config), _=Depends(require_token))
             "what_to_do": readings.get("what_to_do")}
 
 
-@app.get("/api/price")
+@router.get("/api/price")
 def spot_price(cfg: Config = Depends(get_config), _=Depends(require_token)) -> dict:
     """Live spot price (exchange ticker; no DB) so the dashboard headline can
     refresh on its own 60s cadence instead of waiting for the 6h long-term run.
@@ -501,13 +359,13 @@ def _enrich_st(conn, cfg: Config, sig: dict | None, tf: str,
     return sig
 
 
-@app.get("/api/shortterm/latest")
+@router.get("/api/shortterm/latest")
 def shortterm_latest(cfg: Config = Depends(get_config), _=Depends(require_token)) -> dict:
     conn = _conn(cfg)
     try:
-        derivs = store.recent_derivs(conn, 1)
-        funding = derivs[-1]["funding"] if derivs else None
-        oi_chg_pct = derivs[-1]["oi_chg_pct"] if derivs else None
+        derivs_rows = store.recent_derivs(conn, 1)
+        funding = derivs_rows[-1]["funding"] if derivs_rows else None
+        oi_chg_pct = derivs_rows[-1]["oi_chg_pct"] if derivs_rows else None
         rows1d = store.recent_candles(conn, "1d", 300, contiguous_source=True)
         # Drop the still-forming daily candle so the dashboard regime matches the
         # collector/alert path (which is closed-candle-only) — no intraday flip-flop
@@ -523,7 +381,7 @@ def shortterm_latest(cfg: Config = Depends(get_config), _=Depends(require_token)
     return {"timeframes": out}
 
 
-@app.get("/api/candles")
+@router.get("/api/candles")
 def candles(timeframe: str = Query("4h"), limit: int = Query(300, ge=1, le=1000),
             cfg: Config = Depends(get_config), _=Depends(require_token)) -> dict:
     if timeframe not in cfg.st_timeframes and timeframe not in ("4h", "1d", "1w"):
@@ -536,7 +394,7 @@ def candles(timeframe: str = Query("4h"), limit: int = Query(300, ge=1, le=1000)
     return {"timeframe": timeframe, "candles": rows}
 
 
-@app.get("/api/indicators")
+@router.get("/api/indicators")
 def indicators(timeframe: str = Query("4h"),
                cfg: Config = Depends(get_config), _=Depends(require_token)) -> dict:
     conn = _conn(cfg)
@@ -555,7 +413,7 @@ def indicators(timeframe: str = Query("4h"),
             "score": score, "state": shortterm.st_state(score, cfg), "components": comps}
 
 
-@app.get("/api/derivs")
+@router.get("/api/derivs")
 def derivs(limit: int = Query(200, ge=1, le=1000),
            cfg: Config = Depends(get_config), _=Depends(require_token)) -> dict:
     conn = _conn(cfg)
@@ -584,7 +442,7 @@ def _lt_alert_reason(row: dict) -> dict:
     }
 
 
-@app.get("/api/alerts")
+@router.get("/api/alerts")
 def alerts(limit: int = Query(50, ge=1, le=500),
            cfg: Config = Depends(get_config), _=Depends(require_token)) -> dict:
     conn = _conn(cfg)
@@ -600,126 +458,3 @@ def alerts(limit: int = Query(50, ge=1, le=500),
             r["reason"] = None
         r.pop("readings", None)  # keep payload lean
     return {"short_term": st_rows, "long_term": lt_rows}
-
-
-# --- Email subscriptions -----------------------------------------------------
-
-class SubscribeIn(BaseModel):
-    email: str
-
-
-def _send_welcome(cfg: Config, email: str, unsubscribe_url: str) -> None:
-    """Confirmation email (also carries the unsubscribe link). Best-effort."""
-    subject = "You're subscribed to BTC signal alerts"
-    body = (
-        "You'll now receive Bitcoin long-term accumulation alerts at this address:\n\n"
-        "  • Tier changes — WATCH → ACCUMULATE → DEEP_VALUE\n"
-        "  • Capitulation flash — an acute, oversold-fear washout\n\n"
-        "These are infrequent, high-confluence signals (not the noisier short-term "
-        "swing triggers, which stay on the dashboard). Not financial advice — "
-        "long-term is buy-only accumulation; you decide whether, how much, and where."
-    )
-    notify_email.send_email(cfg, subject, body, to=email, unsubscribe_url=unsubscribe_url)
-
-
-@app.post("/api/subscribe")
-def subscribe(body: SubscribeIn, background: BackgroundTasks,
-              cfg: Config = Depends(get_config), _=Depends(require_token)) -> dict:
-    """Add an email to the alert broadcast list (token-gated; called by the
-    dashboard's server-side proxy). Sends a confirmation/welcome email."""
-    email = (body.email or "").strip().lower()
-    if len(email) > 254 or not _EMAIL_RE.match(email):
-        raise HTTPException(status_code=400, detail="invalid email")
-    token = secrets.token_urlsafe(32)
-    conn = _conn_rw(cfg)
-    try:
-        token, is_new = store.upsert_subscriber(
-            conn, email=email, token=token,
-            created_at=datetime.now(timezone.utc).isoformat())
-    finally:
-        conn.close()
-    # Only send the welcome on a genuinely NEW subscription — re-POSTing an existing
-    # address (a refresh, or an abuse loop) must not re-send mail (Resend quota /
-    # reputation / unsolicited-mail vector).
-    if cfg.resend_api_key and is_new:
-        unsub = f"{cfg.public_base_url}/api/unsubscribe?token={token}"
-        background.add_task(_send_welcome, cfg, email, unsub)
-    return {"ok": True, "email": email, "new": is_new}
-
-
-def _unsub_page(message: str, *, body_html: str = "") -> HTMLResponse:
-    safe = message  # message is one of our own fixed strings (no user input)
-    html_doc = f"""<!doctype html>
-<html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="robots" content="noindex">
-<title>BTC alerts</title>
-<style>
-  html,body{{margin:0;height:100%;background:#0b0d12;color:#e8eaf0;
-    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}}
-  .box{{max-width:440px;margin:14vh auto 0;padding:32px;background:#14181f;
-    border:1px solid rgba(255,255,255,.06);border-radius:16px;text-align:center;
-    box-shadow:0 8px 24px rgba(0,0,0,.22)}}
-  h1{{font-size:18px;margin:0 0 10px}}
-  p{{color:#98a1b2;font-size:14px;line-height:1.5;margin:0 0 16px}}
-  button{{background:#e8eaf0;color:#0b0d12;border:0;border-radius:10px;
-    padding:11px 22px;font-size:14px;font-weight:600;cursor:pointer}}
-</style></head>
-<body><div class="box"><h1>BTC signal alerts</h1><p>{safe}</p>{body_html}</div></body></html>"""
-    # default-src 'none' neutralises any injected <script>/<img>/etc. even if a
-    # reflection slipped past escaping — this is a static, no-asset page.
-    return HTMLResponse(content=html_doc,
-                        headers={"Content-Security-Policy": "default-src 'none'"})
-
-
-def _do_unsubscribe(token: str, cfg: Config) -> str | None:
-    if not token:
-        return None
-    conn = _conn_rw(cfg)
-    try:
-        return store.deactivate_subscriber(conn, token)
-    finally:
-        conn.close()
-
-
-@app.get("/api/unsubscribe", response_class=HTMLResponse)
-def unsubscribe_confirm(token: str = Query(""),
-                        cfg: Config = Depends(get_config)) -> HTMLResponse:
-    """Public confirmation page — does NOT mutate.
-
-    A GET must be side-effect-free: corporate/AV mail link scanners (Outlook
-    SafeLinks, Gmail/Yahoo prefetch, Mimecast) issue GETs on every link in an
-    email, which previously unsubscribed subscribers the moment a message was
-    merely scanned. The actual deactivation happens on the POST below — triggered
-    either by the button here or by an RFC 8058 one-click request from the mail
-    client. (The token in the URL remains the capability.)
-    """
-    valid = bool(_TOKEN_RE.match(token))
-    safe_token = html.escape(token, quote=True)
-    form = (f'<form method="post" action="/api/unsubscribe?token={safe_token}">'
-            f'<button type="submit">Unsubscribe</button></form>') if valid else ""
-    return _unsub_page(
-        "Click below to stop receiving BTC signal alerts at your address."
-        if valid else "This unsubscribe link is invalid.",
-        body_html=form)
-
-
-@app.post("/api/unsubscribe", response_class=HTMLResponse)
-def unsubscribe_do(token: str = Query(""),
-                   cfg: Config = Depends(get_config)) -> HTMLResponse:
-    """Public (no bearer token) — the unguessable ``token`` is the capability.
-
-    Handles both the confirmation-page button and RFC 8058 one-click POSTs
-    (``List-Unsubscribe-Post: List-Unsubscribe=One-Click``) from Gmail/Yahoo.
-    Idempotent.
-    """
-    email = _do_unsubscribe(token, cfg)
-    if email:
-        # email comes from our DB, but escape defensively — historical rows may
-        # predate the tightened _EMAIL_RE above.
-        return _unsub_page(
-            f"You’ve been unsubscribed. {html.escape(email)} will no longer "
-            "receive alerts.")
-    return _unsub_page(
-        "This unsubscribe link is invalid or has already been used. "
-        "If you keep receiving alerts, reply to one of them.")
