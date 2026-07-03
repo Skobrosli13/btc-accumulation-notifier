@@ -3,7 +3,7 @@
 Mirrors ``scoring.py``/``shortterm.py`` in spirit: table-driven, testable, no
 network. The shape differs from the BTC side — instead of one asset's absolute
 0..100, this ranks a *universe* of tickers each close and surfaces the strongest
-setups. Reuses the BTC indicator primitives (``shortterm.ema/rsi/bollinger/atr``).
+setups. Reuses the shared indicator primitives (``core.indicators``).
 
 Three archetypes, chosen per ticker by priority (PEAD > momentum > mean-reversion):
 - **pead_drift** — fresh earnings surprise whose price reaction confirms the sign;
@@ -22,8 +22,8 @@ from dataclasses import dataclass, field
 
 import pandas as pd
 
-from . import shortterm
 from .config import Config
+from .core import indicators as ind
 
 # Per-archetype composite weights: (primary strength, cross-sectional rel-strength,
 # regime alignment, context bonus). Normalized, so they read as a blend.
@@ -76,10 +76,10 @@ def features(bars: list[dict]) -> dict | None:
     df = _df(bars)
     close, high, low, vol = df["close"], df["high"], df["low"], df["volume"]
     price = float(close.iloc[-1])
-    atr14 = shortterm.atr(high, low, close, 14)
+    atr14 = ind.atr(high, low, close, 14)
     atr = float(atr14.iloc[-1]) if pd.notna(atr14.iloc[-1]) else None
-    rsi14 = shortterm.rsi(close, 14)
-    _mid, _up, _lo, pctb = shortterm.bollinger(close, 20, 2.0)
+    rsi14 = ind.rsi(close, 14)
+    _mid, _up, _lo, pctb = ind.bollinger(close, 20, 2.0)
     dma50 = float(close.tail(50).mean())
     dma200 = float(close.tail(200).mean()) if len(close) >= 200 else float(close.mean())
     dollar_vol = float((close * vol).tail(20).mean())

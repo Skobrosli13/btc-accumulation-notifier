@@ -17,53 +17,10 @@ from dataclasses import dataclass
 import pandas as pd
 
 from .config import Config
-
-
-# --- Indicator primitives (return full Series, oldest->newest) ---------------
-
-def ema(series: pd.Series, span: int) -> pd.Series:
-    return series.ewm(span=span, adjust=False).mean()
-
-
-def rsi(close: pd.Series, period: int = 14) -> pd.Series:
-    delta = close.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
-    avg_loss = loss.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
-    rs = avg_gain / avg_loss
-    out = 100 - 100 / (1 + rs)
-    # Edge cases at the window seams:
-    out = out.mask((avg_loss == 0) & (avg_gain > 0), 100.0)   # only gains -> 100
-    out = out.mask((avg_gain == 0) & (avg_loss > 0), 0.0)     # only losses -> 0
-    out = out.mask((avg_gain == 0) & (avg_loss == 0), 50.0)   # flat -> neutral 50
-    return out
-
-
-def macd(close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
-    macd_line = ema(close, fast) - ema(close, slow)
-    signal_line = ema(macd_line, signal)
-    hist = macd_line - signal_line
-    return macd_line, signal_line, hist
-
-
-def bollinger(close: pd.Series, period: int = 20, mult: float = 2.0):
-    mid = close.rolling(period).mean()
-    std = close.rolling(period).std(ddof=0)
-    upper = mid + mult * std
-    lower = mid - mult * std
-    pctb = (close - lower) / (upper - lower)
-    return mid, upper, lower, pctb
-
-
-def atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
-    prev_close = close.shift(1)
-    tr = pd.concat([
-        (high - low),
-        (high - prev_close).abs(),
-        (low - prev_close).abs(),
-    ], axis=1).max(axis=1)
-    return tr.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
+# Pure indicator primitives now live in core.indicators (shared with the
+# equities engine). Re-exported here so ``shortterm.ema`` etc. and this module's
+# own internals keep working unchanged.
+from .core.indicators import atr, bollinger, ema, macd, rsi  # noqa: F401
 
 
 # --- Trigger model -----------------------------------------------------------
