@@ -275,6 +275,22 @@ def test_subscribe_unsubscribe_flow(tmp_path):
         api.app.dependency_overrides.clear()
 
 
+def test_schema_init_runs_on_startup_not_import(tmp_path, monkeypatch):
+    """§0.5: no import-time side effects — schema init moved into the FastAPI
+    lifespan, so it runs when the ASGI server starts, not when app.api imports."""
+    calls = {"n": 0}
+    monkeypatch.setattr(api, "_ensure_schema", lambda: calls.__setitem__("n", calls["n"] + 1))
+    cfg = make_config(db_path=str(tmp_path / "l.db"), api_token="secret")
+    api.app.dependency_overrides[api.get_config] = lambda: cfg
+    try:
+        # Entering the TestClient context manager drives the ASGI lifespan startup.
+        with TestClient(api.app):
+            pass
+    finally:
+        api.app.dependency_overrides.clear()
+    assert calls["n"] >= 1
+
+
 def test_unsubscribe_get_is_xss_safe(tmp_path):
     """A hostile ``token`` must never be reflected raw into the confirm page.
 

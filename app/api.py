@@ -18,6 +18,7 @@ import json
 import re
 import secrets
 import sqlite3
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
@@ -43,14 +44,6 @@ _EMAIL_RE = re.compile(r"^[^@\s<>\"'&]+@[^@\s<>\"'&]+\.[^@\s<>\"'&]+$")
 # malformed/hostile link and gets the "invalid" page (no form, no reflection).
 _TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{16,}$")
 
-app = FastAPI(title="BTC Signal API", version="1.0.0")
-
-# Stock swing tracker (second asset) — namespaced under /api/stock/*.
-app.include_router(stock_api.router)
-# Long-term stock "long buys" engine — /api/stock/longterm/*.
-app.include_router(stock_lt_api.router)
-
-
 def _ensure_schema() -> None:
     """Best-effort: create both schemas so the READ-ONLY endpoints never hit a
     missing table on a fresh box (before the first collector cron has run). The
@@ -66,7 +59,31 @@ def _ensure_schema() -> None:
         pass
 
 
-_ensure_schema()
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    """Startup work, run by the ASGI server — NOT at import (§0.5: no import-time
+    side effects). Merely importing ``app.api`` (tests, tooling) now touches no
+    database; the schema is ensured when the server actually starts."""
+    _ensure_schema()
+    yield
+
+
+app = FastAPI(title="BTC Signal API", version="1.0.0", lifespan=lifespan)
+
+# Stock swing tracker (second asset) — namespaced under /api/stock/*.
+app.include_router(stock_api.router)
+# Long-term stock "long buys" engine — /api/stock/longterm/*.
+app.include_router(stock_lt_api.router)
+
+# CORS only matters if the dashboard is served cross-origin (it usually isn't).
+# Read config here (cheap, cached, no I/O) rather than holding a module global.
+if get_config().api_cors_origin:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=[get_config().api_cors_origin],
+        allow_methods=["GET"],
+        allow_headers=["*"],
+    )
 
 # Display labels (server-side single source of truth; the dashboard never re-derives).
 _CATEGORY_LABELS = {
@@ -77,17 +94,6 @@ _COMPONENT_LABELS = {
     "trend": "Trend (EMA 9/21 spread)", "macd": "MACD histogram",
     "funding": "Funding positioning",
 }
-
-
-# CORS only matters if the dashboard is served cross-origin (it usually isn't).
-_cfg = get_config()
-if _cfg.api_cors_origin:
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=[_cfg.api_cors_origin],
-        allow_methods=["GET"],
-        allow_headers=["*"],
-    )
 
 
 # Long-term runs are a 6h cron; allow ~2 cadences + slack before "stale" so a
