@@ -79,6 +79,103 @@ def _parse_date(raw: str, default: date) -> date:
         return default
 
 
+# --- Namespaced config groups (§0.5) ----------------------------------------
+# Backward-compatible views over the flat Config below: the flat dataclass stays
+# the single source of truth (every existing cfg.<field> call site, the loader
+# and the test factory are untouched), and these typed groups are BUILT on demand
+# from it via the cfg.core / cfg.btc / cfg.equity properties. New code (routers,
+# harness, portfolio) reads cfg.btc.st_cooldown_hours etc.; nothing has to.
+
+@dataclass(frozen=True)
+class CoreConfig:
+    """Asset-agnostic infra: notifications, DB, the API gate, watchdog, freshness."""
+    db_path: str
+    api_token: str | None
+    api_cors_origin: str | None
+    public_base_url: str
+    watchdog_stale_hours: float
+    freshness_budget_days: float
+    ntfy_topic: str | None
+    ntfy_server: str
+    telegram_bot_token: str | None
+    telegram_chat_id: str | None
+    resend_api_key: str | None
+    email_from: str
+    email_to: str | None
+
+
+@dataclass(frozen=True)
+class BtcConfig:
+    """BTC/crypto: data-layer keys, long-term accumulation scoring, short-term swing."""
+    # data layers
+    fred_api_key: str | None
+    coinalyze_api_key: str | None
+    coinalyze_symbol: str
+    flow_cvd_lookback: int
+    flow_liq_spike_mult: float
+    flow_oi_bar_surge_pct: float
+    flow_liq_min_usd: float
+    glassnode_api_key: str | None
+    coinglass_api_key: str | None
+    onchain_free_enabled: bool
+    oi_flush_window_hours: float
+    exchange: str
+    symbol: str
+    # long-term composite
+    weights: dict[str, float]
+    tier_watch: float
+    tier_accumulate: float
+    tier_deepvalue: float
+    tier_hysteresis_margin: float
+    flash_fng_max: float
+    flash_drop_pct: float
+    flash_debounce_days: int
+    ath_date: date
+    peak_to_trough_days: int
+    cycle_mult_swing: float
+    # short-term swing
+    st_timeframes: tuple[str, ...]
+    st_cooldown_hours: float
+    st_rsi_oversold: float
+    st_rsi_overbought: float
+    st_vol_spike_mult: float
+    st_funding_spike: float
+    st_oi_surge_pct: float
+    st_buy_threshold: float
+    st_strong_buy_threshold: float
+    st_sell_threshold: float
+    st_strong_sell_threshold: float
+    st_regime_suppress: bool
+    st_require_confluence: bool
+
+
+@dataclass(frozen=True)
+class EquityConfig:
+    """Equities: swing screener + long-term factor engine keys and knobs."""
+    finnhub_api_key: str | None
+    alpaca_api_key: str | None
+    alpaca_secret_key: str | None
+    tiingo_api_key: str | None
+    massive_api_key: str | None
+    sec_user_agent: str
+    stock_insider_enabled: bool
+    stock_universe_path: str
+    stock_top_n: int
+    stock_pead_lookback_days: int
+    stock_pead_min_surprise: float
+    stock_min_price: float
+    stock_min_dollar_vol: float
+    stock_atr_k_stop: float
+    stock_atr_k_t1: float
+    stock_atr_k_t2: float
+    stock_time_stop_days: int
+    stock_cooldown_days: float
+    stock_allow_shorts: bool
+    stock_cost_bps: float
+    stock_lt_top_n: int
+    stock_lt_min_dollar_vol: float
+
+
 @dataclass(frozen=True)
 class Config:
     # Notifications
@@ -199,6 +296,66 @@ class Config:
     # renormalizes away (and flips active_cats) rather than silently pinning a
     # category at a stale level. .env: FRESHNESS_BUDGET_DAYS (default 3).
     freshness_budget_days: float = 3.0
+
+    # --- Namespaced views (§0.5) -----------------------------------------
+    # Typed groupings built from the flat fields above. Pure views (no state of
+    # their own), so they can never drift from the source config.
+
+    @property
+    def core(self) -> CoreConfig:
+        return CoreConfig(
+            db_path=self.db_path, api_token=self.api_token,
+            api_cors_origin=self.api_cors_origin, public_base_url=self.public_base_url,
+            watchdog_stale_hours=self.watchdog_stale_hours,
+            freshness_budget_days=self.freshness_budget_days,
+            ntfy_topic=self.ntfy_topic, ntfy_server=self.ntfy_server,
+            telegram_bot_token=self.telegram_bot_token, telegram_chat_id=self.telegram_chat_id,
+            resend_api_key=self.resend_api_key, email_from=self.email_from,
+            email_to=self.email_to)
+
+    @property
+    def btc(self) -> BtcConfig:
+        return BtcConfig(
+            fred_api_key=self.fred_api_key, coinalyze_api_key=self.coinalyze_api_key,
+            coinalyze_symbol=self.coinalyze_symbol, flow_cvd_lookback=self.flow_cvd_lookback,
+            flow_liq_spike_mult=self.flow_liq_spike_mult,
+            flow_oi_bar_surge_pct=self.flow_oi_bar_surge_pct,
+            flow_liq_min_usd=self.flow_liq_min_usd, glassnode_api_key=self.glassnode_api_key,
+            coinglass_api_key=self.coinglass_api_key,
+            onchain_free_enabled=self.onchain_free_enabled,
+            oi_flush_window_hours=self.oi_flush_window_hours, exchange=self.exchange,
+            symbol=self.symbol, weights=self.weights, tier_watch=self.tier_watch,
+            tier_accumulate=self.tier_accumulate, tier_deepvalue=self.tier_deepvalue,
+            tier_hysteresis_margin=self.tier_hysteresis_margin, flash_fng_max=self.flash_fng_max,
+            flash_drop_pct=self.flash_drop_pct, flash_debounce_days=self.flash_debounce_days,
+            ath_date=self.ath_date, peak_to_trough_days=self.peak_to_trough_days,
+            cycle_mult_swing=self.cycle_mult_swing, st_timeframes=self.st_timeframes,
+            st_cooldown_hours=self.st_cooldown_hours, st_rsi_oversold=self.st_rsi_oversold,
+            st_rsi_overbought=self.st_rsi_overbought, st_vol_spike_mult=self.st_vol_spike_mult,
+            st_funding_spike=self.st_funding_spike, st_oi_surge_pct=self.st_oi_surge_pct,
+            st_buy_threshold=self.st_buy_threshold,
+            st_strong_buy_threshold=self.st_strong_buy_threshold,
+            st_sell_threshold=self.st_sell_threshold,
+            st_strong_sell_threshold=self.st_strong_sell_threshold,
+            st_regime_suppress=self.st_regime_suppress,
+            st_require_confluence=self.st_require_confluence)
+
+    @property
+    def equity(self) -> EquityConfig:
+        return EquityConfig(
+            finnhub_api_key=self.finnhub_api_key, alpaca_api_key=self.alpaca_api_key,
+            alpaca_secret_key=self.alpaca_secret_key, tiingo_api_key=self.tiingo_api_key,
+            massive_api_key=self.massive_api_key, sec_user_agent=self.sec_user_agent,
+            stock_insider_enabled=self.stock_insider_enabled,
+            stock_universe_path=self.stock_universe_path, stock_top_n=self.stock_top_n,
+            stock_pead_lookback_days=self.stock_pead_lookback_days,
+            stock_pead_min_surprise=self.stock_pead_min_surprise,
+            stock_min_price=self.stock_min_price, stock_min_dollar_vol=self.stock_min_dollar_vol,
+            stock_atr_k_stop=self.stock_atr_k_stop, stock_atr_k_t1=self.stock_atr_k_t1,
+            stock_atr_k_t2=self.stock_atr_k_t2, stock_time_stop_days=self.stock_time_stop_days,
+            stock_cooldown_days=self.stock_cooldown_days, stock_allow_shorts=self.stock_allow_shorts,
+            stock_cost_bps=self.stock_cost_bps, stock_lt_top_n=self.stock_lt_top_n,
+            stock_lt_min_dollar_vol=self.stock_lt_min_dollar_vol)
 
     # --- Derived helpers -------------------------------------------------
 

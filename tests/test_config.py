@@ -68,3 +68,24 @@ def test_freshness_budget_default_and_override(monkeypatch):
     assert config.load_config().freshness_budget_days == 3.0
     monkeypatch.setenv("FRESHNESS_BUDGET_DAYS", "7")
     assert config.load_config().freshness_budget_days == 7.0
+
+
+def test_namespaced_views_mirror_flat_config():
+    """§0.5: cfg.core / cfg.btc / cfg.equity are pure views over the flat config."""
+    cfg = config.load_config()
+    assert cfg.core.db_path == cfg.db_path
+    assert cfg.core.public_base_url == cfg.public_base_url
+    assert cfg.btc.st_cooldown_hours == cfg.st_cooldown_hours
+    assert cfg.btc.weights == cfg.weights
+    assert cfg.equity.stock_top_n == cfg.stock_top_n
+    assert cfg.equity.sec_user_agent == cfg.sec_user_agent
+
+
+def test_namespaced_views_partition_flat_fields_without_overlap():
+    from dataclasses import fields
+    core = {f.name for f in fields(config.CoreConfig)}
+    btc = {f.name for f in fields(config.BtcConfig)}
+    equity = {f.name for f in fields(config.EquityConfig)}
+    assert not (core & btc) and not (core & equity) and not (btc & equity)  # disjoint
+    flat = {f.name for f in fields(config.Config)}
+    assert (core | btc | equity) <= flat  # every grouped field exists on Config
