@@ -13,6 +13,7 @@ Run:  uvicorn app.api:app --host 127.0.0.1 --port 8000
 """
 from __future__ import annotations
 
+import html
 import json
 import re
 import secrets
@@ -33,7 +34,14 @@ from .api_deps import conn_ro as _conn, conn_rw as _conn_rw, get_config, require
 from .config import Config, load_config
 from .sources import exchange
 
-_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+# Reflected into the unsubscribe HTML — reject any address carrying characters
+# that could break out of an HTML attribute/text node (belt-and-suspenders with
+# html.escape at render time; also stops such rows entering the DB via subscribe).
+_EMAIL_RE = re.compile(r"^[^@\s<>\"'&]+@[^@\s<>\"'&]+\.[^@\s<>\"'&]+$")
+# Subscriber tokens are secrets.token_urlsafe(32) -> URL-safe base64 [A-Za-z0-9_-].
+# Only render the unsubscribe form for a well-formed token; anything else is a
+# malformed/hostile link and gets the "invalid" page (no form, no reflection).
+_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{16,}$")
 
 app = FastAPI(title="BTC Signal API", version="1.0.0")
 
@@ -652,7 +660,10 @@ def _unsub_page(message: str, *, body_html: str = "") -> HTMLResponse:
     padding:11px 22px;font-size:14px;font-weight:600;cursor:pointer}}
 </style></head>
 <body><div class="box"><h1>BTC signal alerts</h1><p>{safe}</p>{body_html}</div></body></html>"""
-    return HTMLResponse(content=html_doc)
+    # default-src 'none' neutralises any injected <script>/<img>/etc. even if a
+    # reflection slipped past escaping — this is a static, no-asset page.
+    return HTMLResponse(content=html_doc,
+                        headers={"Content-Security-Policy": "default-src 'none'"})
 
 
 def _do_unsubscribe(token: str, cfg: Config) -> str | None:
@@ -677,11 +688,13 @@ def unsubscribe_confirm(token: str = Query(""),
     either by the button here or by an RFC 8058 one-click request from the mail
     client. (The token in the URL remains the capability.)
     """
-    form = (f'<form method="post" action="/api/unsubscribe?token={token}">'
-            f'<button type="submit">Unsubscribe</button></form>') if token else ""
+    valid = bool(_TOKEN_RE.match(token))
+    safe_token = html.escape(token, quote=True)
+    form = (f'<form method="post" action="/api/unsubscribe?token={safe_token}">'
+            f'<button type="submit">Unsubscribe</button></form>') if valid else ""
     return _unsub_page(
         "Click below to stop receiving BTC signal alerts at your address."
-        if token else "This unsubscribe link is invalid.",
+        if valid else "This unsubscribe link is invalid.",
         body_html=form)
 
 
@@ -696,8 +709,11 @@ def unsubscribe_do(token: str = Query(""),
     """
     email = _do_unsubscribe(token, cfg)
     if email:
+        # email comes from our DB, but escape defensively — historical rows may
+        # predate the tightened _EMAIL_RE above.
         return _unsub_page(
-            f"You’ve been unsubscribed. {email} will no longer receive alerts.")
+            f"You’ve been unsubscribed. {html.escape(email)} will no longer "
+            "receive alerts.")
     return _unsub_page(
         "This unsubscribe link is invalid or has already been used. "
         "If you keep receiving alerts, reply to one of them.")

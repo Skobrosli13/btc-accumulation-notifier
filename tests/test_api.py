@@ -275,6 +275,53 @@ def test_subscribe_unsubscribe_flow(tmp_path):
         api.app.dependency_overrides.clear()
 
 
+def test_unsubscribe_get_is_xss_safe(tmp_path):
+    """A hostile ``token`` must never be reflected raw into the confirm page.
+
+    Regression for a reflected XSS: the GET endpoint bypasses the bearer token,
+    so any query string is attacker-controlled. A malformed token gets the
+    inert 'invalid' page (no form, no reflection); the response also carries a
+    locked-down CSP.
+    """
+    db = str(tmp_path / "xss.db")
+    conn = store.connect(db)
+    store.init_db(conn)
+    conn.close()
+    cfg = make_config(db_path=db, api_token="secret")
+    api.app.dependency_overrides[api.get_config] = lambda: cfg
+    try:
+        c = TestClient(api.app)
+        payload = '"><script>alert(1)</script>'
+        g = c.get("/api/unsubscribe", params={"token": payload})
+        assert g.status_code == 200
+        # Not reflected verbatim; the injection is either dropped (malformed
+        # token -> no form) or HTML-escaped. Either way no live <script> tag.
+        assert "<script>alert(1)</script>" not in g.text
+        assert "invalid" in g.text.lower()  # malformed token -> invalid page
+        # CSP present on the unsubscribe surface.
+        assert g.headers.get("content-security-policy") == "default-src 'none'"
+    finally:
+        api.app.dependency_overrides.clear()
+
+
+def test_subscribe_rejects_html_metachars_in_email(tmp_path):
+    """The tightened _EMAIL_RE keeps HTML metacharacters out of stored emails
+    (defence in depth with output escaping on the unsubscribe page)."""
+    db = str(tmp_path / "email.db")
+    conn = store.connect(db)
+    store.init_db(conn)
+    conn.close()
+    cfg = make_config(db_path=db, api_token="secret")
+    api.app.dependency_overrides[api.get_config] = lambda: cfg
+    try:
+        c = TestClient(api.app)
+        for bad in ('a<b@x.com', 'a"b@x.com', "a'b@x.com", "a&b@x.com", "a>b@x.com"):
+            r = c.post("/api/subscribe", json={"email": bad}, headers=_auth())
+            assert r.status_code == 400, bad
+    finally:
+        api.app.dependency_overrides.clear()
+
+
 def test_email_recipients_dedupe(tmp_path):
     from app import notify
     db = str(tmp_path / "r.db")
