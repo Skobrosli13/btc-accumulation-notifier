@@ -30,7 +30,11 @@ from __future__ import annotations
 import random
 
 N_SHUFFLES = 50
-EXCEEDANCE_MAX_FRAC = 0.15    # >15% of shuffles beyond their dof-critical |t| = dirty
+# Dirty when more than this fraction of shuffles exceed their dof-critical |t|.
+# 0.10 (>=6/50) per the M2 power analysis: false-alarm 3.9%, detection 55% at a
+# +1 SE systematic bias and ~100% at +2 SE (0.15 had only 24% power at +1 SE —
+# a machinery bias of one standard error would have passed 3 times out of 4).
+EXCEEDANCE_MAX_FRAC = 0.10
 
 # Two-sided 95% critical values of Student's t by dof (standard table);
 # interpolated between entries, 1.96 beyond 120 dof.

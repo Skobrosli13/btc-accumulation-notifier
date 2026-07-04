@@ -133,7 +133,10 @@ def _run_car(conn, study: dict, events: list[dict]) -> list[dict]:
                             if r["included"]]
     cand_tickers = {r["ticker"] for rows in snapshots.values() for r in rows}
     cand_tickers |= {e["ticker"] for e in events if e.get("ticker")}
-    bars = eq_prices.sep_bars_bulk(lake, sorted(cand_tickers), limit=500)
+    # Full history per name: a most-recent-N window would truncate BEFORE old
+    # (IS-segment) events, and the evaluator's adjacency guard would then skip
+    # them all. SEP holds ~2.6k sessions/name — 5000 covers everything.
+    bars = eq_prices.sep_bars_bulk(lake, sorted(cand_tickers), limit=5000)
 
     cands_by_event = [snapshots[_date_iso(ev["event_ts"])] for ev in events]
     split = walkforward.split_events(events, study["registered_at"])
@@ -206,7 +209,7 @@ def cmd_run(args) -> None:
         else:
             raise SystemExit(f"evaluator {study['evaluator']} not implemented yet")
         schema.record_results(conn, rows)
-        schema.set_study_status(conn, args.name, "RUNNING")
+        schema.mark_running(conn, args.name)   # never clobbers an existing verdict
     finally:
         conn.close()
     print(f"{args.name}: wrote {len(rows)} result rows "
@@ -242,14 +245,19 @@ def cmd_placebo(args) -> None:
         else:
             raise SystemExit("car placebo wiring lands with the first car study (M3)")
         result = placebo.suite(eval_t, n=args.shuffles)
+        p = {"shuffles": args.shuffles, "horizon": h,
+             "max_exceed_frac": placebo.EXCEEDANCE_MAX_FRAC}
         schema.record_results(conn, [{
             # Column reuse, documented: PLACEBO rows store the suite summary —
             # t_clustered = 95th pct |t|, win_rate = exceedance fraction,
-            # n_events = valid shuffles. mean_car stays NULL.
+            # n_events = valid shuffles; full detail in extra_json.
             "study": args.name, "segment": "PLACEBO", "horizon": h,
             "n_events": result["n_valid"], "t_clustered": result["p95_abs_t"],
             "win_rate": result["exceed_frac"],
-            "emitter_sha": emitter_sha(), "computed_at": _now_ms()}])
+            "emitter_sha": emitter_sha(), "params_hash": params_hash(p),
+            "computed_at": _now_ms(),
+            "extra": {"clean": result["clean"], "p95_lt_2": result["p95_lt_2"],
+                      "exceedances": result["exceedances"]}}])
     finally:
         conn.close()
     print(f"{args.name} placebo: clean={result['clean']} "

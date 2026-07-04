@@ -96,54 +96,79 @@ def match_controls(event: dict, candidates: list[dict], *, k: int = K_CONTROLS,
     return tiers[-1][:k]      # thin universe: best available (may be < min_cohort)
 
 
-def daily_returns(bars: list[dict], event_ts: int, h: int) -> list[float] | None:
-    """The h per-session returns from the NEXT session's open after ``event_ts``.
+# Entry-adjacency guard: the entry bar must fall within this many ms of the
+# event, else the name's data simply doesn't cover the event (late-starting or
+# truncated series) and pricing it on the wrong calendar window would fabricate
+# CAR — the exact phantom-alpha bug the M2 adversarial verification caught.
+MAX_ENTRY_LAG_MS = 7 * _DAY_MS
+
+
+def daily_returns(bars: list[dict], event_ts: int, h: int
+                  ) -> list[tuple[int, float]] | None:
+    """The h per-session (ts, return) pairs from the NEXT session's open after
+    ``event_ts``.
 
     Session 1 = close_1/open_1 − 1 (entry at that open); sessions 2..h are
-    close-over-close. None when fewer than h post-event sessions exist (the
-    event is skipped for that horizon, never padded)."""
+    close-over-close. None when fewer than h post-event sessions exist, when the
+    entry bar lags the event by more than MAX_ENTRY_LAG_MS (a series that starts
+    after the event must be skipped, never priced on the wrong window), or when
+    any window bar carries a missing/zero price (a None/0 close would otherwise
+    crash or fabricate a −100% session)."""
     if not bars:
         return None
     ts_list = [b["ts"] for b in bars]
     start = bisect.bisect_right(ts_list, event_ts)     # first bar AFTER the event
     if start + h > len(bars):
         return None
-    first = bars[start]
-    if not first.get("open"):
+    if bars[start]["ts"] - event_ts > MAX_ENTRY_LAG_MS:
         return None
-    rets = [first["close"] / first["open"] - 1.0]
-    for i in range(start + 1, start + h):
-        prev_close = bars[i - 1]["close"]
-        if not prev_close:
-            return None
-        rets.append(bars[i]["close"] / prev_close - 1.0)
-    return rets
+    window = bars[start: start + h]
+    if any(not b.get("close") for b in window) or not window[0].get("open"):
+        return None
+    out = [(window[0]["ts"], window[0]["close"] / window[0]["open"] - 1.0)]
+    for i in range(1, h):
+        out.append((window[i]["ts"],
+                    window[i]["close"] / window[i - 1]["close"] - 1.0))
+    return out
 
 
 def event_car(event: dict, bars_by_ticker: dict[str, list[dict]],
-              controls: list[dict], h: int) -> float | None:
+              controls: list[dict], h: int) -> tuple[float, dict] | None:
     """Signed CAR_h for one event vs its matched controls (pure).
 
-    Σ_t (r_evt,t − mean over controls of r_ctl,t); a control without full
-    h-session coverage drops out entirely (a partial series would skew the
-    per-session mean); zero surviving controls ⇒ raw (unhedged) forward sum —
-    honest but rare, flagged upstream via the coverage counts. SHORT flips sign.
+    CAR = Σ over the event's h sessions of (r_evt,t − mean over controls of
+    r_ctl,t), where control returns are matched to the event's sessions BY
+    TIMESTAMP — a control with a gapped/halted series contributes exactly the
+    sessions it traded and drops out of the others (per-session renormalize),
+    never a positionally-shifted window. Returns (signed_car, diag) where diag
+    carries {"mean_controls": avg controls per session, "zero_control_sessions":
+    n} so an unhedged CAR is visible upstream; None when the event itself is
+    unpriceable. SHORT flips sign.
     """
-    ev_rets = daily_returns(bars_by_ticker.get(event.get("ticker"), []),
-                            int(event["event_ts"]), h)
-    if ev_rets is None:
+    ev = daily_returns(bars_by_ticker.get(event.get("ticker"), []),
+                       int(event["event_ts"]), h)
+    if ev is None:
         return None
-    ctl_series = []
+    # Control returns keyed by session timestamp (their own calendars).
+    ctl_by_ts: list[dict[int, float]] = []
     for c in controls:
         r = daily_returns(bars_by_ticker.get(c.get("ticker"), []),
                           int(event["event_ts"]), h)
         if r is not None:
-            ctl_series.append(r)
+            ctl_by_ts.append(dict(r))
     car = 0.0
-    for t in range(h):
-        ctl_mean = (sum(s[t] for s in ctl_series) / len(ctl_series)) if ctl_series else 0.0
-        car += ev_rets[t] - ctl_mean
-    return -car if event.get("direction") == "SHORT" else car
+    n_ctl_total = 0
+    zero_sessions = 0
+    for ts, ev_ret in ev:
+        session_ctl = [d[ts] for d in ctl_by_ts if ts in d]
+        n_ctl_total += len(session_ctl)
+        if session_ctl:
+            car += ev_ret - sum(session_ctl) / len(session_ctl)
+        else:
+            zero_sessions += 1
+            car += ev_ret          # unhedged session (flagged via diag)
+    diag = {"mean_controls": n_ctl_total / h, "zero_control_sessions": zero_sessions}
+    return (-car if event.get("direction") == "SHORT" else car), diag
 
 
 def evaluate(events: list[dict], bars_by_ticker: dict[str, list[dict]],
@@ -168,13 +193,25 @@ def evaluate(events: list[dict], bars_by_ticker: dict[str, list[dict]],
 
     out: dict = {"horizons": {}, "cars": {}, "coverage": {"n_events": len(events)}}
     priced_counts: dict[int, int] = {}
+    ctl_cov: dict[int, dict] = {}
     for h in horizons:
         rows = []                                   # (event_index, car)
+        mean_ctls: list[float] = []
+        n_unhedged = 0
         for i, ev in enumerate(events):
-            car = event_car(ev, bars_by_ticker, controls[i], h)
-            if car is not None:
-                rows.append((i, car))
+            res = event_car(ev, bars_by_ticker, controls[i], h)
+            if res is None:
+                continue
+            car, diag = res
+            rows.append((i, car))
+            mean_ctls.append(diag["mean_controls"])
+            if diag["zero_control_sessions"]:
+                n_unhedged += 1
         priced_counts[h] = len(rows)
+        # Control-coverage honesty: an unhedged CAR must be visible, not silent.
+        ctl_cov[h] = {"mean_controls": (sum(mean_ctls) / len(mean_ctls)
+                                        if mean_ctls else None),
+                      "n_events_with_unhedged_sessions": n_unhedged}
         cars = stats.winsorize([c for _i, c in rows], WINSOR_LO, WINSOR_HI)
         ts_ms = [int(events[i]["event_ts"]) for i, _c in rows]
         ct = stats.clustered_t(cars, ts_ms)
@@ -187,6 +224,7 @@ def evaluate(events: list[dict], bars_by_ticker: dict[str, list[dict]],
         }
         out["cars"][h] = [(i, w) for (i, _raw), w in zip(rows, cars)]
     out["coverage"]["n_priced_by_horizon"] = priced_counts
+    out["coverage"]["controls_by_horizon"] = ctl_cov
     return out
 
 

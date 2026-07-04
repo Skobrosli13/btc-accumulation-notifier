@@ -134,6 +134,66 @@ def test_match_controls_excludes_contaminated_and_self():
     assert "E1" not in names and "E2" not in names and len(names) == 10
 
 
+# --- M2-verification regression fixes --------------------------------------------
+
+def test_adjacency_guard_skips_late_starting_series():
+    """A series whose first post-event bar lags the event by more than the guard
+    must be skipped, never priced on the wrong calendar window (phantom alpha)."""
+    late_bars = [{"ts": (20 + k) * DAY, "open": 100.0, "high": 100.0, "low": 100.0,
+                  "close": 100.0 * (1.01 ** (k + 1)), "volume": 1.0} for k in range(30)]
+    assert car.daily_returns(late_bars, 5 * DAY, 5) is None      # 15-day lag > guard
+    # and within the guard it prices normally
+    ok_bars = _bars(5, 1.01, 40)
+    assert car.daily_returns(ok_bars, 5 * DAY, 5) is not None
+
+
+def test_controls_are_session_aligned_not_positional():
+    """A control missing one session must contribute its OTHER sessions matched
+    by timestamp — never a positionally-shifted window."""
+    ev = _event("E1", 5)
+    ev_bars = {"E1": _bars(5, 1.0, 40)}                          # event flat
+    # control: flat, but with day 7 MISSING and a +10% move on day 9
+    ctl = []
+    close = 100.0
+    for k in range(40):
+        if k == 7:
+            continue
+        opn = close
+        close = opn * (1.10 if k == 9 else 1.0)
+        ctl.append({"ts": k * DAY, "open": opn, "high": max(opn, close),
+                    "low": min(opn, close), "close": close, "volume": 1.0})
+    bars = {**ev_bars, "C0": ctl}
+    res = car.event_car(ev, bars, [{"ticker": "C0"}], 4)
+    assert res is not None
+    got, diag = res
+    # Sessions 6,8,9(+10% on the control),?  -> event 0 minus control each ts:
+    # ts6: 0-0; ts7: control missing (unhedged 0); ts8: 0 - (100->110? no: the
+    # +10% lands on ts9). ts9 is the event's 4th session: 0 - 0.10 = -0.10.
+    assert got == pytest.approx(-0.10)
+    assert diag["zero_control_sessions"] == 1                    # ts7 unhedged
+
+
+def test_none_and_zero_closes_skip_not_crash():
+    bars_none = _bars(5, 1.01, 40)
+    bars_none[9]["close"] = None
+    assert car.daily_returns(bars_none, 5 * DAY, 5) is None      # no TypeError
+    bars_zero = _bars(5, 1.01, 40)
+    bars_zero[10]["close"] = 0.0                                 # final window bar
+    assert car.daily_returns(bars_zero, 5 * DAY, 5) is None      # no bogus -100%
+
+
+def test_coverage_flags_unhedged_events():
+    events, bars, cands = _fixture()
+    out = car.evaluate(events, bars, cands, horizons=(5,))
+    cov = out["coverage"]["controls_by_horizon"][5]
+    assert cov["mean_controls"] == pytest.approx(12.0)           # all 12 flat controls
+    assert cov["n_events_with_unhedged_sessions"] == 0
+    # strip all controls -> every event unhedged and flagged
+    out2 = car.evaluate(events, bars, [[] for _ in events], horizons=(5,))
+    assert out2["coverage"]["controls_by_horizon"][5][
+        "n_events_with_unhedged_sessions"] == 5
+
+
 def test_earnings_bucket_edges():
     b = car.earnings_bucket
     assert b(0) == "0-10" and b(10) == "0-10"

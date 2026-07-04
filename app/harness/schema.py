@@ -63,7 +63,9 @@ CREATE TABLE IF NOT EXISTS study_results (
   exp_after_tax REAL,
   emitter_sha TEXT,                     -- anti-drift stamp (§5.6)
   params_hash TEXT,
-  computed_at INTEGER
+  computed_at INTEGER,
+  extra_json TEXT                       -- evaluator-specific payload (policy legs,
+                                        -- placebo suite details, regime splits)
 );
 CREATE INDEX IF NOT EXISTS ix_results_study ON study_results(study, segment, horizon);
 
@@ -97,10 +99,23 @@ def init_harness_db(conn: sqlite3.Connection) -> None:
 
 def insert_events(conn: sqlite3.Connection, rows: list[dict]) -> int:
     """INSERT OR IGNORE emitted events; the UNIQUE(study, permaticker, event_ts)
-    key makes emitter re-runs converge. Returns how many rows were NEW."""
+    key makes emitter re-runs converge. Returns how many rows were NEW.
+
+    permaticker is COALESCED to ticker (then '') — SQLite treats NULLs as
+    distinct in UNIQUE keys, so a NULL permaticker (BTC events) would silently
+    re-insert on every emitter re-run (10-minute cron ⇒ unbounded duplicates;
+    caught by the M2 adversarial verification)."""
     if not rows:
         return 0
     before = conn.execute("SELECT count(*) FROM events").fetchone()[0]
+    prepared = []
+    for r in rows:
+        d = {"cik": None, "ticker": None, "direction": None,
+             "strength": None, "tier": None, "sector": None,
+             "days_since_earnings": None, "ingested_at": None,
+             **r, "meta": json.dumps(r.get("meta") or {})}
+        d["permaticker"] = r.get("permaticker") or r.get("ticker") or ""
+        prepared.append(d)
     conn.executemany(
         """INSERT OR IGNORE INTO events
            (study, asset, permaticker, cik, ticker, event_ts, direction,
@@ -108,10 +123,7 @@ def insert_events(conn: sqlite3.Connection, rows: list[dict]) -> int:
            VALUES (:study, :asset, :permaticker, :cik, :ticker, :event_ts,
                    :direction, :strength, :tier, :sector, :days_since_earnings,
                    :meta, :ingested_at)""",
-        [{"cik": None, "permaticker": None, "ticker": None, "direction": None,
-          "strength": None, "tier": None, "sector": None,
-          "days_since_earnings": None, "ingested_at": None,
-          **r, "meta": json.dumps(r.get("meta") or {})} for r in rows])
+        prepared)
     conn.commit()
     return conn.execute("SELECT count(*) FROM events").fetchone()[0] - before
 
@@ -147,9 +159,27 @@ def register_study(conn: sqlite3.Connection, *, name: str, asset: str,
 
 def set_study_status(conn: sqlite3.Connection, name: str, status: str,
                      verdict_at: int | None = None) -> None:
-    conn.execute("UPDATE studies SET status = ?, verdict_at = ? WHERE name = ?",
-                 (status, verdict_at, name))
+    if verdict_at is None:
+        # A non-verdict update (e.g. RUNNING) must not erase an existing verdict
+        # timestamp — recomputation is routine; verdicts are events.
+        conn.execute("UPDATE studies SET status = ? WHERE name = ?", (status, name))
+    else:
+        conn.execute("UPDATE studies SET status = ?, verdict_at = ? WHERE name = ?",
+                     (status, verdict_at, name))
     conn.commit()
+
+
+# Verdict statuses that a routine re-run must never silently overwrite.
+_VERDICT_STATUSES = frozenset({"PROMOTED", "KILLED", "EXTEND", "WATCHLIST"})
+
+
+def mark_running(conn: sqlite3.Connection, name: str) -> None:
+    """Set status=RUNNING only from REGISTERED/RUNNING — a study that already
+    carries a verdict keeps it (re-running the numbers is routine; flipping a
+    PROMOTED/KILLED study back to RUNNING would erase the lab record)."""
+    cur = get_study(conn, name)
+    if cur and cur.get("status") not in _VERDICT_STATUSES:
+        set_study_status(conn, name, "RUNNING")
 
 
 def get_study(conn: sqlite3.Connection, name: str) -> dict | None:
@@ -162,21 +192,26 @@ def record_results(conn: sqlite3.Connection, rows: list[dict]) -> None:
     Prior rows for the same study+segment+horizon+tier are replaced — results
     are a pure function of (events, data, params), so recomputation supersedes."""
     for r in rows:
+        # Coalesce tier: SQL NULL never matches NULL, so a None tier would
+        # bypass the supersede DELETE and accumulate rows forever.
+        r["tier"] = r.get("tier") or ""
         conn.execute(
             "DELETE FROM study_results WHERE study=? AND segment=? AND horizon=? AND tier=?",
-            (r["study"], r["segment"], r["horizon"], r.get("tier", "")))
+            (r["study"], r["segment"], r["horizon"], r["tier"]))
     conn.executemany(
         """INSERT INTO study_results
            (study, segment, horizon, tier, n_events, n_months, mean_car,
             t_clustered, win_rate, exp_gross, exp_net, exp_after_tax,
-            emitter_sha, params_hash, computed_at)
+            emitter_sha, params_hash, computed_at, extra_json)
            VALUES (:study, :segment, :horizon, :tier, :n_events, :n_months,
                    :mean_car, :t_clustered, :win_rate, :exp_gross, :exp_net,
-                   :exp_after_tax, :emitter_sha, :params_hash, :computed_at)""",
+                   :exp_after_tax, :emitter_sha, :params_hash, :computed_at,
+                   :extra_json)""",
         [{"tier": "", "n_events": None, "n_months": None, "mean_car": None,
           "t_clustered": None, "win_rate": None, "exp_gross": None,
           "exp_net": None, "exp_after_tax": None, "emitter_sha": None,
-          "params_hash": None, "computed_at": None, **r} for r in rows])
+          "params_hash": None, "computed_at": None,
+          **r, "extra_json": json.dumps(r.get("extra") or {})} for r in rows])
     conn.commit()
 
 

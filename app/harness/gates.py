@@ -62,17 +62,22 @@ def policy_verdict(*, overlay_return: float, baseline_return: float,
     """POLICY gate (§5.5): no harm vs the naive baseline + drawdown improvement,
     in BOTH the backtest and (when supplied) the rolling forward window.
     Drawdowns are magnitudes (positive = worse). Pass keeps the 'discipline
-    overlay — not alpha' label; any failed leg demotes to unscored context."""
+    overlay — not alpha' label; any failed leg demotes to unscored context.
+
+    Each forward leg is evaluated independently and only when BOTH of its sides
+    are supplied — a missing baseline is never fabricated as 0.0, and forward
+    drawdowns are checked even if forward returns weren't passed (the nested
+    version silently skipped the DD leg — caught by the M2 verification)."""
     reasons = []
     if overlay_return < baseline_return:
         reasons.append("backtest: overlay return < baseline")
     if overlay_maxdd >= baseline_maxdd:
         reasons.append("backtest: overlay max drawdown not smaller")
-    if forward_overlay_return is not None:
-        if forward_overlay_return < (forward_baseline_return or 0.0):
+    if forward_overlay_return is not None and forward_baseline_return is not None:
+        if forward_overlay_return < forward_baseline_return:
             reasons.append("forward: overlay return < baseline")
-        if forward_overlay_maxdd is not None and \
-                forward_overlay_maxdd >= (forward_baseline_maxdd or 0.0):
+    if forward_overlay_maxdd is not None and forward_baseline_maxdd is not None:
+        if forward_overlay_maxdd >= forward_baseline_maxdd:
             reasons.append("forward: overlay max drawdown not smaller")
     return {"status": "PROMOTED" if not reasons else "WATCHLIST",
             "reasons": reasons}

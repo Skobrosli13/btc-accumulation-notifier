@@ -72,6 +72,40 @@ def test_schema_rejects_bad_enums():
     c.close()
 
 
+def test_null_permaticker_events_still_dedupe():
+    """BTC events carry no permaticker; SQLite UNIQUE treats NULLs as distinct,
+    so without coalescing every 10-min emitter re-run would duplicate rows."""
+    c = _conn()
+    ev = {"study": "btc_funding_extreme", "asset": "BTC", "ticker": "BTC",
+          "event_ts": 999, "direction": "LONG"}          # no permaticker at all
+    assert schema.insert_events(c, [ev]) == 1
+    assert schema.insert_events(c, [ev]) == 0            # deduped via coalesce
+    c.close()
+
+
+def test_mark_running_never_clobbers_a_verdict():
+    c = _conn()
+    schema.register_study(c, name="s", asset="BTC", evaluator="ts", tier="alpha",
+                          spec_path="x", registered_at=1, primary_horizon=10)
+    schema.mark_running(c, "s")
+    assert schema.get_study(c, "s")["status"] == "RUNNING"
+    schema.set_study_status(c, "s", "PROMOTED", verdict_at=123)
+    schema.mark_running(c, "s")                          # routine re-run
+    s = schema.get_study(c, "s")
+    assert s["status"] == "PROMOTED" and s["verdict_at"] == 123
+    c.close()
+
+
+def test_record_results_coalesces_none_tier():
+    c = _conn()
+    row = {"study": "s", "segment": "OOS", "horizon": 5, "tier": None, "n_events": 1}
+    schema.record_results(c, [row])
+    schema.record_results(c, [dict(row, n_events=2)])
+    rows = schema.results_for_study(c, "s", "OOS")
+    assert len(rows) == 1 and rows[0]["n_events"] == 2   # superseded, not stacked
+    c.close()
+
+
 # --- walk-forward -------------------------------------------------------------
 
 def test_segments_and_embargo():
@@ -86,6 +120,15 @@ def test_segments_and_embargo():
     assert f("2026-02-10") is None       # near registration
     assert f("2026-03-20") is None       # just after registration
     assert f("2022-02-15") == "OOS"      # clear of the embargo
+
+
+def test_embargo_boundary_is_strict():
+    """delta == embargo_ms exactly is NOT embargoed (strict '<') — pinned so an
+    off-by-one refactor gets caught."""
+    reg = _ms("2026-03-01")
+    at_edge = walkforward.IS_END_MS + walkforward.EMBARGO_MS
+    assert walkforward.segment_of(at_edge, reg) == "OOS"
+    assert walkforward.segment_of(at_edge - 1, reg) is None
 
 
 def test_split_events_reports_embargoed():

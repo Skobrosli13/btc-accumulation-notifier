@@ -147,6 +147,21 @@ def test_policy_gate_requires_both_legs():
     assert fwd_fail["status"] == "WATCHLIST"
 
 
+def test_policy_gate_forward_dd_checked_independently():
+    """Forward drawdowns WITHOUT forward returns must still be checked (the
+    nested version silently skipped this leg), and a missing forward baseline is
+    never fabricated as 0.0."""
+    v = gates.policy_verdict(overlay_return=0.5, baseline_return=0.4,
+                             overlay_maxdd=0.30, baseline_maxdd=0.45,
+                             forward_overlay_maxdd=0.50, forward_baseline_maxdd=0.10)
+    assert v["status"] == "WATCHLIST"                 # 5x-worse forward DD caught
+    # forward return supplied WITHOUT a baseline: no fabricated comparison
+    v2 = gates.policy_verdict(overlay_return=0.5, baseline_return=0.4,
+                              overlay_maxdd=0.30, baseline_maxdd=0.45,
+                              forward_overlay_return=-0.01)
+    assert v2["status"] == "PROMOTED" and v2["reasons"] == []
+
+
 def test_premium_gate():
     ok = gates.premium_verdict(net_annualized_carry=0.07, tbill_rate=0.04,
                                forced_liquidations=0, min_margin_ratio=2.5)
