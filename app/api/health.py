@@ -12,11 +12,22 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends
 
+from .. import schedule as sched
 from .. import scoring, store
 from ..api_deps import get_config, require_token
 from ..config import Config
 
 router = APIRouter()
+
+
+def _lab_sync_state(conn) -> dict:
+    """Freshness of the laptop-run lab sync from the lab_meta marker."""
+    try:
+        row = conn.execute(
+            "SELECT value FROM lab_meta WHERE key='last_sync'").fetchone()
+        return sched.lab_sync_state(row[0] if row else None)
+    except sqlite3.Error:
+        return sched.lab_sync_state(None)
 
 # Long-term runs are a 6h cron; allow ~2 cadences + slack before "stale" so a
 # single missed run isn't flagged, but a dead run_once (which the 10-min collector
@@ -55,11 +66,15 @@ def health(cfg: Config = Depends(get_config), _=Depends(require_token)) -> dict:
         "run_stale": True,
         "stale": True,
     }
+    # §10 freshness: NEXT attempts from the cron grid (never from the data),
+    # lab sync self-calibrating from its marker.
+    out["schedule"] = {**sched.btc_schedule(), "lab": sched.lab_sync_state(None)}
     try:
         conn = store.connect_readonly(cfg.db_path)
         lc = store.last_collect_ts(conn)
         lr = store.last_run_ts(conn)
         recent_reads = store.recent_run_readings(conn, _INDICATOR_HEALTH_RUNS)
+        out["schedule"]["lab"] = _lab_sync_state(conn)
         conn.close()
         inds = {}
         for name in scoring.THRESHOLDS:

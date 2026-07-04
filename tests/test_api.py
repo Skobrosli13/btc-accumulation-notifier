@@ -360,6 +360,49 @@ def test_studies_recent_events_feed(tmp_path):
         api.app.dependency_overrides.clear()
 
 
+def test_policies_state_endpoint(tmp_path):
+    from app.harness import schema as hs
+    db = str(tmp_path / "pol.db")
+    conn = store.connect(db)
+    store.init_db(conn)
+    hs.init_harness_db(conn)
+    hs.register_study(conn, name="btc_trend_policy", asset="BTC",
+                      evaluator="portfolio", tier="policy", spec_path="x",
+                      registered_at=1, primary_horizon=0)
+    hs.set_study_status(conn, "btc_trend_policy", "PROMOTED", verdict_at=2)
+    # 260 rising daily closes -> LONG regime, plus a run with a tier
+    base = int(datetime(2025, 9, 1, tzinfo=timezone.utc).timestamp() * 1000)
+    rows = [(base + i * 86_400_000, 100 + i, 101 + i, 99 + i, 100 + i, 1.0)
+            for i in range(260)]
+    store.upsert_candles(conn, "1d", rows)
+    store.record_run(conn, run_ts="2026-07-04T00:00:00+00:00", price=360.0,
+                     composite=65.0, tier="ACCUMULATE", active_cats=["price"],
+                     readings={}, tier_alerted=False, flash_alerted=False,
+                     notified_tier=None)
+    conn.close()
+    cfg = make_config(db_path=db, api_token="secret")
+    api.app.dependency_overrides[api.get_config] = lambda: cfg
+    try:
+        c = TestClient(api.app)
+        assert c.get("/api/policies/state").status_code == 401     # token-gated
+        j = c.get("/api/policies/state", headers=_auth()).json()
+        assert j["trend"]["status"] == "PROMOTED"
+        assert j["trend"]["state"] == "LONG"                       # rising series
+        assert j["accum"]["tier"] == "ACCUMULATE"
+        assert j["accum"]["dca_multiplier"] == 1.5
+        assert "not alpha" in j["note"]
+    finally:
+        api.app.dependency_overrides.clear()
+
+
+def test_health_carries_schedule_block(client):
+    j = client.get("/api/health", headers=_auth()).json()
+    assert "schedule" in j
+    assert j["schedule"]["collect_next"] > j["now"]
+    assert j["schedule"]["run_next"] > j["now"]
+    assert "lab" in j["schedule"] and "overdue" in j["schedule"]["lab"]
+
+
 def test_studies_endpoint_empty_on_fresh_db(tmp_path):
     db = str(tmp_path / "fresh.db")
     conn = store.connect(db)

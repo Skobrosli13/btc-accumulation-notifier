@@ -38,6 +38,7 @@ def recent_events(study: str = "insider_cluster", days: int = 14,
     import time
     days = max(1, min(int(days), 90))
     since = int((time.time() - days * 86_400) * 1000)
+    from .. import schedule as sched
     conn = _conn(cfg)
     try:
         study_row = _rows(conn, "SELECT * FROM studies WHERE name = ?", (study,))
@@ -52,6 +53,10 @@ def recent_events(study: str = "insider_cluster", days: int = 14,
                       "segment = 'OOS' AND horizon = "
                       "(SELECT primary_horizon FROM studies WHERE name = ?)",
                       (study, study))
+        # §10 staleness: the events arrive via the laptop nightly — the card
+        # must know how fresh the feed is (Gap C guard keys off `overdue`).
+        sync_row = _rows(conn, "SELECT value FROM lab_meta WHERE key='last_sync'")
+        lab_sync = sched.lab_sync_state(sync_row[0]["value"] if sync_row else None)
     finally:
         conn.close()
     for e in evs:
@@ -70,6 +75,7 @@ def recent_events(study: str = "insider_cluster", days: int = 14,
                             "exp_after_tax": st["exp_after_tax"],
                             "win_rate": st["win_rate"]} if st else None),
             "days": days, "events": evs,
+            "lab_sync": lab_sync,
             "note": ("Events from a pre-registered study; the status/gate stats "
                      "are the label. LIVE forward evidence accrues from these — "
                      "not investment advice.")}

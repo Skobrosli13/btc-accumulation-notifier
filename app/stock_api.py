@@ -89,6 +89,9 @@ def health(cfg: Config = Depends(_cfg), _=Depends(_require_token)) -> dict:
         "universe_n": None, "regime": None, "coverage": None, "degraded_run": None,
         "stale_positions": [],
     }
+    # §10 freshness: next cron ATTEMPTS from the grid (never from the data).
+    from . import schedule as _sched
+    out["schedule"] = _sched.stock_schedule(now)
     try:
         conn = store.connect_readonly(cfg.db_path)
         lr = stock_store.last_stock_run_ts(conn)
