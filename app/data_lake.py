@@ -80,14 +80,15 @@ class Lake:
             return None
         return df[column].max()
 
-    def query(self, sql: str):
-        """Run a DuckDB SQL query. Reference tables as
-        ``read_parquet('<lake>/<table>.parquet')`` — use :meth:`sql_table` to
-        build that path. Returns a pandas DataFrame."""
+    def query(self, sql: str, params: list | None = None):
+        """Run a DuckDB SQL query (optionally parameterized with ``?``
+        placeholders — use these for any untrusted value). Reference tables as
+        ``read_parquet('<lake>/<table>.parquet')`` via :meth:`sql_table`. Returns
+        a pandas DataFrame."""
         import duckdb
         con = duckdb.connect(database=":memory:")
         try:
-            return con.execute(sql).df()
+            return con.execute(sql, params or []).df()
         finally:
             con.close()
 
