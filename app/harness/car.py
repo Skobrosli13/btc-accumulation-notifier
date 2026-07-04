@@ -171,6 +171,25 @@ def event_car(event: dict, bars_by_ticker: dict[str, list[dict]],
     return (-car if event.get("direction") == "SHORT" else car), diag
 
 
+def aggregate(rows: list[tuple[int, float]], events: list[dict]) -> dict:
+    """Winsorized per-horizon stats from raw (event_index, car) rows (pure).
+
+    The single aggregation path — evaluate() and any chunked orchestration both
+    use it, so the winsorize-then-cluster order can never diverge. Returns
+    {stats: {n_events, n_months, mean_car, t_clustered, win_rate},
+     winsorized: [(event_index, car), ...]}."""
+    cars = stats.winsorize([c for _i, c in rows], WINSOR_LO, WINSOR_HI)
+    ts_ms = [int(events[i]["event_ts"]) for i, _c in rows]
+    ct = stats.clustered_t(cars, ts_ms)
+    return {"stats": {
+        "n_events": len(cars),
+        "n_months": ct["n_months"],
+        "mean_car": ct["mean"],
+        "t_clustered": ct["t"],
+        "win_rate": (sum(1 for c in cars if c > 0) / len(cars)) if cars else None,
+    }, "winsorized": [(i, w) for (i, _raw), w in zip(rows, cars)]}
+
+
 def evaluate(events: list[dict], bars_by_ticker: dict[str, list[dict]],
              candidates_by_event: list[list[dict]], *,
              horizons: tuple[int, ...] = HORIZONS, k: int = K_CONTROLS,
@@ -212,17 +231,9 @@ def evaluate(events: list[dict], bars_by_ticker: dict[str, list[dict]],
         ctl_cov[h] = {"mean_controls": (sum(mean_ctls) / len(mean_ctls)
                                         if mean_ctls else None),
                       "n_events_with_unhedged_sessions": n_unhedged}
-        cars = stats.winsorize([c for _i, c in rows], WINSOR_LO, WINSOR_HI)
-        ts_ms = [int(events[i]["event_ts"]) for i, _c in rows]
-        ct = stats.clustered_t(cars, ts_ms)
-        out["horizons"][h] = {
-            "n_events": len(cars),
-            "n_months": ct["n_months"],
-            "mean_car": ct["mean"],
-            "t_clustered": ct["t"],
-            "win_rate": (sum(1 for c in cars if c > 0) / len(cars)) if cars else None,
-        }
-        out["cars"][h] = [(i, w) for (i, _raw), w in zip(rows, cars)]
+        agg = aggregate(rows, events)
+        out["horizons"][h] = agg["stats"]
+        out["cars"][h] = agg["winsorized"]
     out["coverage"]["n_priced_by_horizon"] = priced_counts
     out["coverage"]["controls_by_horizon"] = ctl_cov
     return out

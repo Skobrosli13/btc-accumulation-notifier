@@ -114,6 +114,11 @@ def _run_ts(conn, study: dict, events: list[dict], *, n_resamples: int) -> list[
 # --- run: car evaluator ---------------------------------------------------------
 
 def _run_car(conn, study: dict, events: list[dict]) -> list[dict]:
+    """Chunked CAR run: MONTHLY PIT snapshots for control matching (membership
+    drifts slowly; a snapshot as of the event month's 1st is PIT-safe) and
+    YEAR-chunked bar fetching (whole-universe full histories would be ~10GB of
+    bar dicts; a year window keeps memory flat). Aggregation goes through
+    car.aggregate — the same path evaluate() uses."""
     from datetime import datetime, timezone
 
     from app.data.equities import prices as eq_prices
@@ -122,53 +127,99 @@ def _run_car(conn, study: dict, events: list[dict]) -> list[dict]:
 
     cfg = load_config()
     lake = Lake(cfg.data_lake_path)
-    # One PIT snapshot per distinct event date (candidates for control matching).
-    def _date_iso(ts): return datetime.fromtimestamp(
-        ts / 1000, tz=timezone.utc).date().isoformat()
-    snapshots: dict[str, list[dict]] = {}
-    for ev in events:
-        d = _date_iso(ev["event_ts"])
-        if d not in snapshots:
-            snapshots[d] = [r for r in eq_universe.build_from_lake(lake, d)
-                            if r["included"]]
-    cand_tickers = {r["ticker"] for rows in snapshots.values() for r in rows}
-    cand_tickers |= {e["ticker"] for e in events if e.get("ticker")}
-    # Full history per name: a most-recent-N window would truncate BEFORE old
-    # (IS-segment) events, and the evaluator's adjacency guard would then skip
-    # them all. SEP holds ~2.6k sessions/name — 5000 covers everything.
-    bars = eq_prices.sep_bars_bulk(lake, sorted(cand_tickers), limit=5000)
 
-    cands_by_event = [snapshots[_date_iso(ev["event_ts"])] for ev in events]
-    split = walkforward.split_events(events, study["registered_at"])
-    sha, now = emitter_sha(), _now_ms()
-    rows = []
-    for segment in ("IS", "OOS", "LIVE"):
-        evs = split[segment]
-        if not evs:
-            continue
-        idx = [events.index(e) for e in evs]
-        out = car.evaluate(evs, bars, [cands_by_event[i] for i in idx])
-        p = {"horizons": HORIZONS_CAR, "k": car.K_CONTROLS,
-             "min_cohort": car.MIN_COHORT}
-        for h, hstats in out["horizons"].items():
-            if hstats["mean_car"] is None:
+    # Pre-filter events before price coverage starts (SEP begins 2016-01):
+    # unpriceable, and their snapshot/bar fetches would be pure waste.
+    sep_min = str(lake.query(
+        f"SELECT min(date) AS d FROM {lake.sql_table('sep')}")["d"][0])[:10]
+    sep_min_ms = int(datetime.strptime(sep_min, "%Y-%m-%d")
+                     .replace(tzinfo=timezone.utc).timestamp() * 1000)
+    usable = [e for e in events if int(e["event_ts"]) >= sep_min_ms]
+    print(f"{study['name']}: {len(events)} events, {len(usable)} within price "
+          f"coverage (SEP starts {sep_min})")
+
+    def month_start(ts_ms: int) -> str:
+        d = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).date()
+        return f"{d.year:04d}-{d.month:02d}-01"
+
+    months = sorted({month_start(e["event_ts"]) for e in usable})
+    snapshots: dict[str, list[dict]] = {}
+    for m in months:
+        snapshots[m] = [r for r in eq_universe.build_from_lake(lake, m)
+                        if r["included"]]
+    print(f"{study['name']}: {len(months)} monthly control snapshots built")
+
+    study_ts: dict[str, list[int]] = {}
+    for e in usable:
+        study_ts.setdefault(e.get("ticker"), []).append(int(e["event_ts"]))
+    controls = [car.match_controls(e, snapshots[month_start(e["event_ts"])],
+                                   study_event_ts_by_ticker=study_ts)
+                for e in usable]
+
+    seg_of = [walkforward.segment_of(int(e["event_ts"]), study["registered_at"])
+              for e in usable]
+
+    # Year-chunked pricing.
+    rows_by = {}                                   # (segment, h) -> [(idx, car)]
+    cov_by = {}                                    # (segment, h) -> [mean_controls]
+    unhedged_by = {}
+    by_year: dict[int, list[int]] = {}
+    for i, e in enumerate(usable):
+        y = datetime.fromtimestamp(e["event_ts"] / 1000, tz=timezone.utc).year
+        by_year.setdefault(y, []).append(i)
+    for y in sorted(by_year):
+        idxs = by_year[y]
+        tks = {usable[i]["ticker"] for i in idxs}
+        for i in idxs:
+            tks |= {c["ticker"] for c in controls[i]}
+        bars = eq_prices.sep_bars_bulk(lake, sorted(tks), limit=5000,
+                                       start_date=f"{y - 1}-12-15",
+                                       end_date=f"{y + 1}-04-30")
+        for i in idxs:
+            if seg_of[i] is None:                  # embargoed
                 continue
-            cars_h = [c for _i, c in out["cars"][h]]
-            # per-event tiers vary; use the modal tier for the cost model
-            tiers = [e.get("tier") for e in evs if e.get("tier")]
+            for h in HORIZONS_CAR:
+                res = car.event_car(usable[i], bars, controls[i], h)
+                if res is None:
+                    continue
+                c_val, diag = res
+                key = (seg_of[i], h)
+                rows_by.setdefault(key, []).append((i, c_val))
+                cov_by.setdefault(key, []).append(diag["mean_controls"])
+                if diag["zero_control_sessions"]:
+                    unhedged_by[key] = unhedged_by.get(key, 0) + 1
+        print(f"  {y}: {len(idxs)} events priced against {len(tks)} names")
+
+    sha, now = emitter_sha(), _now_ms()
+    p = {"horizons": HORIZONS_CAR, "k": car.K_CONTROLS,
+         "min_cohort": car.MIN_COHORT, "monthly_snapshots": True}
+    out_rows = []
+    for segment in ("IS", "OOS", "LIVE"):
+        for h in HORIZONS_CAR:
+            rows = rows_by.get((segment, h))
+            if not rows:
+                continue
+            agg = car.aggregate(rows, usable)["stats"]
+            if agg["mean_car"] is None:
+                continue
+            cars_h = [c for _i, c in rows]
+            tiers = [usable[i].get("tier") for i, _c in rows if usable[i].get("tier")]
             tier = max(set(tiers), key=tiers.count) if tiers else None
             trip = tax.expectancy_triplet(cars_h, tier)
-            rows.append({"study": study["name"], "segment": segment, "horizon": h,
-                         "tier": tier or "", "n_events": hstats["n_events"],
-                         "n_months": hstats["n_months"],
-                         "mean_car": hstats["mean_car"],
-                         "t_clustered": hstats["t_clustered"],
-                         "win_rate": hstats["win_rate"],
-                         "exp_gross": trip["exp_gross"], "exp_net": trip["exp_net"],
-                         "exp_after_tax": trip["exp_after_tax"],
-                         "emitter_sha": sha, "params_hash": params_hash(p),
-                         "computed_at": now})
-    return rows
+            covs = cov_by.get((segment, h), [])
+            out_rows.append({
+                "study": study["name"], "segment": segment, "horizon": h,
+                "tier": tier or "", "n_events": agg["n_events"],
+                "n_months": agg["n_months"], "mean_car": agg["mean_car"],
+                "t_clustered": agg["t_clustered"], "win_rate": agg["win_rate"],
+                "exp_gross": trip["exp_gross"], "exp_net": trip["exp_net"],
+                "exp_after_tax": trip["exp_after_tax"],
+                "emitter_sha": sha, "params_hash": params_hash(p),
+                "computed_at": now,
+                "extra": {"mean_controls": (sum(covs) / len(covs)) if covs else None,
+                          "n_events_with_unhedged_sessions":
+                              unhedged_by.get((segment, h), 0)}})
+    return out_rows
 
 
 # --- run: portfolio evaluator (BTC policies) ---------------------------------------
