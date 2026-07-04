@@ -72,7 +72,7 @@ def crawl(limit: int | None = None, stale_days: int | None = None) -> int:
                             ["ticker", "fy", "quarter"], sort_col="report_ts")
                 batch = []
             log.info("%d/%d names crawled (%d events so far)", k, len(todo), n_events)
-    total = lake.read("sue_events").shape[0] if lake.exists("sue_events") else 0
+    total = lake.count("sue_events")
     log.info("done: lake sue_events now %d rows", total)
     return total
 

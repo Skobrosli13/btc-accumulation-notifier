@@ -74,7 +74,7 @@ def ingest(table: str, *, ticker: str | None = None, incremental: bool = False,
     rows = sharadar.fetch_table(table, api_key, params=params)
     if not rows:
         log.warning("%s: 0 rows fetched (no change / no data / error)", table)
-        return lake.read(table.lower()).shape[0] if lake.exists(table.lower()) else 0
+        return lake.count(table.lower())
     df = pd.DataFrame(rows)
     n = lake.upsert(table.lower(), df, PRIMARY_KEYS.get(table))
     log.info("%s: fetched %d rows -> lake now %d rows", table, len(rows), n)

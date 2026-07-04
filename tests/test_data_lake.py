@@ -56,6 +56,51 @@ def test_upsert_normalizes_date_typed_keys(tmp_path):
     assert got["note"].iloc[0] is None or got["note"].isna().iloc[0]  # None stays None
 
 
+def test_upsert_keeps_stored_row_when_it_is_fresher(tmp_path):
+    """A late-arriving stale batch must not clobber a fresher stored row —
+    freshest-wins is by lastupdated, not by arrival order."""
+    lake = Lake(tmp_path / "lake")
+    keys = ["ticker", "date"]
+    lake.upsert("sep", pd.DataFrame({"ticker": ["A"], "date": ["d1"], "close": [2.0],
+                                     "lastupdated": ["2026-03-01"]}), keys)
+    n = lake.upsert("sep", pd.DataFrame({"ticker": ["A"], "date": ["d1"], "close": [1.0],
+                                         "lastupdated": ["2026-01-01"]}), keys)
+    assert n == 1
+    assert list(lake.read("sep")["close"]) == [2.0]
+
+
+def test_upsert_schema_evolution_fills_null(tmp_path):
+    """A new vendor column appears mid-history: old rows get NULL, nothing breaks."""
+    lake = Lake(tmp_path / "lake")
+    keys = ["ticker", "date"]
+    lake.upsert("sep", pd.DataFrame({"ticker": ["A"], "date": ["d1"], "close": [1.0],
+                                     "lastupdated": ["2026-01-01"]}), keys)
+    n = lake.upsert("sep", pd.DataFrame({"ticker": ["B"], "date": ["d1"], "close": [2.0],
+                                         "lastupdated": ["2026-01-02"],
+                                         "newcol": ["x"]}), keys)
+    assert n == 2
+    got = lake.read("sep").set_index("ticker")
+    assert got.loc["B", "newcol"] == "x"
+    assert pd.isna(got.loc["A", "newcol"])
+
+
+def test_upsert_without_keys_dedupes_exact_rows(tmp_path):
+    """keys=None (SF2/ACTIONS) dedupes on all columns — overlapping re-crawls
+    converge, genuinely distinct rows all survive."""
+    lake = Lake(tmp_path / "lake")
+    v1 = pd.DataFrame({"ticker": ["A", "A"], "filingdate": ["d1", "d2"], "shares": [10, 20]})
+    assert lake.upsert("sf2", v1, None) == 2
+    v2 = pd.DataFrame({"ticker": ["A", "A"], "filingdate": ["d2", "d3"], "shares": [20, 30]})
+    assert lake.upsert("sf2", v2, None) == 3   # d2 row is an exact dupe
+
+
+def test_count(tmp_path):
+    lake = Lake(tmp_path / "lake")
+    assert lake.count("sep") == 0
+    lake.write("sep", pd.DataFrame({"ticker": ["A", "B"], "close": [1.0, 2.0]}))
+    assert lake.count("sep") == 2
+
+
 def test_max_value_for_incremental_refresh(tmp_path):
     lake = Lake(tmp_path / "lake")
     assert lake.max_value("sep", "lastupdated") is None
