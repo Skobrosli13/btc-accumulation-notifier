@@ -20,7 +20,7 @@ from .. import stock_api, stock_lt_api, stock_lt_store, stock_store, store
 from ..api_deps import get_config
 from ..config import load_config
 from ..harness import schema as harness_schema
-from . import btc, health, policies, studies, subscribe, today
+from . import book, btc, health, policies, studies, subscribe, today
 
 
 def _ensure_schema() -> None:
@@ -68,6 +68,7 @@ app.include_router(subscribe.router)
 app.include_router(studies.router)
 app.include_router(policies.router)
 app.include_router(today.router)
+app.include_router(book.router)
 # Second asset: the stock swing tracker (/api/stock/*) + long-term engine
 # (/api/stock/longterm/*) — already self-contained routers.
 app.include_router(stock_api.router)
