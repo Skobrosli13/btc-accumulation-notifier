@@ -140,3 +140,43 @@ ever pursued.
   visible here.)
 - SEP/SF1 history is a 10-year vendor window (2016+), not 1998+ as the plan
   assumed — IS is 2016–2021 (~1.2 regimes). All specs carry the caveat.
+
+## 2026-07-04 — Dashboard redesign shipped end-to-end (P0-ops → P4 + audit fix pass)
+
+DASHBOARD_REDESIGN.md v1.1 executed in full and deployed. The design law is
+now enforced everywhere: every on-screen claim traces to a lab verdict or is
+explicitly unscored context — no third kind of number.
+
+- **IA**: 🏠 Today (decision-first home: Act rows / health strip / testing
+  strip / paper book) · ₿ Bitcoin (was `/`) · 📈 Stocks · 🧪 Lab, plus the
+  owner-only 📒 /book. PWA-installable.
+- **One aggregation** (`/api/today` = the daily digest email, Gap D): act
+  rows since previous business day 00:00 ET — PROMOTED events (stale-feed
+  demoted, Gap C), tier changes + froth escalations vs the PRE-WINDOW state,
+  trend flips; testing strip with concrete next-decision dates; after-tax
+  paper NAV; health summary.
+- **Alerting (§4/§8)**: instant push = ACT (tier/exit/flash) / RISK (froth) /
+  FAIL (watchdog, always rings) with quiet hours 03-11 UTC; the stock swing
+  instant alert is RETIRED — setups record silently (row still arms cooldown
+  + forward test); everything else rides the 12:45 UTC weekday digest.
+- **P3 retirements → archive/v1**: st_winrates / stock_st_winrates /
+  stock_track_record + their generators and the M0 backtests (every alerted
+  cell had measured coin-flip; the PEAD seed was look-ahead-tainted). The
+  maturity "prior" rung died with them, both languages. Confidence %s render
+  nowhere; sue_pead's LIVE status is the swing surface's label.
+- **Paper book (meta-gate)**: after-tax NAV (harness.tax on realized legs)
+  vs SPY TR; skips recorded with reasons; /book owner-only.
+- **Directive 6 enforcement**: owner/team htpasswd split + X-Auth-User set
+  by nginx (now also in the repo's provisioning scripts); frontend
+  fail-CLOSED in production when the header is absent (lib/owner.ts).
+- **GAP E**: nightly registry snapshot now pushed off-disk to origin.
+- **Adversarial conformance audit** (6 dimensions → 27 findings, 27
+  confirmed by refutation-verifiers, 0 false positives) — all 27 closed
+  same-day. Notables: tier-change detection was window-blind (would drop
+  changes >6h old), sue_pead's verdict was hardcoded copy, the owner gate
+  was fail-open, froth wore verdict-red, PROMOTED chips lacked gate stats.
+
+Deliberately NOT done: Playwright (curl smoke script instead —
+scripts/smoke.sh runs post-deploy); Litestream/healthchecks (owner-input);
+Lake→DuckDB streaming merge (laptop nightly stays the lab's data source,
+freshness self-reported via lab_meta.last_sync).
