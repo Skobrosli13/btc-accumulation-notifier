@@ -99,6 +99,36 @@ def parse_companyconcept(payload: dict) -> dict[tuple[int, int], float]:
     return out
 
 
+def period_ends(payload: dict) -> dict[tuple[int, int], str]:
+    """Period-END date (ISO) per (fy, q) from an EDGAR companyconcept payload —
+    the earliest-filed quarterly fact's ``end`` for Q1-3, and the annual fact's
+    ``end`` for Q4. Used to join a SUE quarter to its 8-K announcement by date.
+    """
+    units = (payload or {}).get("units") or {}
+    facts = units.get("USD/shares") or units.get("USD/share") or []
+    best_q: dict[tuple[int, int], tuple[str, str]] = {}   # (fy,q) -> (filed, end)
+    best_fy: dict[int, tuple[str, str]] = {}
+    for f in facts:
+        fy, fp = f.get("fy"), f.get("fp")
+        start, end, filed = f.get("start"), f.get("end"), f.get("filed") or ""
+        if fy is None or not start or not end:
+            continue
+        dur = _duration_days(start, end)
+        if dur is None:
+            continue
+        if fp in _FP_TO_Q and _Q_MIN_DAYS <= dur <= _Q_MAX_DAYS:
+            key = (int(fy), _FP_TO_Q[fp])
+            if key not in best_q or filed < best_q[key][0]:
+                best_q[key] = (filed, end)
+        elif fp == "FY" and _FY_MIN_DAYS <= dur <= _FY_MAX_DAYS:
+            if int(fy) not in best_fy or filed < best_fy[int(fy)][0]:
+                best_fy[int(fy)] = (filed, end)
+    out = {k: end for k, (_f, end) in best_q.items()}
+    for fy, (_f, end) in best_fy.items():
+        out[(fy, 4)] = end
+    return out
+
+
 def _seasonal_diffs(eps: dict[tuple[int, int], float],
                     adjust=None) -> dict[tuple[int, int], float]:
     """d_(fy,q) = adj(fy,q)·EPS_(fy,q) − adj(fy-1,q)·EPS_(fy-1,q), where the
