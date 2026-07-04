@@ -171,6 +171,162 @@ def _run_car(conn, study: dict, events: list[dict]) -> list[dict]:
     return rows
 
 
+# --- run: portfolio evaluator (BTC policies) ---------------------------------------
+
+def _btc_daily_lake() -> tuple[list[str], list[float], list[int]]:
+    """(dates_iso, closes, ts_ms) from the lake's deep btc_daily archive."""
+    from datetime import datetime, timezone
+
+    from app.data_lake import Lake
+    lake = Lake(load_config().data_lake_path)
+    df = lake.read("btc_daily")
+    if df.empty:
+        raise SystemExit("lake btc_daily missing — run: python -m scripts.ingest_btc")
+    df = df.sort_values("date").reset_index(drop=True)
+    dates = [str(d)[:10] for d in df["date"]]
+    closes = [float(c) for c in df["close"]]
+    ts = [int(datetime.strptime(d, "%Y-%m-%d").replace(
+        tzinfo=timezone.utc).timestamp() * 1000) for d in dates]
+    return dates, closes, ts
+
+
+def _policy_row(study: str, segment: str, legs: dict, n_days: int,
+                extra: dict | None = None) -> dict:
+    return {"study": study, "segment": segment, "horizon": 0,
+            "n_events": n_days,
+            "mean_car": legs["overlay_return"] - legs["baseline_return"],
+            "exp_gross": legs["overlay_return"],
+            "emitter_sha": emitter_sha(), "computed_at": _now_ms(),
+            "extra": {**legs, **(extra or {})}}
+
+
+def _run_trend_policy(conn, study: dict) -> list[dict]:
+    from app.harness import portfolio_bt as pbt
+    from app.policies import btc as pol
+
+    _dates, closes, ts = _btc_daily_lake()
+    exposure = pol.trend_exposure(closes)      # causal over the FULL series
+
+    def window(lo_ts: int | None, hi_ts: int) -> tuple[int, int]:
+        # default len(ts), NOT 0: an empty window (e.g. LIVE right after
+        # registration) must be empty, not silently wrap to the whole series.
+        a = next((i for i, t in enumerate(ts) if lo_ts is None or t > lo_ts), len(ts))
+        b = next((i for i, t in enumerate(ts) if t > hi_ts), len(ts))
+        return a, max(a, b)      # clamp: a degenerate window is empty, never inverted
+
+    reg = study["registered_at"]
+    segments = {"IS": window(None, walkforward.IS_END_MS),
+                "OOS": window(walkforward.IS_END_MS, reg),
+                "BACKTEST": window(None, reg),
+                "LIVE": window(reg, ts[-1] + 1)}
+    rows, legs_by_segment = [], {}
+    for seg, (a, b) in segments.items():
+        if b - a < 60:
+            continue
+        ov = pbt.equity_curve(closes[a:b], exposure[a:b], switch_cost_bps=10.0)
+        bh = pbt.equity_curve(closes[a:b], [1.0] * (b - a), switch_cost_bps=10.0)
+        legs = pbt.policy_vs_baseline(
+            {"total_return": ov[-1] - 1.0, "max_drawdown": pbt.max_drawdown(ov)},
+            {"total_return": bh[-1] - 1.0, "max_drawdown": pbt.max_drawdown(bh)})
+        legs_by_segment[seg] = legs
+        rows.append(_policy_row(study["name"], seg, legs, b - a))
+
+    bt = legs_by_segment.get("BACKTEST")
+    live = legs_by_segment.get("LIVE") or {}
+    verdict = gates.policy_verdict(
+        overlay_return=bt["overlay_return"], baseline_return=bt["baseline_return"],
+        overlay_maxdd=bt["overlay_maxdd"], baseline_maxdd=bt["baseline_maxdd"],
+        forward_overlay_return=live.get("overlay_return"),
+        forward_baseline_return=live.get("baseline_return"),
+        forward_overlay_maxdd=live.get("overlay_maxdd"),
+        forward_baseline_maxdd=live.get("baseline_maxdd"))
+    schema.set_study_status(conn, study["name"], verdict["status"],
+                            verdict_at=_now_ms())
+    print(f"{study['name']}: {verdict['status']}"
+          + (f" — {'; '.join(verdict['reasons'])}" if verdict["reasons"] else ""))
+    return rows
+
+
+def _accum_tier_series(cfg) -> tuple[list[str], list[float], list[str]]:
+    """No-look-ahead daily (dates, closes, tiers) via the multi-cycle panel
+    (network: Coinbase + FRED + BGeometrics statics). Mirrors
+    calibrate._track_record's expanding-percentile loop exactly."""
+    import numpy as np
+
+    from app import scoring
+    from scripts import backtest_longterm, calibrate
+
+    px, native = backtest_longterm._panel(cfg)
+    inds = [k for k in backtest_longterm.BACKBONE + backtest_longterm.ONCHAIN
+            if k in px.columns]
+    seeds = calibrate._seed_history(px, inds, native=native)
+    rows = px.dropna(subset=["price_to_wma200"]).reset_index(drop=True)
+    hist = {k: list(seeds.get(k, [])) for k in inds}
+    dates, closes, tiers = [], [], []
+    for _, r in rows.iterrows():
+        sub: dict[str, float] = {}
+        for name in inds:
+            v = r.get(name)
+            if v is None or not np.isfinite(v):
+                continue
+            hist[name].append(float(v))
+            sub[name] = scoring.rank_score(hist[name], float(v),
+                                           scoring.DIRECTION[name])
+        cats = scoring.category_scores(sub)
+        comp, _ = scoring.composite(cats, cfg.weights, 1.0)
+        wma = r["close"] / r["price_to_wma200"] if r["price_to_wma200"] else None
+        tiers.append(scoring.tier(comp, r["close"], wma, cfg.tier_watch,
+                                  cfg.tier_accumulate, cfg.tier_deepvalue))
+        dates.append(str(r["date"])[:10])
+        closes.append(float(r["close"]))
+    return dates, closes, tiers
+
+
+def _run_accum_policy(conn, study: dict) -> list[dict]:
+    from app.harness import portfolio_bt as pbt
+    from app.policies import btc as pol
+
+    cfg = load_config()
+    try:
+        dates, closes, tiers = _accum_tier_series(cfg)
+    except SystemExit:
+        raise
+    except Exception as exc:  # noqa: BLE001 - network panel is genuinely optional
+        raise SystemExit(
+            f"BLOCKED: accum backtest panel unavailable ({exc}) — the forward "
+            "leg accrues from live runs; re-run when the panel sources are up")
+    n = len(closes)
+    contrib = list(range(0, n, 7))                  # weekly budget
+    scales = pol.accum_scales([tiers[i] for i in contrib])
+    overlay = pbt.dca_simulate(closes, contrib, budget=1.0, scales=scales)
+    plain = pbt.dca_simulate(closes, contrib, budget=1.0)
+    legs = pbt.policy_vs_baseline(overlay, plain)
+    verdict = gates.policy_verdict(
+        overlay_return=legs["overlay_return"], baseline_return=legs["baseline_return"],
+        overlay_maxdd=legs["overlay_maxdd"], baseline_maxdd=legs["baseline_maxdd"])
+    schema.set_study_status(conn, study["name"], verdict["status"],
+                            verdict_at=_now_ms())
+    print(f"{study['name']}: {verdict['status']}"
+          + (f" — {'; '.join(verdict['reasons'])}" if verdict["reasons"] else ""))
+    return [_policy_row(study["name"], "BACKTEST", legs, n,
+                        extra={"window": f"{dates[0]}..{dates[-1]}",
+                               "contributions": len(contrib),
+                               "tier_counts": {t: tiers.count(t)
+                                               for t in set(tiers)}})]
+
+
+_POLICY_RUNNERS = {"btc_trend_policy": _run_trend_policy,
+                   "btc_accum_policy": _run_accum_policy}
+
+
+def _run_portfolio(conn, study: dict) -> list[dict]:
+    base = study["name"].split("-v")[0]             # <study>-v2 reuses the runner
+    fn = _POLICY_RUNNERS.get(base)
+    if fn is None:
+        raise SystemExit(f"no portfolio runner wired for {study['name']}")
+    return fn(conn, study)
+
+
 # --- commands --------------------------------------------------------------------
 
 def cmd_register(args) -> None:
@@ -199,6 +355,18 @@ def cmd_run(args) -> None:
         study = schema.get_study(conn, args.name)
         if not study:
             raise SystemExit(f"unknown study {args.name} — register first")
+        if study["evaluator"] == "portfolio":
+            # Policies are continuous overlays — no events table; the runner
+            # also sets the POLICY verdict itself. A re-run recomputes the WHOLE
+            # window set, so clear prior non-placebo rows first (a segment that
+            # disappears — e.g. a mis-windowed LIVE — must not linger as stale).
+            rows = _run_portfolio(conn, study)
+            conn.execute("DELETE FROM study_results WHERE study=? AND segment != 'PLACEBO'",
+                         (args.name,))
+            conn.commit()
+            schema.record_results(conn, rows)
+            print(f"{args.name}: wrote {len(rows)} result rows (sha {emitter_sha()})")
+            return
         events = schema.events_for_study(conn, args.name)
         if not events:
             raise SystemExit(f"no events for {args.name} — emit events first")

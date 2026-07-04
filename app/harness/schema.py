@@ -50,7 +50,10 @@ CREATE TABLE IF NOT EXISTS studies (
 
 CREATE TABLE IF NOT EXISTS study_results (
   study TEXT,
-  segment TEXT CHECK(segment IN ('IS','OOS','LIVE','PLACEBO')),
+  -- BACKTEST = a continuous-overlay window spanning IS+OOS (portfolio policies:
+  -- a DCA curve can't be split at a boundary — later equity depends on earlier
+  -- accumulation), distinct from the event segments.
+  segment TEXT CHECK(segment IN ('IS','OOS','LIVE','PLACEBO','BACKTEST')),
   horizon INTEGER,
   tier TEXT,                            -- cap tier the row aggregates ('' = all)
   n_events INTEGER,
