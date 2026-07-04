@@ -1,0 +1,68 @@
+[
+ {
+  "asset": "BTC",
+  "evaluator": "portfolio",
+  "name": "btc_trend_policy",
+  "primary_horizon": 0,
+  "registered_at": 1783135914040,
+  "spec_path": "studies\\btc_trend_policy.md",
+  "status": "PROMOTED",
+  "tier": "policy",
+  "verdict_at": 1783136005256
+ },
+ {
+  "asset": "BTC",
+  "evaluator": "portfolio",
+  "name": "btc_accum_policy",
+  "primary_horizon": 0,
+  "registered_at": 1783136025555,
+  "spec_path": "studies\\btc_accum_policy.md",
+  "status": "PROMOTED",
+  "tier": "policy",
+  "verdict_at": 1783136041064
+ },
+ {
+  "asset": "EQ",
+  "evaluator": "car",
+  "name": "insider_cluster",
+  "primary_horizon": 21,
+  "registered_at": 1783136670315,
+  "spec_path": "studies\\insider_cluster.md",
+  "status": "PROMOTED",
+  "tier": "alpha",
+  "verdict_at": 1783139779171
+ },
+ {
+  "asset": "EQ",
+  "evaluator": "car",
+  "name": "sue_pead",
+  "primary_horizon": 21,
+  "registered_at": 1783137449306,
+  "spec_path": "studies\\sue_pead.md",
+  "status": "EXTEND",
+  "tier": "alpha",
+  "verdict_at": 1783143682854
+ },
+ {
+  "asset": "EQ",
+  "evaluator": "car",
+  "name": "clone13f",
+  "primary_horizon": 63,
+  "registered_at": 1783174100919,
+  "spec_path": "studies\\clone13f.md",
+  "status": "KILLED",
+  "tier": "alpha",
+  "verdict_at": 1783175092852
+ },
+ {
+  "asset": "EQ",
+  "evaluator": "portfolio",
+  "name": "lt_factor",
+  "primary_horizon": 0,
+  "registered_at": 1783176376664,
+  "spec_path": "studies\\lt_factor.md",
+  "status": "WATCHLIST",
+  "tier": "policy",
+  "verdict_at": 1783176548176
+ }
+]
