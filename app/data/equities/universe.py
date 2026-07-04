@@ -70,6 +70,50 @@ def dollar_volume_20d(closes: list[float], volumes: list[float]) -> float | None
     return sum(c * v for c, v in pairs) / len(pairs)
 
 
+def build_from_lake(lake, as_of: str, *, excluded_tickers=frozenset(),
+                    common_only: bool = True) -> list[dict]:
+    """PIT universe snapshot as of ``as_of`` from the lake (TICKERS + DAILY + SEP).
+
+    Joins on ticker (within SEP-covered securities), pulls the latest DAILY
+    market cap (Sharadar reports it in $millions -> ×1e6) and the trailing-20d
+    price + dollar volume from SEP, then classifies each name. Needs TICKERS +
+    DAILY + SEP ingested; returns [] if any is missing.
+    """
+    for t in ("tickers", "daily", "sep"):
+        if not lake.exists(t):
+            return []
+    cat = "AND category LIKE '%Common Stock%'" if common_only else ""
+    sql = f"""
+        WITH secs AS (
+            SELECT DISTINCT permaticker, ticker, sector, category
+            FROM {lake.sql_table('tickers')}
+            WHERE "table" = 'SEP' {cat}
+        ),
+        mcap AS (
+            SELECT ticker, marketcap FROM (
+                SELECT ticker, marketcap,
+                       row_number() OVER (PARTITION BY ticker ORDER BY date DESC) rn
+                FROM {lake.sql_table('daily')} WHERE date <= ?
+            ) WHERE rn = 1
+        ),
+        px AS (
+            SELECT ticker, max_by(close, date) AS price,
+                   avg(close * volume) AS dollar_vol_20d
+            FROM (
+                SELECT ticker, date, close, volume,
+                       row_number() OVER (PARTITION BY ticker ORDER BY date DESC) rn
+                FROM {lake.sql_table('sep')} WHERE date <= ?
+            ) WHERE rn <= 20
+            GROUP BY ticker
+        )
+        SELECT s.permaticker, s.ticker, s.sector,
+               m.marketcap * 1e6 AS mcap_usd, p.price, p.dollar_vol_20d
+        FROM secs s JOIN mcap m USING(ticker) JOIN px p USING(ticker)
+    """
+    df = lake.query(sql, [as_of, as_of])
+    return build_snapshot(as_of, df.to_dict("records"), excluded_tickers)
+
+
 def build_snapshot(as_of: str, rows: list[dict],
                    excluded_tickers=frozenset()) -> list[dict]:
     """Assemble the PIT universe snapshot for ``as_of`` from per-name rows already

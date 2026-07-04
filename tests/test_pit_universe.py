@@ -1,7 +1,10 @@
 """PIT universe classification + snapshot, and the Shumway delisting policy."""
 from __future__ import annotations
 
+import pandas as pd
+
 from app.data.equities import delisting, universe
+from app.data_lake import Lake
 
 
 def test_tier_boundaries():
@@ -52,6 +55,32 @@ def test_build_snapshot_includes_since_delisted_name():
     assert by_ticker["SHELL"]["tier"] is None and by_ticker["SHELL"]["included"] is False
     assert by_ticker["SECRET"]["excluded"] is True and by_ticker["SECRET"]["included"] is False
     assert all(r["date"] == "2022-06-30" for r in snap)
+
+
+def test_build_from_lake_joins_tickers_daily_sep(tmp_path):
+    lake = Lake(tmp_path / "lake")
+    assert universe.build_from_lake(lake, "2026-01-10") == []      # nothing ingested
+    lake.write("tickers", pd.DataFrame({
+        "table": ["SEP", "SF1", "SEP", "SEP"],
+        "permaticker": [1, 1, 2, 3],
+        "ticker": ["AAPL", "AAPL", "PENNY", "FUND"],
+        "sector": ["Tech", "Tech", "Fin", None],
+        "category": ["Domestic Common Stock", "Domestic Common Stock",
+                     "Domestic Common Stock", "ETF"]}))     # FUND excluded (not common)
+    lake.write("daily", pd.DataFrame({
+        "ticker": ["AAPL", "AAPL", "PENNY"],
+        "date": ["2026-01-05", "2026-01-09", "2026-01-09"],
+        "marketcap": [3_900_000.0, 4_000_000.0, 10.0]}))     # $M: AAPL $4T, PENNY $10M
+    lake.write("sep", pd.DataFrame({
+        "ticker": ["AAPL", "AAPL", "PENNY"],
+        "date": ["2026-01-08", "2026-01-09", "2026-01-09"],
+        "close": [199.0, 200.0, 4.0], "volume": [1_000_000.0, 1_000_000.0, 1000.0]}))
+    snap = universe.build_from_lake(lake, "2026-01-10")
+    by = {r["ticker"]: r for r in snap}
+    assert "FUND" not in by                                   # non-common filtered out
+    assert by["AAPL"]["tier"] == "large" and by["AAPL"]["included"] is True
+    assert by["AAPL"]["price"] == 200.0                       # latest close in the window
+    assert by["PENNY"]["tier"] is None and by["PENNY"]["included"] is False  # sub-micro
 
 
 # --- delisting-return policy (Shumway) ---------------------------------------
