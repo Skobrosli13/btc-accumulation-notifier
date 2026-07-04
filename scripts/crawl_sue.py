@@ -32,7 +32,12 @@ from app.sources.stocks import universe as sec     # noqa: E402
 log = logging.getLogger("crawl-sue")
 
 
-def crawl(limit: int | None = None) -> int:
+def crawl(limit: int | None = None, stale_days: int | None = None) -> int:
+    """``stale_days=None`` = initial-crawl resume (skip any ticker already in
+    the lake). With ``stale_days=N`` (the monthly-refresh mode) only tickers
+    whose NEWEST crawled event is younger than N days are skipped — otherwise
+    the per-ticker resume would freeze every name at its first crawl and new
+    quarters would never arrive."""
     cfg = load_config()
     lake = Lake(cfg.data_lake_path)
     from datetime import datetime, timezone
@@ -40,7 +45,13 @@ def crawl(limit: int | None = None) -> int:
     uni = [r["ticker"] for r in universe.build_from_lake(lake, today) if r["included"]]
     done = set()
     if lake.exists("sue_events"):
-        done = set(lake.read("sue_events")["ticker"].unique())
+        df = lake.read("sue_events")
+        if stale_days is None:
+            done = set(df["ticker"].unique())
+        else:
+            cutoff = (datetime.now(timezone.utc).timestamp() - stale_days * 86400) * 1000
+            newest = df.groupby("ticker")["report_ts"].max()
+            done = set(newest[newest >= cutoff].index)
     todo = [t for t in uni if t not in done]
     if limit:
         todo = todo[:limit]
@@ -70,4 +81,7 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     p = argparse.ArgumentParser()
     p.add_argument("--limit", type=int, default=None)
-    crawl(limit=p.parse_args().limit)
+    p.add_argument("--stale-days", type=int, default=None,
+                   help="refresh mode: re-crawl tickers whose newest event is older than N days")
+    args = p.parse_args()
+    crawl(limit=args.limit, stale_days=args.stale_days)

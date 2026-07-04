@@ -42,6 +42,16 @@ PRIMARY_KEYS = {
     "EVENTS": None, "SFP": ["ticker", "date"], "INDICATORS": None,
 }
 
+# Column driving --incremental (.gte filter) per table. SF2/ACTIONS carry no
+# lastupdated; their natural append column stands in (Form 3/4/5 rows are
+# append-only by filing date; actions by action date).
+INCREMENTAL_COLS = {
+    "SF2": "filingdate",
+    "ACTIONS": "date",
+    "SF3": "calendardate", "SF3A": "calendardate", "SF3B": "calendardate",
+}
+_DEFAULT_INCREMENTAL_COL = "lastupdated"
+
 
 def ingest(table: str, *, ticker: str | None = None, incremental: bool = False,
            lake: Lake | None = None, api_key: str | None = None) -> int:
@@ -55,11 +65,12 @@ def ingest(table: str, *, ticker: str | None = None, incremental: bool = False,
     if ticker:
         params["ticker"] = ticker.upper()
     if incremental:
-        since = lake.max_value(table, "lastupdated")
+        col = INCREMENTAL_COLS.get(table, _DEFAULT_INCREMENTAL_COL)
+        since = lake.max_value(table.lower(), col)
         if since is not None:
-            # Sharadar filters lastupdated with a .gte operator (ISO date).
-            params["lastupdated.gte"] = str(since)[:10]
-            log.info("%s incremental: lastupdated >= %s", table, params["lastupdated.gte"])
+            # Sharadar filters date columns with a .gte operator (ISO date).
+            params[f"{col}.gte"] = str(since)[:10]
+            log.info("%s incremental: %s >= %s", table, col, params[f"{col}.gte"])
     rows = sharadar.fetch_table(table, api_key, params=params)
     if not rows:
         log.warning("%s: 0 rows fetched (no change / no data / error)", table)

@@ -57,8 +57,25 @@ class Lake:
         """
         if df is None or df.empty:
             return self.read(table).shape[0] if self.exists(table) else 0
+        df = df.copy()
         if self.exists(table):
-            df = pd.concat([self.read(table), df], ignore_index=True)
+            old = self.read(table)
+            # Normalize EVERY shared date-object column to ISO strings (null-
+            # safe): a bulk-loaded parquet stores DATE-typed columns while the
+            # cursor API delivers strings — mixed object columns break sorting,
+            # silently defeat key-dedup (date(...) != '2026-07-03'), and abort
+            # the parquet write. ISO strings sort identically to dates.
+            import datetime as _dt
+            for col in set(old.columns) & set(df.columns):
+                for frame in (old, df):
+                    if frame[col].dtype != object:
+                        continue
+                    s = frame[col].dropna()
+                    if not s.empty and isinstance(
+                            s.iloc[0], (_dt.date, _dt.datetime)):
+                        frame[col] = frame[col].map(
+                            lambda v: str(v) if v is not None and v == v else v)
+            df = pd.concat([old, df], ignore_index=True)
         if sort_col and sort_col in df.columns:
             df = df.sort_values(sort_col, kind="stable")
         # Dedupe on the keys actually present; a key column missing from the frame

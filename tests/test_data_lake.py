@@ -31,6 +31,31 @@ def test_upsert_is_idempotent_and_keeps_freshest(tmp_path):
     assert got == {"A": 1.5, "B": 2.0, "C": 3.0}   # A took the fresher value
 
 
+def test_upsert_normalizes_date_typed_keys(tmp_path):
+    """A bulk-loaded parquet stores DATE columns; the cursor API sends ISO
+    strings — the merge must still dedupe and sort (regression: the nightly
+    incremental blew up on date-vs-str comparison and would have silently
+    double-inserted rows)."""
+    from datetime import date
+    lake = Lake(tmp_path / "lake")
+    # NON-key date column (calendardate) + a nullable string col: the normalize
+    # must cover every shared date column (pyarrow can't write mixed objects)
+    # while never stringifying None/NaN.
+    lake.write("sep", pd.DataFrame({"ticker": ["A"], "date": [date(2026, 7, 2)],
+                                    "close": [1.0], "lastupdated": [date(2026, 7, 2)],
+                                    "calendardate": [date(2026, 6, 30)],
+                                    "note": [None]}))
+    new = pd.DataFrame({"ticker": ["A", "A"], "date": ["2026-07-02", "2026-07-03"],
+                        "close": [1.5, 2.0], "lastupdated": ["2026-07-03", "2026-07-03"],
+                        "calendardate": ["2026-06-30", "2026-06-30"],
+                        "note": [None, "x"]})
+    n = lake.upsert("sep", new, ["ticker", "date"])
+    assert n == 2                                       # restated 07-02 deduped
+    got = lake.read("sep").sort_values("date")
+    assert list(got["close"]) == [1.5, 2.0]             # freshest won
+    assert got["note"].iloc[0] is None or got["note"].isna().iloc[0]  # None stays None
+
+
 def test_max_value_for_incremental_refresh(tmp_path):
     lake = Lake(tmp_path / "lake")
     assert lake.max_value("sep", "lastupdated") is None
