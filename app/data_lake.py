@@ -45,13 +45,14 @@ class Lake:
             return pd.DataFrame()
         return pd.read_parquet(self.path(table))
 
-    def upsert(self, table: str, df: pd.DataFrame, keys: list[str],
+    def upsert(self, table: str, df: pd.DataFrame, keys: list[str] | None,
                *, sort_col: str = "lastupdated") -> int:
         """Merge ``df`` into ``table``, keeping the freshest row per ``keys``.
 
         Rows are concatenated onto the existing table, sorted by ``sort_col``
         (if present) so the newest lands last, then deduped on ``keys`` keeping
-        the last. Idempotent: re-upserting the same rows leaves the table
+        the last (``keys=None`` dedupes on all columns — for tables with no clean
+        primary key). Idempotent: re-upserting the same rows leaves the table
         unchanged. Returns the resulting row count.
         """
         if df is None or df.empty:
@@ -60,7 +61,12 @@ class Lake:
             df = pd.concat([self.read(table), df], ignore_index=True)
         if sort_col and sort_col in df.columns:
             df = df.sort_values(sort_col, kind="stable")
-        df = df.drop_duplicates(subset=keys, keep="last").reset_index(drop=True)
+        # Dedupe on the keys actually present; a key column missing from the frame
+        # (malformed response) degrades to all-column dedupe rather than crashing.
+        subset = [k for k in keys if k in df.columns] if keys else None
+        if keys and not subset:
+            subset = None
+        df = df.drop_duplicates(subset=subset, keep="last").reset_index(drop=True)
         self.write(table, df)
         return len(df)
 

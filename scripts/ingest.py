@@ -1,0 +1,85 @@
+"""Ingest a Sharadar table into the Parquet lake (idempotent) — §4.1.
+
+    python -m scripts.ingest TICKERS
+    python -m scripts.ingest SF1 --ticker AAPL
+    python -m scripts.ingest DAILY --incremental        # only rows changed since the lake's newest
+
+Fetches via the datatables cursor (app.data.equities.sharadar), then merges into
+the lake with a per-table primary key so re-runs converge (freshest wins). SEP/
+SF1 full pulls are large (multi-cadence, cached upstream) — filter with --ticker
+for a smoke, or run --incremental after the first full load. Raw is re-derivable
+from the vendor, so the lake is the cache of record (no separate raw store yet).
+"""
+from __future__ import annotations
+
+import argparse
+import logging
+import sys
+from pathlib import Path
+
+import pandas as pd
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from app.config import load_config                     # noqa: E402
+from app.data.equities import sharadar                 # noqa: E402
+from app.data_lake import Lake                          # noqa: E402
+
+log = logging.getLogger("ingest")
+
+# Primary key per table for the idempotent upsert (None => dedupe on all columns).
+PRIMARY_KEYS = {
+    # 'table' distinguishes which Sharadar dataset covers a security (SEP/SF1/...);
+    # keep it in the PK so the raw TICKERS rows aren't collapsed on ingest.
+    "TICKERS": ["table", "permaticker", "ticker"],
+    "SEP": ["ticker", "date"],
+    "SF1": ["ticker", "dimension", "datekey"],
+    "DAILY": ["ticker", "date"],
+    "SF2": None,        # insider events — no clean PK, dedupe exact rows
+    "SF3": None, "SF3A": None, "SF3B": None,
+    "ACTIONS": None,    # corporate actions — dedupe exact rows
+    "METRICS": ["ticker", "date"], "SP500": None,
+    "EVENTS": None, "SFP": ["ticker", "date"], "INDICATORS": None,
+}
+
+
+def ingest(table: str, *, ticker: str | None = None, incremental: bool = False,
+           lake: Lake | None = None, api_key: str | None = None) -> int:
+    cfg = load_config()
+    api_key = api_key or cfg.nasdaq_data_link_api_key
+    if not api_key:
+        raise SystemExit("NASDAQ_DATA_LINK_API_KEY not set — cannot ingest Sharadar")
+    lake = lake or Lake(cfg.data_lake_path)
+    table = table.upper()
+    params: dict = {"qopts.per_page": 10000}
+    if ticker:
+        params["ticker"] = ticker.upper()
+    if incremental:
+        since = lake.max_value(table, "lastupdated")
+        if since is not None:
+            # Sharadar filters lastupdated with a .gte operator (ISO date).
+            params["lastupdated.gte"] = str(since)[:10]
+            log.info("%s incremental: lastupdated >= %s", table, params["lastupdated.gte"])
+    rows = sharadar.fetch_table(table, api_key, params=params)
+    if not rows:
+        log.warning("%s: 0 rows fetched (no change / no data / error)", table)
+        return lake.read(table.lower()).shape[0] if lake.exists(table.lower()) else 0
+    df = pd.DataFrame(rows)
+    n = lake.upsert(table.lower(), df, PRIMARY_KEYS.get(table))
+    log.info("%s: fetched %d rows -> lake now %d rows", table, len(rows), n)
+    return n
+
+
+def main(argv=None) -> None:
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+    p = argparse.ArgumentParser(description="Ingest a Sharadar table into the Parquet lake")
+    p.add_argument("table", help="Sharadar table, e.g. TICKERS / SF1 / SEP / ACTIONS")
+    p.add_argument("--ticker", help="restrict to one ticker (smoke / partial ingest)")
+    p.add_argument("--incremental", action="store_true",
+                   help="only fetch rows changed since the lake's newest lastupdated")
+    args = p.parse_args(argv)
+    ingest(args.table, ticker=args.ticker, incremental=args.incremental)
+
+
+if __name__ == "__main__":
+    main()
