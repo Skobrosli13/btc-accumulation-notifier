@@ -40,13 +40,6 @@ _REBASE_TOL = 0.02         # entry-bar close drift beyond this => split/adjustme
 _YAHOO_DELAY_S = 0.15      # keyless-path politeness delay (+ jitter) between chart calls
 
 
-def _winrates() -> dict:
-    try:
-        return json.loads(Path(__file__).with_name("stock_st_winrates.json").read_text())
-    except (OSError, json.JSONDecodeError):
-        return {}
-
-
 def _structure_stop(bars: list[dict], report_ts: int, direction: str) -> float | None:
     """Swing low/high since the earnings report — the PEAD thesis-invalidation level."""
     seg = [b for b in bars if b["ts"] >= report_ts]
@@ -425,7 +418,11 @@ def run(cfg: Config, *, dry_run: bool = False, limit: int | None = None,
         candidates.append(cand)
 
     ranked = stock_scoring.rank(candidates, regime, universe_ret63)
-    winrates = _winrates()
+    # P3 retirement: stock_st_winrates.json is archived (the honest recalibration
+    # measured every cell not-significant), so confidence runs on its built-in
+    # PRIORs — a recorded label, never displayed as measured. archetype_maturity
+    # over {} is always "forward", matching the artifact's own verdict.
+    winrates: dict = {}
 
     # Pass 1: levels + confidence + expected-value PRIORITY per candidate.
     records: list = []

@@ -42,7 +42,7 @@ import requests
 # Allow running as `python scripts/eval_netactivity.py` as well as `-m scripts...`.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from scripts.st_validation import wilson_interval  # noqa: E402
+from app.harness.stats import wilson_ci  # noqa: E402  (st_validation retired -> archive/v1)
 
 BC = "https://api.blockchain.info/charts"
 _Z_WINDOW = 90          # trailing days, EXCLUDING the current point (live definition)
@@ -104,7 +104,7 @@ def _bucket_stats(sub: pd.DataFrame, h: int) -> dict | None:
     eps = _episode_dates(list(sub.index), h)
     outs = sub.loc[eps, col]
     wins = int((outs > 0).sum())
-    lo, hi = wilson_interval(wins, len(outs))
+    lo, hi = wilson_ci(wins, len(outs))  # n>0 guaranteed by the empty-check above
     return {"episodes": len(outs), "hit": (wins / len(outs) if len(outs) else None),
             "lo": lo, "hi": hi, "mean": float(outs.mean())}
 

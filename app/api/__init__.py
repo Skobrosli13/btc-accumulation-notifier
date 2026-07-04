@@ -7,10 +7,10 @@ lifespan + CORS + router includes) and the :mod:`~app.api.health`,
 
 Re-exports the small surface that tests/tooling import as ``app.api.*``:
 ``app``, ``get_config`` (for FastAPI dependency_overrides), and the pure
-helpers ``_trigger_stats`` / ``_lt_breakdown`` exercised directly by tests.
+helper ``_lt_breakdown`` exercised directly by tests.
 """
 from ..api_deps import get_config
-from .btc import _lt_breakdown, _trigger_stats
+from .btc import _lt_breakdown
 from .main import app
 
-__all__ = ["app", "get_config", "_lt_breakdown", "_trigger_stats"]
+__all__ = ["app", "get_config", "_lt_breakdown"]

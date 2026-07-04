@@ -6,15 +6,12 @@ under ``/api/stock/*`` so the two asset dashboards never collide.
 """
 from __future__ import annotations
 
-import json
 import sqlite3
 from datetime import datetime, timezone
-from functools import lru_cache
-from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
-from . import stock_confidence, stock_positions, stock_store, store
+from . import stock_positions, stock_store, store
 from .api_deps import conn_ro as _conn, get_config as _cfg, require_token as _require_token
 from .config import Config
 
@@ -29,21 +26,10 @@ _DEGRADED_RUNS = 3
 _POSITION_STALE_MS = 7 * 86_400_000
 
 
-@lru_cache(maxsize=1)
-def _track_record() -> dict:
-    try:
-        return json.loads(Path(__file__).with_name("stock_track_record.json").read_text())
-    except (OSError, json.JSONDecodeError):
-        return {}
-
-
-@lru_cache(maxsize=1)
-def _winrates() -> dict:
-    try:
-        return json.loads(Path(__file__).with_name("stock_st_winrates.json").read_text())
-    except (OSError, json.JSONDecodeError):
-        return {}
-
+# P3 retirement: the stock_track_record.json / stock_st_winrates.json loaders
+# are gone (artifacts archived to archive/v1 — the seed was look-ahead-tainted
+# and the honest recalibration measured coin-flip). Setup trust now reads from
+# the lab's sue_pead verdict; nothing here re-derives a maturity rung.
 
 # Layer -> the run-readings counts key that proves data actually flowed.
 _LAYER_COUNT_KEYS = {
@@ -133,23 +119,6 @@ def health(cfg: Config = Depends(_cfg), _=Depends(_require_token)) -> dict:
     return out
 
 
-def _setup_maturity(archetype: str, edge_class: str | None) -> str:
-    """The honesty rung ('edge' | 'forward') the dashboard badge renders — the SAME
-    rung the alert email stamped. Prefers the edge_class persisted at signal time
-    (what the email used); pre-migration rows derive it from the currently loaded
-    win-rates via stock_confidence.archetype_maturity."""
-    if edge_class in ("edge", "forward"):
-        return edge_class
-    return stock_confidence.archetype_maturity(archetype, _winrates())
-
-
-def _annotate_maturity(rows: list[dict]) -> list[dict]:
-    """Attach the per-archetype maturity rung to raw position rows (in place)."""
-    for r in rows:
-        r["maturity"] = stock_confidence.archetype_maturity(r.get("archetype"), _winrates())
-    return rows
-
-
 def _setup_from_signal(s: dict) -> dict:
     """Shape a stored stock_signals row (+ parsed detail) into a screener setup card."""
     d = s.get("detail") or {}
@@ -161,7 +130,6 @@ def _setup_from_signal(s: dict) -> dict:
         "archetype": s["archetype"], "archetype_label": d.get("archetype_label", s["archetype"]),
         "composite": s["composite"], "surfaced": d.get("surfaced", True),
         "edge_class": d.get("edge_class", "unproven"), "priority": d.get("priority"),
-        "maturity": _setup_maturity(s["archetype"], d.get("edge_class")),
         "catalyst": d.get("catalyst"),
         "name": feat.get("name"), "sector": feat.get("sector"),
         "confidence": {
@@ -208,8 +176,10 @@ def screener(cfg: Config = Depends(_cfg), _=Depends(_require_token)) -> dict:
         "price_source": readings.get("price_source", cfg.stock_price_source),
         "surfaced": [s for s in setups if s["surfaced"]],
         "watchlist": [s for s in setups if not s["surfaced"]][:20],
-        "note": ("Cross-sectional swing screener. Confidence is a backtested prior "
-                 "until the live position tracker confirms it. Alert-only, not advice."),
+        "note": ("Cross-sectional swing screener — RECORDING ONLY. The alerted "
+                 "population measured statistically indistinguishable from a coin "
+                 "flip; setups accrue forward evidence for the lab (sue_pead), "
+                 "they are not picks. Alert-only, not advice."),
     }
 
 
@@ -226,22 +196,12 @@ def positions(cfg: Config = Depends(_cfg), _=Depends(_require_token)) -> dict:
         conn.close()
     summary = stock_positions.summarize(closed)  # excludes voided ('rebased') rows
     recent_closed = sorted(closed, key=lambda r: r.get("closed_ts") or 0, reverse=True)[:40]
-    # per-position maturity rung so the tracker cards read the same honesty
-    # vocabulary as the screener setups and the alert emails
-    for rows in (openp, pending, recent_closed):
-        _annotate_maturity(rows)
     return {"open": openp, "pending": pending, "recent_closed": recent_closed,
             "summary": summary, "n_open": len(openp), "n_pending": len(pending),
             "n_closed": len(closed),
             "note": ("Forward-tested on the tracker's own signals — out-of-sample, "
                      "grows over time. Fills are at the NEXT session's open (pending "
                      "until then); voided/rebased rows never count.")}
-
-
-@router.get("/track_record")
-def track_record(_=Depends(_require_token)) -> dict:
-    tr = _track_record()
-    return {"available": True, **tr} if tr.get("available") else {"available": False}
 
 
 @router.get("/alerts")

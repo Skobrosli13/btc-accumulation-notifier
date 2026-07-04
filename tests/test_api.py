@@ -164,12 +164,12 @@ def test_lt_breakdown_cycle_ath_fallbacks():
     assert cyc2["ath_source"] == "config"
 
 
-def test_trigger_stats_unmeasured_marker():
-    wr = {"ema_cross_bull": {"n": 124, "win_rate": 0.508}}
-    assert api._trigger_stats(wr, "ema_cross_bull")["n"] == 124
-    # keys with no cell (funding/OI, flow) get an explicit marker, not None
-    assert api._trigger_stats(wr, "funding_spike_bull") == {"unmeasured": True}
-    assert api._trigger_stats({}, "liq_long_flush") == {"unmeasured": True}
+def test_triggers_carry_no_winrate_stats(client):
+    """P3 retirement: per-trigger win-rate cells are archived (the alerted
+    population measured coin-flip) — the payload must not resurrect them."""
+    j = client.get("/api/shortterm/latest", headers=_auth()).json()
+    for t in (j.get("latest") or {}).get("triggers") or []:
+        assert "stats" not in t
 
 
 def test_live_performance_contract(tmp_path):

@@ -663,7 +663,7 @@ def test_has_transport_predicate():
         dataclasses.replace(bare, resend_api_key="k", email_to="a@b.c")) is True
 
 
-# --- API: per-setup maturity rung ------------------------------------------------
+# --- API: setup shape after the P3 maturity retirement ---------------------------
 
 def _signal_row(detail: dict) -> dict:
     return {"ticker": "AAA", "rank": 1, "direction": "BUY", "archetype": "momentum",
@@ -673,23 +673,14 @@ def _signal_row(detail: dict) -> dict:
             "detail": detail}
 
 
-def test_setup_serves_maturity_rung():
-    # the rung persisted at signal time (what the alert email used) is preferred
+def test_setup_serves_no_maturity_rung():
+    """P3 retirement: the winrate-derived maturity rung is gone — setup trust
+    reads from the lab's sue_pead verdict, not a per-archetype cell. The stored
+    edge_class passes through untouched as a historical record only."""
     out = stock_api._setup_from_signal(_signal_row({"edge_class": "forward"}))
-    assert out["maturity"] == "forward" and out["edge_class"] == "forward"
-    assert stock_api._setup_from_signal(_signal_row({"edge_class": "edge"}))["maturity"] == "edge"
-    # pre-migration rows (no stored edge_class) derive from the loaded win-rates;
-    # the committed seed has no significant cells, so every archetype is 'forward'
-    legacy = stock_api._setup_from_signal(_signal_row({}))
-    assert legacy["maturity"] == "forward"
-    assert legacy["edge_class"] == "unproven"   # legacy default untouched
-
-
-def test_positions_annotated_with_maturity():
-    rows = [{"ticker": "AAA", "archetype": "momentum"},
-            {"ticker": "BBB", "archetype": "pead_drift"}]
-    out = stock_api._annotate_maturity(rows)
-    assert all(r["maturity"] in ("edge", "forward") for r in out)
+    assert "maturity" not in out
+    assert out["edge_class"] == "forward"
+    assert stock_api._setup_from_signal(_signal_row({}))["edge_class"] == "unproven"
 
 
 # --- estimate snapshot guard ---------------------------------------------------

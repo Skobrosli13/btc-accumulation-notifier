@@ -38,24 +38,6 @@ _COMPONENT_LABELS = {
 
 
 @lru_cache(maxsize=1)
-def _st_winrates() -> dict:
-    """Read app/st_winrates.json once (emitted by scripts/st_calibrate.py). {} if absent."""
-    try:
-        return json.loads((_APP_DIR / "st_winrates.json").read_text())
-    except (OSError, json.JSONDecodeError):
-        return {}
-
-
-def _trigger_stats(wr: dict, key: str) -> dict:
-    """Historical win-rate cell for a trigger key, or an explicit
-    {"unmeasured": true} marker when the calibration JSON carries no cell for it
-    (funding/OI and order-flow triggers are not replayable from candle history,
-    so they can never have one). Serving None would render as blank conviction
-    rather than "no coverage". Tolerates both the old and new st_winrates shapes."""
-    return wr.get(key) or {"unmeasured": True}
-
-
-@lru_cache(maxsize=1)
 def _track_record_data() -> dict:
     """Read app/track_record.json once (emitted by scripts/calibrate.py). {} if absent."""
     try:
@@ -337,7 +319,6 @@ def _enrich_st(conn, cfg: Config, sig: dict | None, tf: str,
         state = sig.get("st_state", "NEUTRAL")
         st_price = sig.get("price")
         atr = (sig.get("indicators") or {}).get("atr")
-        wr = _st_winrates().get("timeframes", {}).get(tf, {})
         live_trigs = shortterm.detect_triggers(df, cfg, funding, oi_chg_pct)
         # Confluence counts CANDLE triggers only (funding/OI triggers are
         # context-only), mirroring the collector's gate exactly so the dashboard
@@ -351,8 +332,9 @@ def _enrich_st(conn, cfg: Config, sig: dict | None, tf: str,
                 dirs.count(t.direction), shortterm.regime_aligned(t.direction, regime),
                 alerting.is_counter_trend(t.direction, state)),
             "levels": shortterm.trade_levels(t.direction, st_price, atr),
-            # historical win-rate + ATR R-expectancy, or {"unmeasured": true}
-            "stats": _trigger_stats(wr, t.key),
+            # P3 retirement: per-trigger win-rate cells (st_winrates.json) are
+            # archived — the whole alerted population measured coin-flip, so a
+            # per-cell number was false precision. The lab is the verdict now.
         } for t in live_trigs]
     except Exception:  # noqa: BLE001 - never 500 the dashboard over a recompute
         pass
