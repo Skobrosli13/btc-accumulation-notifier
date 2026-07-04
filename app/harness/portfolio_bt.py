@@ -95,6 +95,38 @@ def dca_simulate(closes: list[float], contribution_idx: list[int],
             "total_return": (final / contributed - 1.0) if contributed else 0.0}
 
 
+def rebalance_backtest(port_ret: list[float], bench_ret: list[float]) -> dict:
+    """Monthly-rebalance long-portfolio vs a benchmark from aligned per-period
+    return series (pure). ``port_ret[m]`` / ``bench_ret[m]`` are the realized
+    fractional returns of the portfolio and benchmark over rebalance period m.
+
+    Returns {n_periods, port_curve, bench_curve, active, port_total, bench_total,
+    active_total, port_maxdd, bench_maxdd} where ``active[m]`` = port − bench is
+    the monthly active-return series the gate's clustered t runs on, and the
+    curves compound from 1.0. Missing (None) periods are dropped pairwise so a
+    gap in one series never desynchronizes the other.
+    """
+    pairs = [(p, b) for p, b in zip(port_ret, bench_ret)
+             if p is not None and b is not None]
+    if not pairs:
+        return {"n_periods": 0, "port_curve": [], "bench_curve": [], "active": [],
+                "port_total": None, "bench_total": None, "active_total": None,
+                "port_maxdd": None, "bench_maxdd": None}
+    port_curve, bench_curve = [1.0], [1.0]
+    active = []
+    for p, b in pairs:
+        port_curve.append(port_curve[-1] * (1.0 + p))
+        bench_curve.append(bench_curve[-1] * (1.0 + b))
+        active.append(p - b)
+    return {
+        "n_periods": len(pairs),
+        "port_curve": port_curve, "bench_curve": bench_curve, "active": active,
+        "port_total": port_curve[-1] - 1.0, "bench_total": bench_curve[-1] - 1.0,
+        "active_total": port_curve[-1] - bench_curve[-1],
+        "port_maxdd": max_drawdown(port_curve), "bench_maxdd": max_drawdown(bench_curve),
+    }
+
+
 def policy_vs_baseline(overlay: dict, baseline: dict) -> dict:
     """The two POLICY-gate legs from two simulator outputs (either simulator)."""
     o_ret = overlay.get("total_return")

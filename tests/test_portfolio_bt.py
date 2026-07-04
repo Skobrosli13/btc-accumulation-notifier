@@ -53,6 +53,19 @@ def test_dca_spend_capped_by_cash_and_smax():
     assert out["cash"] == pytest.approx(0.0)
 
 
+def test_rebalance_backtest_active_and_curves():
+    # port +10%, +0%, +20%; bench +5%, +5%, +5%
+    bt = pbt.rebalance_backtest([0.10, 0.0, 0.20], [0.05, 0.05, 0.05])
+    assert bt["n_periods"] == 3
+    assert bt["active"] == pytest.approx([0.05, -0.05, 0.15])
+    assert bt["port_total"] == pytest.approx(1.10 * 1.0 * 1.20 - 1.0)
+    assert bt["bench_total"] == pytest.approx(1.05 ** 3 - 1.0)
+    # pairwise drop: a None in either series removes that period from both
+    bt2 = pbt.rebalance_backtest([0.1, None, 0.2], [0.05, 0.05, 0.05])
+    assert bt2["n_periods"] == 2 and bt2["active"] == pytest.approx([0.05, 0.15])
+    assert pbt.rebalance_backtest([], [])["n_periods"] == 0
+
+
 def test_trend_exposure_hysteresis():
     closes = [10.0, 10.0, 10.0, 11.0, 10.4, 9.0]
     exp = pol.trend_exposure(closes, period=3, band=0.02)

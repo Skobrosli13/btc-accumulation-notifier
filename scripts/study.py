@@ -388,8 +388,178 @@ def _run_accum_policy(conn, study: dict) -> list[dict]:
                                                for t in set(tiers)}})]
 
 
+def _monthly_price_panel(lake, table: str, tickers=None):
+    """Month-end adjusted-close panel: DataFrame (index='YYYY-MM', cols=ticker).
+    max_by(closeadj, date) = the last adjusted close of each calendar month."""
+    filt, params = "", []
+    if tickers:
+        ph = ",".join("?" for _ in tickers)
+        filt, params = f"WHERE ticker IN ({ph})", list(tickers)
+    df = lake.query(
+        f"SELECT ticker, strftime(CAST(date AS DATE), '%Y-%m') AS ym, "
+        f"max_by(closeadj, date) AS close "
+        f"FROM {lake.sql_table(table)} {filt} GROUP BY ticker, ym", params)
+    return df.pivot(index="ym", columns="ticker", values="close").sort_index()
+
+
+def _month_end_dates(lake) -> dict:
+    df = lake.query(
+        f"SELECT strftime(CAST(date AS DATE), '%Y-%m') AS ym, max(date) AS d "
+        f"FROM {lake.sql_table('sep')} GROUP BY 1")
+    return {r["ym"]: str(r["d"])[:10] for _, r in df.iterrows()}
+
+
+_LT_FACTOR_COLS = ("ticker", "datekey", "pe", "evebitda", "fcf", "marketcap",
+                   "gp", "assets", "roic", "netmargin", "ncfo", "netinc",
+                   "ncfdiv", "ncfcommon", "de", "currentratio", "opinc")
+_LT_TOP_N = 30
+_LT_RT_COST = 0.0020        # 20bps blended round-trip on the fraction of book turned
+_LT_TIERS = ("small", "mid", "large")
+
+
+def _run_lt_factor(conn, study: dict) -> list[dict]:
+    """Monthly-rebalance QVM backtest vs the equal-weight PIT universe AND a
+    50/50 VTV+QUAL ETF blend; verdict = gates.lt_factor_verdict (§5.5)."""
+    from datetime import datetime, timezone
+
+    import numpy as np
+
+    from app.data.equities import universe as eq_universe
+    from app.data_lake import Lake
+    from app.harness import portfolio_bt as pbt
+    from app.lt import factor_screener as fscr
+
+    cfg = load_config()
+    lake = Lake(cfg.data_lake_path)
+    prices = _monthly_price_panel(lake, "sep")
+    etf = _monthly_price_panel(lake, "sfp", tickers=("VTV", "QUAL"))
+    med = _month_end_dates(lake)
+    art = lake.query(
+        f"SELECT {', '.join(_LT_FACTOR_COLS)} FROM {lake.sql_table('sf1')} "
+        f"WHERE dimension = 'ART'").sort_values("datekey")
+
+    months = [m for m in prices.index if m in etf.index]
+    # need 13 months of price history for 12-1 momentum, and a next month for the
+    # forward return -> rebalance range [13, len-2].
+    rebal = months[13:-1]
+    print(f"lt_factor: {len(rebal)} monthly rebalances {rebal[0]}..{rebal[-1]}")
+
+    def etf_ret(i):
+        try:
+            r1 = etf.loc[months[i + 1], "VTV"] / etf.loc[months[i], "VTV"] - 1
+            r2 = etf.loc[months[i + 1], "QUAL"] / etf.loc[months[i], "QUAL"] - 1
+            return 0.5 * r1 + 0.5 * r2
+        except (KeyError, ZeroDivisionError):
+            return None
+
+    port_ret, uni_ret, e_ret, month_ts = [], [], [], []
+    prev_sel: set = set()
+    for gi, ym in enumerate(rebal):
+        i = months.index(ym)
+        as_of = med[ym]
+        universe = {r["ticker"] for r in eq_universe.build_from_lake(lake, as_of)
+                    if r["included"] and r["tier"] in _LT_TIERS}
+        if not universe:
+            port_ret.append(None); uni_ret.append(None); e_ret.append(None)
+            month_ts.append(None); continue
+        # PIT fundamentals: latest ART datekey <= as_of, per ticker
+        fund = art[art["datekey"] <= as_of].groupby("ticker").tail(1)
+        fund = fund[fund["ticker"].isin(universe)].copy()
+        # 12-1 momentum (skip most recent month): price[M-1]/price[M-13]-1
+        p_prev, p_13 = prices.loc[months[i - 1]], prices.loc[months[i - 13]]
+        mom = (p_prev / p_13 - 1.0)
+        fund["mom_12_1"] = fund["ticker"].map(mom)
+        sel = fscr.select(fund, top_n=_LT_TOP_N)
+        sel_tickers = list(sel["ticker"])
+
+        fwd = (prices.loc[months[i + 1]] / prices.loc[months[i]] - 1.0)
+        sel_fwd = [fwd.get(t) for t in sel_tickers]
+        sel_fwd = [x for x in sel_fwd if x is not None and np.isfinite(x)]
+        uni_fwd = [fwd.get(t) for t in universe]
+        uni_fwd = [x for x in uni_fwd if x is not None and np.isfinite(x)]
+        if not sel_fwd or not uni_fwd:
+            port_ret.append(None); uni_ret.append(None); e_ret.append(None)
+            month_ts.append(None); prev_sel = set(sel_tickers); continue
+
+        # turnover cost on the portfolio leg (the strategy's real disadvantage)
+        cur = set(sel_tickers)
+        turnover = (len(cur - prev_sel) / len(cur)) if cur else 0.0
+        prev_sel = cur
+
+        port_ret.append(sum(sel_fwd) / len(sel_fwd) - turnover * _LT_RT_COST)
+        uni_ret.append(sum(uni_fwd) / len(uni_fwd))
+        e_ret.append(etf_ret(i))
+        month_ts.append(int(datetime.strptime(as_of, "%Y-%m-%d")
+                            .replace(tzinfo=timezone.utc).timestamp() * 1000))
+
+    # segment by IS <= 2021-12-31 / OOS after
+    def seg(ts): return "IS" if ts <= walkforward.IS_END_MS else "OOS"
+    rows_active_u: dict = {"IS": [], "OOS": []}
+    rows_active_e: dict = {"IS": [], "OOS": []}
+    ts_by: dict = {"IS": [], "OOS": []}
+    for p, u, e, ts in zip(port_ret, uni_ret, e_ret, month_ts):
+        if ts is None or p is None or u is None:
+            continue
+        s = seg(ts)
+        rows_active_u[s].append(p - u)
+        ts_by[s].append(ts)
+        if e is not None:
+            rows_active_e[s].append((p - e, ts))
+
+    sha, now = emitter_sha(), _now_ms()
+    p_hash = params_hash({"top_n": _LT_TOP_N, "rt_cost": _LT_RT_COST,
+                          "tiers": _LT_TIERS})
+    out_rows, legs = [], {}
+    for segment in ("IS", "OOS"):
+        au, ts_u = rows_active_u[segment], ts_by[segment]
+        ae = rows_active_e[segment]
+        if len(au) < 2:
+            continue
+        t_u = stats.clustered_t(au, ts_u)["t"]
+        t_e = (stats.clustered_t([a for a, _ in ae], [t for _, t in ae])["t"]
+               if len(ae) >= 2 else None)
+        legs[segment] = {"t_vs_universe": t_u, "t_vs_etf": t_e,
+                         "n_months": len(au)}
+        out_rows.append({
+            "study": study["name"], "segment": segment, "horizon": 0,
+            "n_events": len(au), "n_months": len(au),
+            "mean_car": sum(au) / len(au),
+            "t_clustered": min([x for x in (t_u, t_e) if x is not None], default=None),
+            "emitter_sha": sha, "params_hash": p_hash, "computed_at": now,
+            "extra": {"t_vs_universe": t_u, "t_vs_etf": t_e,
+                      "active_mean_vs_universe": sum(au) / len(au),
+                      "active_mean_vs_etf": (sum(a for a, _ in ae) / len(ae)
+                                             if ae else None)}})
+
+    # BACKTEST display row: compounded curves over the full window
+    bt_u = pbt.rebalance_backtest(port_ret, uni_ret)
+    bt_e = pbt.rebalance_backtest(port_ret, e_ret)
+    out_rows.append({
+        "study": study["name"], "segment": "BACKTEST", "horizon": 0,
+        "n_events": bt_u["n_periods"], "mean_car": bt_u["active_total"],
+        "emitter_sha": sha, "params_hash": p_hash, "computed_at": now,
+        "extra": {"port_total": bt_u["port_total"],
+                  "universe_total": bt_u["bench_total"],
+                  "etf_total": bt_e["bench_total"],
+                  "port_maxdd": bt_u["port_maxdd"],
+                  "active_total_vs_universe": bt_u["active_total"],
+                  "active_total_vs_etf": bt_e["active_total"]}})
+
+    oos = legs.get("OOS", {})
+    v = gates.lt_factor_verdict(t_vs_universe=oos.get("t_vs_universe"),
+                                t_vs_etf=oos.get("t_vs_etf"),
+                                n_months=oos.get("n_months", 0))
+    schema.set_study_status(conn, study["name"], v["status"], verdict_at=_now_ms())
+    print(f"{study['name']}: {v['status']}"
+          + (f" — {'; '.join(v['reasons'])}" if v["reasons"] else "")
+          + f"  [OOS t_vs_universe={oos.get('t_vs_universe')} "
+            f"t_vs_etf={oos.get('t_vs_etf')} n_months={oos.get('n_months')}]")
+    return out_rows
+
+
 _POLICY_RUNNERS = {"btc_trend_policy": _run_trend_policy,
-                   "btc_accum_policy": _run_accum_policy}
+                   "btc_accum_policy": _run_accum_policy,
+                   "lt_factor": _run_lt_factor}
 
 
 def _run_portfolio(conn, study: dict) -> list[dict]:
