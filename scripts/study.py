@@ -89,8 +89,9 @@ def _run_ts(conn, study: dict, events: list[dict], *, n_resamples: int) -> list[
                  "mean_block": ts_study.MEAN_BLOCK_DAYS}
             out = ts_study.evaluate(
                 closes, ts_ms, [e["event_ts"] for e in evs], h_days=h,
-                direction=("SHORT" if all(e.get("direction") == "SHORT" for e in evs)
-                           else "LONG"),
+                # score each event by its OWN claimed direction (contrarian
+                # studies fire both ways; a uniform sign would mis-score them)
+                directions=[e.get("direction") or "LONG" for e in evs],
                 n_resamples=n_resamples,
                 split_ts_ms=ts_study.SPLIT_2024_MS)
             a = out["all"]

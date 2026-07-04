@@ -93,14 +93,18 @@ def _regime_at(closes: list[float], i: int, period: int = REGIME_PERIOD) -> str:
     return "bull" if closes[i] >= ma else "bear"
 
 
-def _population_stats(fwd: list[float], ev_ts: list[int], direction: str,
+def _population_stats(fwd: list[float], ev_ts: list[int], signs: list[float],
                       rets: list[float], indices: list[int], h: int,
                       n_resamples: int, mean_block: int, seed: int) -> dict:
-    """Observed stats + bootstrap p for one event population (pure)."""
+    """Observed stats + bootstrap p for one event population (pure).
+
+    ``signs`` is per-event (+1 LONG / −1 SHORT), applied identically to the
+    observed forward returns and to every resample's placements — a mixed-
+    direction study is scored per each event's own claimed direction."""
     if not fwd:
         return {"n_events": 0, "observed_mean": None, "p_value": None,
                 "t_clustered": None, "n_months": 0, "win_rate": None}
-    signed = [-f if direction == "SHORT" else f for f in fwd]
+    signed = [s * f for s, f in zip(signs, fwd)]
     obs_mean = sum(signed) / len(signed)
     ct = stats.clustered_t(signed, ev_ts)
     rnd = random.Random(seed)
@@ -108,14 +112,13 @@ def _population_stats(fwd: list[float], ev_ts: list[int], direction: str,
     valid = 0
     for _ in range(n_resamples):
         boot = stationary_bootstrap(rets, rnd, mean_block)
-        sample = [f for f in (_forward_from_returns(boot, i, h) for i in indices)
-                  if f is not None]
+        sample = [s * f for s, f in
+                  ((s, _forward_from_returns(boot, i, h))
+                   for s, i in zip(signs, indices)) if f is not None]
         if not sample:
             continue
         valid += 1
-        m = sum(sample) / len(sample)
-        m = -m if direction == "SHORT" else m
-        if m >= obs_mean:
+        if sum(sample) / len(sample) >= obs_mean:
             at_least += 1
     return {"n_events": len(signed),
             "observed_mean": obs_mean,
@@ -126,33 +129,41 @@ def _population_stats(fwd: list[float], ev_ts: list[int], direction: str,
 
 def evaluate(closes: list[float], ts_ms: list[int], event_ts: list[int], *,
              h_days: int, direction: str = "LONG",
+             directions: list[str] | None = None,
              n_resamples: int = N_RESAMPLES, mean_block: int = MEAN_BLOCK_DAYS,
              seed: int = 42, split_ts_ms: int | None = None,
              regime_period: int = REGIME_PERIOD) -> dict:
     """Run a BTC time-series study (pure, deterministic).
 
     ``closes``/``ts_ms``: the daily series ascending; ``event_ts``: raw event
-    timestamps (ms). Returns observed vs bootstrap-baseline stats for the whole
+    timestamps (ms). ``directions`` (aligned with ``event_ts``) scores each
+    event by its OWN claimed direction — required for mixed contrarian studies
+    (e.g. funding extremes fire both ways); ``direction`` is the uniform
+    fallback. Returns observed vs bootstrap-baseline stats for the whole
     de-correlated population, per 200-DMA regime, and (when ``split_ts_ms``)
     pre/post the structural break.
     """
+    dirs = directions if directions is not None else [direction] * len(event_ts)
     order = sorted(range(len(event_ts)), key=lambda k: event_ts[k])
     ev_sorted = [int(event_ts[k]) for k in order]
+    dir_sorted = [dirs[k] for k in order]
     kept = stats.spaced_subset(ev_sorted, h_days * _DAY_MS)     # de-correlate
     ev_kept = [ev_sorted[i] for i in kept]
+    sign_kept = [-1.0 if dir_sorted[i] == "SHORT" else 1.0 for i in kept]
 
     rets = _returns(closes)
     idxs = _event_indices(ts_ms, ev_kept)
     # entry close at bar i => forward over return slots i..i+h-1
-    rows = []                                    # (event_ts, bar_idx, fwd)
-    for ts, i in zip(ev_kept, idxs):
+    rows = []                                    # (event_ts, bar_idx, fwd, sign)
+    for ts, i, s in zip(ev_kept, idxs, sign_kept):
         f = _forward_from_returns(rets, i, h_days)
         if f is not None:
-            rows.append((ts, i, f))
+            rows.append((ts, i, f, s))
 
     def pop(sub_rows: list[tuple], seed_offset: int = 0) -> dict:
         return _population_stats(
-            [r[2] for r in sub_rows], [r[0] for r in sub_rows], direction,
+            [r[2] for r in sub_rows], [r[0] for r in sub_rows],
+            [r[3] for r in sub_rows],
             rets, [r[1] for r in sub_rows], h_days,
             n_resamples, mean_block, seed + seed_offset)
 

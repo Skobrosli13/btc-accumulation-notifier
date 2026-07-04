@@ -73,6 +73,36 @@ def test_injected_short_effect_via_direction():
     assert out2["all"]["p_value"] > 0.95
 
 
+def test_mixed_directions_scored_per_event():
+    """A contrarian study fires BOTH ways: +3%/day injected after LONG events,
+    -3%/day after SHORT events. Per-event signing must score all of them as
+    wins; a uniform LONG read would cancel to ~zero."""
+    rnd = random.Random(0)
+    rets = [rnd.gauss(0.0, 0.01) for _ in range(N_DAYS - 1)]
+    longs, shorts = [100, 300, 500], [200, 400]
+    for d in longs:
+        for t in range(d, d + H):
+            rets[t] += 0.03
+    for d in shorts:
+        for t in range(d, d + H):
+            rets[t] -= 0.03
+    closes, ts = [100.0], [0]
+    for k, r in enumerate(rets):
+        closes.append(closes[-1] * (1.0 + r))
+        ts.append((k + 1) * DAY)
+    ev = [d * DAY for d in sorted(longs + shorts)]
+    dirs = ["LONG" if d // DAY in longs else "SHORT" for d in ev]
+    out = ts_study.evaluate(closes, ts, ev, h_days=H, directions=dirs,
+                            n_resamples=RESAMPLES, seed=42)
+    a = out["all"]
+    assert a["n_events"] == 5 and a["win_rate"] == 1.0
+    assert a["observed_mean"] > 0.2 and a["p_value"] == 0.0
+    # the uniform-LONG misread cancels the two legs to roughly nothing
+    flat = ts_study.evaluate(closes, ts, ev, h_days=H, direction="LONG",
+                             n_resamples=RESAMPLES, seed=42)["all"]
+    assert abs(flat["observed_mean"]) < a["observed_mean"] / 2
+
+
 def test_overlapping_events_are_decorrelated():
     closes, ts = _series(inject=0.03)
     clustered = [100 * DAY, 101 * DAY, 102 * DAY, 200 * DAY]   # 3 within one horizon
