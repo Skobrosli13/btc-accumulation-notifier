@@ -564,10 +564,15 @@ def cmd_verdict(args) -> None:
         t = oos[0]["t_clustered"]
         after_tax = oos[0]["exp_after_tax"]
         placebo_clean = bool(pl and _json.loads(pl["extra_json"] or "{}").get("clean"))
-        sign_consistent = bool(
-            is_rows and oos and is_rows[0]["mean_car"] is not None
-            and oos[0]["mean_car"] is not None
-            and (is_rows[0]["mean_car"] > 0) == (oos[0]["mean_car"] > 0))
+        # Sign consistency is a two-population test (§5.5 "where applicable"):
+        # with a single-era population (e.g. clone13f — complete SF3 books only
+        # exist 2022+) the split is NOT APPLICABLE, which must not read as a
+        # hard failure. Only an actual sign FLIP between measured eras fails.
+        if (is_rows and oos and is_rows[0]["mean_car"] is not None
+                and oos[0]["mean_car"] is not None):
+            sign_consistent = (is_rows[0]["mean_car"] > 0) == (oos[0]["mean_car"] > 0)
+        else:
+            sign_consistent = True      # split inapplicable — vacuously passes
         already_extended = study["status"] == "EXTEND"
         v = gates.alpha_verdict(
             t_clustered=t, n_months=n_months, n_events=n_events,

@@ -76,6 +76,31 @@ def test_cli_end_to_end_ts(env, tmp_path, capsys):
     conn.close()
 
 
+def test_verdict_single_era_population_is_not_a_sign_failure(env, capsys):
+    """A study whose whole population is OOS (no IS rows — e.g. clone13f, where
+    complete SF3 books only exist 2022+) must not hard-KILL on 'sign
+    inconsistency': the two-population split is NOT APPLICABLE (§5.5 'where
+    applicable'). With a soft t-miss it EXTENDs instead."""
+    conn = store.connect(env)
+    schema.init_harness_db(conn)
+    schema.register_study(conn, name="oos_only", asset="EQ", evaluator="car",
+                          tier="alpha", spec_path="x", registered_at=1,
+                          primary_horizon=63)
+    schema.record_results(conn, [
+        {"study": "oos_only", "segment": "OOS", "horizon": 63, "n_events": 1467,
+         "n_months": 15, "mean_car": 0.01, "t_clustered": 1.58,
+         "exp_after_tax": 0.0073},
+        {"study": "oos_only", "segment": "PLACEBO", "horizon": 63,
+         "n_events": 50, "extra": {"clean": True}}])
+    conn.close()
+    cli.main(["verdict", "--name", "oos_only"])
+    out = capsys.readouterr().out
+    assert "EXTEND" in out and "sign not consistent" not in out
+    conn = store.connect(env)
+    assert schema.get_study(conn, "oos_only")["status"] == "EXTEND"
+    conn.close()
+
+
 def test_cli_run_requires_registration_and_events(env, capsys):
     with pytest.raises(SystemExit):
         cli.main(["run", "--name", "ghost"])

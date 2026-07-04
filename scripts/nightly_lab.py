@@ -93,6 +93,7 @@ def main(argv=None) -> int:
     ok &= _step("emit insider_cluster",
                 lambda: emit_events.main(["insider_cluster"]))
     ok &= _step("emit sue_pead", lambda: emit_events.main(["sue_pead"]))
+    ok &= _step("emit clone13f", lambda: emit_events.main(["clone13f"]))
     if ok and not args.no_sync:
         ok &= _step("sync lab tables to box", sync_lab_to_box)
     elif not ok:

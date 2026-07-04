@@ -135,7 +135,44 @@ def emit_sue_pead(lake: Lake) -> list[dict]:
     return out
 
 
-EMITTERS = {"insider_cluster": emit_insider_cluster, "sue_pead": emit_sue_pead}
+def emit_clone13f(lake: Lake) -> list[dict]:
+    """New positions by concentrated low-turnover managers (SF3, SHR rows).
+
+    Candidate managers = anyone who EVER passes the holdings/AUM screen (their
+    FULL history is fetched so turnover + adds compute against real priors);
+    the pure emitter applies the per-quarter qualification."""
+    from app.events import clone13f as c13
+
+    cand = lake.query(f"""
+        WITH q AS (
+            SELECT investorname, calendardate, count(*) AS n, sum(value) AS aum
+            FROM {lake.sql_table('sf3')} WHERE securitytype = 'SHR'
+            GROUP BY 1, 2)
+        SELECT DISTINCT investorname FROM q
+        WHERE n <= {c13.MAX_HOLDINGS} AND aum BETWEEN {c13.AUM_MIN} AND {c13.AUM_MAX}
+    """)["investorname"].tolist()
+    log.info("clone13f: %d candidate managers (ever concentrated + mid-AUM)", len(cand))
+    if not cand:
+        return []
+    ph = ",".join("?" for _ in cand)
+    hold = lake.query(f"""
+        SELECT investorname, calendardate, ticker, sum(value) AS value
+        FROM {lake.sql_table('sf3')}
+        WHERE securitytype = 'SHR' AND investorname IN ({ph})
+        GROUP BY 1, 2, 3""", cand)
+    log.info("clone13f: %d holding rows for candidates", len(hold))
+    snapshots = []
+    for (inv, q), grp in hold.groupby(["investorname", "calendardate"]):
+        snapshots.append({"investor": inv, "quarter": str(q)[:10],
+                          "aum": float(grp["value"].sum()),
+                          "tickers": set(grp["ticker"])})
+    events = c13.cluster_events(snapshots)
+    log.info("clone13f: %d aggregated add-events", len(events))
+    return [{"study": "clone13f", **e} for e in events]
+
+
+EMITTERS = {"insider_cluster": emit_insider_cluster, "sue_pead": emit_sue_pead,
+            "clone13f": emit_clone13f}
 
 
 def main(argv=None) -> None:
