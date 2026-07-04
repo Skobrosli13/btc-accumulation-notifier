@@ -293,6 +293,49 @@ def test_schema_init_runs_on_startup_not_import(tmp_path, monkeypatch):
     assert calls["n"] >= 1
 
 
+def test_studies_endpoint_serves_verdicts(tmp_path):
+    from app.harness import schema as hs
+    db = str(tmp_path / "studies.db")
+    conn = store.connect(db)
+    store.init_db(conn)
+    hs.init_harness_db(conn)
+    hs.register_study(conn, name="btc_trend_policy", asset="BTC",
+                      evaluator="portfolio", tier="policy", spec_path="x",
+                      registered_at=1, primary_horizon=0)
+    hs.set_study_status(conn, "btc_trend_policy", "PROMOTED", verdict_at=2)
+    hs.record_results(conn, [{"study": "btc_trend_policy", "segment": "BACKTEST",
+                              "horizon": 0, "n_events": 4003,
+                              "extra": {"overlay_return": 2.0}}])
+    conn.close()
+    cfg = make_config(db_path=db, api_token="secret")
+    api.app.dependency_overrides[api.get_config] = lambda: cfg
+    try:
+        c = TestClient(api.app)
+        assert c.get("/api/studies").status_code == 401          # token-gated
+        j = c.get("/api/studies", headers=_auth()).json()
+        s = j["studies"][0]
+        assert s["name"] == "btc_trend_policy" and s["status"] == "PROMOTED"
+        assert s["results"][0]["extra"]["overlay_return"] == 2.0
+        assert "not investment advice" in j["note"]
+    finally:
+        api.app.dependency_overrides.clear()
+
+
+def test_studies_endpoint_empty_on_fresh_db(tmp_path):
+    db = str(tmp_path / "fresh.db")
+    conn = store.connect(db)
+    store.init_db(conn)             # NO harness tables
+    conn.close()
+    cfg = make_config(db_path=db, api_token="secret")
+    api.app.dependency_overrides[api.get_config] = lambda: cfg
+    try:
+        c = TestClient(api.app)
+        j = c.get("/api/studies", headers=_auth()).json()
+        assert j["studies"] == []   # absent tables serve empty, never 500
+    finally:
+        api.app.dependency_overrides.clear()
+
+
 def test_unsubscribe_get_is_xss_safe(tmp_path):
     """A hostile ``token`` must never be reflected raw into the confirm page.
 

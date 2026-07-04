@@ -113,6 +113,68 @@ def _run_ts(conn, study: dict, events: list[dict], *, n_resamples: int) -> list[
 
 # --- run: car evaluator ---------------------------------------------------------
 
+def _sep_min_ms(lake) -> tuple[str, int]:
+    from datetime import datetime, timezone
+    sep_min = str(lake.query(
+        f"SELECT min(date) AS d FROM {lake.sql_table('sep')}")["d"][0])[:10]
+    return sep_min, int(datetime.strptime(sep_min, "%Y-%m-%d")
+                        .replace(tzinfo=timezone.utc).timestamp() * 1000)
+
+
+def _month_start(ts_ms: int) -> str:
+    from datetime import datetime, timezone
+    d = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).date()
+    return f"{d.year:04d}-{d.month:02d}-01"
+
+
+def _monthly_snapshots(lake, events: list[dict]) -> dict[str, list[dict]]:
+    from app.data.equities import universe as eq_universe
+    months = sorted({_month_start(e["event_ts"]) for e in events})
+    return {m: [r for r in eq_universe.build_from_lake(lake, m) if r["included"]]
+            for m in months}
+
+
+def _price_events(lake, events: list[dict], controls: list[list[dict]],
+                  horizons: tuple[int, ...],
+                  seg_of: list[str | None] | None = None) -> tuple[dict, dict, dict]:
+    """Year-chunked pricing shared by run + placebo. Returns
+    (rows_by[(seg,h)] -> [(idx, car)], cov_by, unhedged_by); seg defaults ''."""
+    from datetime import datetime, timezone
+
+    from app.data.equities import prices as eq_prices
+
+    rows_by: dict = {}
+    cov_by: dict = {}
+    unhedged_by: dict = {}
+    by_year: dict[int, list[int]] = {}
+    for i, e in enumerate(events):
+        y = datetime.fromtimestamp(e["event_ts"] / 1000, tz=timezone.utc).year
+        by_year.setdefault(y, []).append(i)
+    for y in sorted(by_year):
+        idxs = by_year[y]
+        tks = {events[i]["ticker"] for i in idxs}
+        for i in idxs:
+            tks |= {c["ticker"] for c in controls[i]}
+        bars = eq_prices.sep_bars_bulk(lake, sorted(tks), limit=5000,
+                                       start_date=f"{y - 1}-12-15",
+                                       end_date=f"{y + 1}-04-30")
+        for i in idxs:
+            seg = seg_of[i] if seg_of else ""
+            if seg is None:                        # embargoed
+                continue
+            for h in horizons:
+                res = car.event_car(events[i], bars, controls[i], h)
+                if res is None:
+                    continue
+                c_val, diag = res
+                key = (seg, h)
+                rows_by.setdefault(key, []).append((i, c_val))
+                cov_by.setdefault(key, []).append(diag["mean_controls"])
+                if diag["zero_control_sessions"]:
+                    unhedged_by[key] = unhedged_by.get(key, 0) + 1
+    return rows_by, cov_by, unhedged_by
+
+
 def _run_car(conn, study: dict, events: list[dict]) -> list[dict]:
     """Chunked CAR run: MONTHLY PIT snapshots for control matching (membership
     drifts slowly; a snapshot as of the event month's 1st is PIT-safe) and
@@ -130,65 +192,25 @@ def _run_car(conn, study: dict, events: list[dict]) -> list[dict]:
 
     # Pre-filter events before price coverage starts (SEP begins 2016-01):
     # unpriceable, and their snapshot/bar fetches would be pure waste.
-    sep_min = str(lake.query(
-        f"SELECT min(date) AS d FROM {lake.sql_table('sep')}")["d"][0])[:10]
-    sep_min_ms = int(datetime.strptime(sep_min, "%Y-%m-%d")
-                     .replace(tzinfo=timezone.utc).timestamp() * 1000)
+    sep_min, sep_min_ms = _sep_min_ms(lake)
     usable = [e for e in events if int(e["event_ts"]) >= sep_min_ms]
     print(f"{study['name']}: {len(events)} events, {len(usable)} within price "
           f"coverage (SEP starts {sep_min})")
 
-    def month_start(ts_ms: int) -> str:
-        d = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).date()
-        return f"{d.year:04d}-{d.month:02d}-01"
-
-    months = sorted({month_start(e["event_ts"]) for e in usable})
-    snapshots: dict[str, list[dict]] = {}
-    for m in months:
-        snapshots[m] = [r for r in eq_universe.build_from_lake(lake, m)
-                        if r["included"]]
-    print(f"{study['name']}: {len(months)} monthly control snapshots built")
+    snapshots = _monthly_snapshots(lake, usable)
+    print(f"{study['name']}: {len(snapshots)} monthly control snapshots built")
 
     study_ts: dict[str, list[int]] = {}
     for e in usable:
         study_ts.setdefault(e.get("ticker"), []).append(int(e["event_ts"]))
-    controls = [car.match_controls(e, snapshots[month_start(e["event_ts"])],
+    controls = [car.match_controls(e, snapshots[_month_start(e["event_ts"])],
                                    study_event_ts_by_ticker=study_ts)
                 for e in usable]
 
     seg_of = [walkforward.segment_of(int(e["event_ts"]), study["registered_at"])
               for e in usable]
-
-    # Year-chunked pricing.
-    rows_by = {}                                   # (segment, h) -> [(idx, car)]
-    cov_by = {}                                    # (segment, h) -> [mean_controls]
-    unhedged_by = {}
-    by_year: dict[int, list[int]] = {}
-    for i, e in enumerate(usable):
-        y = datetime.fromtimestamp(e["event_ts"] / 1000, tz=timezone.utc).year
-        by_year.setdefault(y, []).append(i)
-    for y in sorted(by_year):
-        idxs = by_year[y]
-        tks = {usable[i]["ticker"] for i in idxs}
-        for i in idxs:
-            tks |= {c["ticker"] for c in controls[i]}
-        bars = eq_prices.sep_bars_bulk(lake, sorted(tks), limit=5000,
-                                       start_date=f"{y - 1}-12-15",
-                                       end_date=f"{y + 1}-04-30")
-        for i in idxs:
-            if seg_of[i] is None:                  # embargoed
-                continue
-            for h in HORIZONS_CAR:
-                res = car.event_car(usable[i], bars, controls[i], h)
-                if res is None:
-                    continue
-                c_val, diag = res
-                key = (seg_of[i], h)
-                rows_by.setdefault(key, []).append((i, c_val))
-                cov_by.setdefault(key, []).append(diag["mean_controls"])
-                if diag["zero_control_sessions"]:
-                    unhedged_by[key] = unhedged_by.get(key, 0) + 1
-        print(f"  {y}: {len(idxs)} events priced against {len(tks)} names")
+    rows_by, cov_by, unhedged_by = _price_events(
+        lake, usable, controls, HORIZONS_CAR, seg_of)
 
     sha, now = emitter_sha(), _now_ms()
     p = {"horizons": HORIZONS_CAR, "k": car.K_CONTROLS,
@@ -461,8 +483,37 @@ def cmd_placebo(args) -> None:
                 a = ts_study.evaluate(closes, ts_ms, ev, h_days=h,
                                       n_resamples=1, seed=1)["all"]
                 return (a["t_clustered"], a["n_months"])
+        elif study["evaluator"] == "car":
+            import random as _random
+
+            from app.data_lake import Lake
+            lake = Lake(cfg.data_lake_path)
+            _min_date, sep_min_ms = _sep_min_ms(lake)
+            usable = [e for e in events if int(e["event_ts"]) >= sep_min_ms]
+            # A fixed-seed SUBSAMPLE keeps 50 shuffles tractable (the suite
+            # detects machinery bias, not the study's effect — the null t's
+            # distribution is what matters, and 1,000 events span the same
+            # months). Deterministic, documented in the PLACEBO row.
+            sub = (_random.Random(1234).sample(usable, 1000)
+                   if len(usable) > 1000 else usable)
+            snapshots = _monthly_snapshots(lake, sub)   # date multiset is shuffle-invariant
+
+            def eval_t(rnd):
+                sh = placebo.shuffle_dates_per_ticker(sub, rnd)
+                s_ts: dict[str, list[int]] = {}
+                for e in sh:
+                    s_ts.setdefault(e.get("ticker"), []).append(int(e["event_ts"]))
+                ctls = [car.match_controls(
+                    e, snapshots[_month_start(e["event_ts"])],
+                    study_event_ts_by_ticker=s_ts) for e in sh]
+                rows_by, _cov, _unh = _price_events(lake, sh, ctls, (h,))
+                rows = rows_by.get(("", h), [])
+                if not rows:
+                    return None
+                st = car.aggregate(rows, sh)["stats"]
+                return (st["t_clustered"], st["n_months"])
         else:
-            raise SystemExit("car placebo wiring lands with the first car study (M3)")
+            raise SystemExit(f"no placebo path for evaluator {study['evaluator']}")
         result = placebo.suite(eval_t, n=args.shuffles)
         p = {"shuffles": args.shuffles, "horizon": h,
              "max_exceed_frac": placebo.EXCEEDANCE_MAX_FRAC}
@@ -481,6 +532,56 @@ def cmd_placebo(args) -> None:
         conn.close()
     print(f"{args.name} placebo: clean={result['clean']} "
           f"p95|t|={result['p95_abs_t']} exceed={result['exceed_frac']}")
+
+
+def cmd_verdict(args) -> None:
+    """Apply the ALPHA gate (§5.5) to a study's recorded OOS(+LIVE) results at
+    its primary horizon. POLICY studies verdict inside their runner; this is
+    the event-study path. Sign consistency = same mean_car sign in IS and OOS
+    (the recorded pre/post-structural-break proxy; documented)."""
+    import json as _json
+
+    cfg = load_config()
+    conn = _conn(cfg)
+    try:
+        study = schema.get_study(conn, args.name)
+        if not study:
+            raise SystemExit(f"unknown study {args.name}")
+        if study["tier"] != "alpha":
+            raise SystemExit("verdict is the ALPHA path; policies verdict in their runner")
+        h = study["primary_horizon"]
+        rows = schema.results_for_study(conn, args.name)
+        oos = [r for r in rows if r["segment"] == "OOS" and r["horizon"] == h]
+        live = [r for r in rows if r["segment"] == "LIVE" and r["horizon"] == h]
+        is_rows = [r for r in rows if r["segment"] == "IS" and r["horizon"] == h]
+        pl = next((r for r in rows if r["segment"] == "PLACEBO"), None)
+        if not oos:
+            raise SystemExit("no OOS results at the primary horizon — run first")
+        # OOS(+LIVE) population: n sums; t taken from OOS (LIVE too thin to
+        # matter until it isn't — recomputed monthly per §9.5).
+        n_events = sum(r["n_events"] or 0 for r in oos + live)
+        n_months = sum(r["n_months"] or 0 for r in oos + live)
+        t = oos[0]["t_clustered"]
+        after_tax = oos[0]["exp_after_tax"]
+        placebo_clean = bool(pl and _json.loads(pl["extra_json"] or "{}").get("clean"))
+        sign_consistent = bool(
+            is_rows and oos and is_rows[0]["mean_car"] is not None
+            and oos[0]["mean_car"] is not None
+            and (is_rows[0]["mean_car"] > 0) == (oos[0]["mean_car"] > 0))
+        already_extended = study["status"] == "EXTEND"
+        v = gates.alpha_verdict(
+            t_clustered=t, n_months=n_months, n_events=n_events,
+            exp_after_tax=after_tax, sign_consistent=sign_consistent,
+            placebo_clean=placebo_clean, min_events=args.min_events,
+            already_extended=already_extended)
+        schema.set_study_status(conn, args.name, v["status"], verdict_at=_now_ms())
+    finally:
+        conn.close()
+    print(f"{args.name}: {v['status']}"
+          + (f" — {'; '.join(v['reasons'])}" if v["reasons"] else "")
+          + f"  [t={t} n_events={n_events} n_months={n_months} "
+            f"after_tax={after_tax} placebo_clean={placebo_clean} "
+            f"sign_consistent={sign_consistent}]")
 
 
 def cmd_report(_args) -> None:
@@ -529,6 +630,11 @@ def main(argv=None) -> None:
     pl.add_argument("--name", required=True)
     pl.add_argument("--shuffles", type=int, default=placebo.N_SHUFFLES)
     pl.set_defaults(fn=cmd_placebo)
+
+    ver = sub.add_parser("verdict")
+    ver.add_argument("--name", required=True)
+    ver.add_argument("--min-events", type=int, default=gates.ALPHA_MIN_EVENTS)
+    ver.set_defaults(fn=cmd_verdict)
 
     rep = sub.add_parser("report")
     rep.set_defaults(fn=cmd_report)
