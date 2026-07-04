@@ -70,6 +70,54 @@ def ingest(table: str, *, ticker: str | None = None, incremental: bool = False,
     return n
 
 
+def ingest_bulk(table: str, *, lake: Lake | None = None, api_key: str | None = None) -> int:
+    """Full-table snapshot via the bulk-export zip -> DuckDB streams the CSV into
+    Parquet (no pandas RAM blowup — SEP/SF1/DAILY are multi-GB). Overwrites the
+    lake table (a bulk pull IS the full snapshot). Returns the row count."""
+    import os
+    import tempfile
+    import zipfile
+
+    import duckdb
+    import requests
+
+    cfg = load_config()
+    api_key = api_key or cfg.nasdaq_data_link_api_key
+    if not api_key:
+        raise SystemExit("NASDAQ_DATA_LINK_API_KEY not set")
+    lake = lake or Lake(cfg.data_lake_path)
+    table = table.upper()
+    log.info("%s: requesting bulk export (polling until fresh)...", table)
+    link = sharadar.bulk_link(table, api_key)
+    if not link:
+        raise SystemExit(f"bulk export for {table} unavailable / timed out")
+    lake.root.mkdir(parents=True, exist_ok=True)
+    out = lake.path(table.lower())
+    with tempfile.TemporaryDirectory() as td:
+        zip_path = os.path.join(td, f"{table}.zip")
+        log.info("%s: downloading snapshot...", table)
+        with requests.get(link, stream=True, timeout=1800) as r:
+            r.raise_for_status()
+            with open(zip_path, "wb") as fh:
+                for chunk in r.iter_content(chunk_size=1 << 20):
+                    fh.write(chunk)
+        with zipfile.ZipFile(zip_path) as z:
+            csv_name = z.namelist()[0]
+            z.extract(csv_name, td)
+            csv_path = os.path.join(td, csv_name).replace(os.sep, "/")
+        log.info("%s: converting CSV -> Parquet via DuckDB...", table)
+        con = duckdb.connect()
+        try:
+            con.execute(
+                f"COPY (SELECT * FROM read_csv_auto('{csv_path}', header=true, "
+                f"sample_size=-1)) TO '{out.as_posix()}' (FORMAT PARQUET)")
+        finally:
+            con.close()
+    n = int(lake.query(f"SELECT count(*) AS c FROM {lake.sql_table(table.lower())}")["c"][0])
+    log.info("%s: bulk ingest complete -> lake %d rows", table, n)
+    return n
+
+
 def main(argv=None) -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     p = argparse.ArgumentParser(description="Ingest a Sharadar table into the Parquet lake")
@@ -77,8 +125,13 @@ def main(argv=None) -> None:
     p.add_argument("--ticker", help="restrict to one ticker (smoke / partial ingest)")
     p.add_argument("--incremental", action="store_true",
                    help="only fetch rows changed since the lake's newest lastupdated")
+    p.add_argument("--bulk", action="store_true",
+                   help="full-table snapshot via the bulk-export zip (SEP/SF1/DAILY etc.)")
     args = p.parse_args(argv)
-    ingest(args.table, ticker=args.ticker, incremental=args.incremental)
+    if args.bulk:
+        ingest_bulk(args.table)
+    else:
+        ingest(args.table, ticker=args.ticker, incremental=args.incremental)
 
 
 if __name__ == "__main__":

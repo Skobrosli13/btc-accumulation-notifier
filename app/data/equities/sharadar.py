@@ -63,6 +63,39 @@ def _get(url: str, params: dict, secret: str | None) -> dict | None:
         return None
 
 
+def request_bulk(table: str, api_key: str) -> dict | None:
+    """One GET of the bulk-export endpoint -> the ``file`` block
+    ``{link, status, data_snapshot_time}`` (or None). ``status`` is ``fresh`` when
+    the zipped-CSV snapshot is ready to download, else it is being regenerated."""
+    if table not in TABLES or not api_key:
+        return None
+    payload = _get(_BASE.format(table=table),
+                   {"qopts.export": "true", "api_key": api_key}, api_key)
+    if not isinstance(payload, dict):
+        return None
+    return ((payload.get("datatable_bulk_download") or {}).get("file")) or None
+
+
+def bulk_link(table: str, api_key: str, *, poll_interval: float = 10.0,
+              max_wait: float = 1800.0) -> str | None:
+    """Poll the bulk-export endpoint until the snapshot is ``fresh``; return the
+    download link (a single zipped CSV of the whole table), or None on timeout."""
+    import time
+    waited = 0.0
+    while True:
+        f = request_bulk(table, api_key)
+        if not f:
+            return None
+        if f.get("status") == "fresh" and f.get("link"):
+            return f["link"]
+        if waited >= max_wait:
+            log.warning("sharadar bulk %s not fresh after %.0fs (status=%s)",
+                        table, waited, f.get("status"))
+            return None
+        time.sleep(poll_interval)
+        waited += poll_interval
+
+
 def fetch_table(table: str, api_key: str, *, params: dict | None = None,
                 max_pages: int = _DEFAULT_MAX_PAGES) -> list[dict]:
     """All rows of ``SHARADAR/{table}`` matching ``params``, following the cursor.

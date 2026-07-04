@@ -67,6 +67,32 @@ def test_scrub_removes_secret():
     assert sharadar._scrub("no secret here", None) == "no secret here"
 
 
+def test_request_bulk_parses_file_block(monkeypatch):
+    monkeypatch.setattr(sharadar, "_get", lambda *a, **k: {
+        "datatable_bulk_download": {"file": {"link": "http://x/z.zip", "status": "fresh"}}})
+    f = sharadar.request_bulk("SEP", "k")
+    assert f["status"] == "fresh" and f["link"] == "http://x/z.zip"
+    assert sharadar.request_bulk("NOPE", "k") is None      # unknown table
+    assert sharadar.request_bulk("SEP", "") is None        # no key
+
+
+def test_bulk_link_polls_until_fresh(monkeypatch):
+    states = [{"status": "regenerating", "link": None},
+              {"status": "fresh", "link": "http://x/z.zip"}]
+    calls = {"i": 0}
+
+    def fake_request(table, key):
+        s = states[min(calls["i"], len(states) - 1)]
+        calls["i"] += 1
+        return s
+
+    import time
+    monkeypatch.setattr(sharadar, "request_bulk", fake_request)
+    monkeypatch.setattr(time, "sleep", lambda *_: None)
+    assert sharadar.bulk_link("SEP", "k", poll_interval=0) == "http://x/z.zip"
+    assert calls["i"] == 2      # polled once (regenerating) then got fresh
+
+
 @pytest.mark.skipif(not os.environ.get("RUN_LIVE_SHARADAR"),
                     reason="live Sharadar call — set RUN_LIVE_SHARADAR=1 (needs the key)")
 def test_live_tickers_smoke():
