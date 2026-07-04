@@ -100,6 +100,37 @@ Also fixed en route: single-era populations (no IS rows) no longer hard-fail
 the sign-consistency leg — the split is "not applicable" per §5.5, with a
 regression test.
 
+## 2026-07-04 — lt_factor → WATCHLIST (unscored factor screen); verification-cleared
+
+Registered same-day (data-ready: SF1 ART + SEP + SFP all in the lake). The
+evidence-based QVM screener (value-trap gate → value/quality/momentum ranked
+separately → intersection, top-30 equal-weight, monthly rebalance, SF1 ART PIT,
+net turnover cost), 113 rebalances 2017-02..2026-06.
+
+**Verdict: WATCHLIST** — port +114.6%, dead-matching the equal-weight universe
+(+114.9%), and CRUSHED by a 50/50 VTV+QUAL ETF blend (+215.5%). OOS (54 months):
+active-return clustered t = 0.78 vs universe, 0.25 vs ETF (bar 2.0). Fails BOTH
+benchmark legs ⇒ "Watchlist (unscored factor screen)", no third state. n=54≥36,
+so it is genuinely the t, not sample size. The plan's own "why not just buy the
+ETFs?" test answered, for this window: **just buy VTV+QUAL.** An honest null on
+the strongest-claimed free equity edge — value's lost decade + the mega-cap
+quality run the equal-weight small/mid book couldn't match.
+
+**Adversarially verified TRUSTWORTHY** (4 probes, all PASS): momentum is correct
+12-1/causal/positive-signed (Spearman +1.0, picks winners not falling knives);
+benchmarks fair/conservative (ETF closeadj = dividend-adjusted TR; turnover cost
+nets only the portfolio); PIT clean (42d median filing lag, no look-ahead);
+t-stats reproduce to full precision; active-return stdev 3.98% = real tracking
+error with zero net alpha. Every bias in the code FLATTERS the strategy and it
+still failed — the null is real, not a look-ahead/inversion/benchmark artifact.
+
+Known limitation for a FUTURE lt_factor-v2 (WATCHLIST-safe, verdict-invariant —
+imputation moved OOS t <0.01): the sel_fwd non-finite drop is a forward-return
+survivorship shortcut; a SCORED buy-list must book mid-hold delistings at their
+realized delisting return (`app.data.equities.delisting.terminal_return` exists
+for this). Not fixed now because it cannot change WATCHLIST; wire it if v2 is
+ever pursued.
+
 ## 2026-07-04 — Deferrals (deliberate, revisit at collector cutover)
 
 - Legacy candle-replay backtest scripts + winrate/track-record JSON loaders
