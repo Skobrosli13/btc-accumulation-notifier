@@ -75,6 +75,31 @@ sue_pead (once it lands) are the remaining tests. Meta-gate precondition
   promotion cannot be a PEAD duplicate; no excluded re-run required at this
   overlap. Recorded here as the robustness check.
 
+## 2026-07-04 — clone13f → KILLED (and a machinery lesson)
+
+Registered same-day (owner overruled the queue-pacing misread: the §6 queue was
+pre-registered in the plan; only data-readiness gates registrations). 1,606
+add-events by concentrated low-turnover managers, 2022+ only — pre-2022 SF3
+books in this bundle export are TRUNCATED per filer (~200 vs ~720 holdings/
+investor), and the turnover filter systematically excluded the unreliable era.
+
+Verdict: **KILLED** — OOS t=1.58 at h=63 (bar 3.0), after-tax +0.73%/event,
+AND the placebo suite came back DIRTY (exceedance 16% > 10%, p95|t|=2.59).
+The dirty placebo is a structural finding, not noise: events sit on 16
+quarterly dates (~100/date) and consecutive quarters' 63-session forward
+windows OVERLAP, so month-clustered t overstates significance for this shape.
+The kill is DIRECTIONALLY SAFE: the known bias inflates t, and even inflated
+it reached only 1.58.
+
+Machinery action item (Class A, before any future quarterly-cadence study can
+be trusted): quarter-level clustering (or event-date clustering + a non-overlap
+horizon rule) for studies whose events share filing dates. A clone13f-v2 under
+corrected clustering MAY be re-registered; this record freezes.
+
+Also fixed en route: single-era populations (no IS rows) no longer hard-fail
+the sign-consistency leg — the split is "not applicable" per §5.5, with a
+regression test.
+
 ## 2026-07-04 — Deferrals (deliberate, revisit at collector cutover)
 
 - Legacy candle-replay backtest scripts + winrate/track-record JSON loaders
