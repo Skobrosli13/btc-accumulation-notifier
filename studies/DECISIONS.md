@@ -61,6 +61,20 @@ Honesty notes carried with the promotion: the hypothesis is literature-known
 sue_pead (once it lands) are the remaining tests. Meta-gate precondition
 (≥1 ALPHA-PROMOTED) now satisfied pending the live paper curve vs SPY.
 
+## 2026-07-04 — sue_pead → EXTEND (honest miss); insider promotion collision-cleared
+
+- **sue_pead** (17,746 decile events from an 88,506-quarter universe crawl;
+  13,716 priced): IS showed the textbook short-horizon drift (t 2.9/2.9/2.2 at
+  h 5/10/21) but **OOS (2022+) t=0.87 at the primary h=21** — the published
+  anomaly is weak/decayed out-of-sample. Hard legs intact (after-tax +0.19%,
+  sign-consistent, placebo CLEAN p95|t|=1.93/exceed 4%) ⇒ soft miss ⇒
+  **EXTEND** (the one extension; next miss kills). This is the machinery
+  working: a 35-year-old published edge does not get promoted on reputation.
+- **Collision report** (§5.2): 1.0% of insider_cluster events (198/19,996) sit
+  within ±5 sessions of a sue_pead event on the same name — the ALPHA
+  promotion cannot be a PEAD duplicate; no excluded re-run required at this
+  overlap. Recorded here as the robustness check.
+
 ## 2026-07-04 — Deferrals (deliberate, revisit at collector cutover)
 
 - Legacy candle-replay backtest scripts + winrate/track-record JSON loaders
