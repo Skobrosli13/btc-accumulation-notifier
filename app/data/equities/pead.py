@@ -71,11 +71,13 @@ def match_events(sue: dict[tuple[int, int], float],
 
 
 def sue_events(cik: str, user_agent: str, *, adjust=None) -> list[dict]:
-    """End-to-end PEAD events for a CIK from free EDGAR. [] on any failure."""
-    payload = xbrl_eps.fetch_diluted_eps(cik, user_agent)
-    if not payload:
+    """End-to-end PEAD events for a CIK from free EDGAR. [] on any failure.
+
+    EPS facts are merged across the diluted + basic-and-diluted concepts
+    (loss-year filers switch tags), so growth names keep their SUE history."""
+    eps, ends = xbrl_eps.merged_eps_and_ends(cik, user_agent)
+    if not eps:
         return []
-    sue = xbrl_eps.seasonal_sue(xbrl_eps.parse_companyconcept(payload), adjust=adjust)
-    ends = xbrl_eps.period_ends(payload)
+    sue = xbrl_eps.seasonal_sue(eps, adjust=adjust)
     anns = edgar_earnings.announcement_dates("", user_agent=user_agent, cik=cik)
     return match_events(sue, ends, anns)

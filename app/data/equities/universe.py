@@ -70,14 +70,32 @@ def dollar_volume_20d(closes: list[float], volumes: list[float]) -> float | None
     return sum(c * v for c, v in pairs) / len(pairs)
 
 
+# A live name always prints a bar within this many calendar days of as_of (two
+# weekends + a holiday). A name whose LAST bar is older is dead/delisted as of
+# that date and must fall out of the snapshot — without this gate a delisted
+# name's frozen final bars would keep it "included" in every later snapshot
+# forever (the bug the M1 acceptance verification caught: TWTR still in the
+# 2026 universe at its Oct-2022 acquisition price, ~34% of "current" names dead).
+STALENESS_DAYS = 10
+# Lookback window for the trailing-20-session price/volume stats (~20 trading
+# days + slack). Also bounds the DuckDB scan, which is a large speedup.
+_PX_WINDOW_DAYS = 45
+_MCAP_WINDOW_DAYS = 30
+
+
 def build_from_lake(lake, as_of: str, *, excluded_tickers=frozenset(),
                     common_only: bool = True) -> list[dict]:
     """PIT universe snapshot as of ``as_of`` from the lake (TICKERS + DAILY + SEP).
 
     Joins on ticker (within SEP-covered securities), pulls the latest DAILY
     market cap (Sharadar reports it in $millions -> ×1e6) and the trailing-20d
-    price + dollar volume from SEP, then classifies each name. Needs TICKERS +
-    DAILY + SEP ingested; returns [] if any is missing.
+    price + dollar volume from SEP, then classifies each name.
+
+    Point-in-time semantics: a name is in the snapshot iff it was ALIVE at
+    ``as_of`` — its latest bar must fall within :data:`STALENESS_DAYS` of the
+    date. Since-delisted names therefore appear in historical snapshots (their
+    bars were fresh then) and drop out of snapshots after their delisting.
+    Needs TICKERS + DAILY + SEP ingested; returns [] if any is missing.
     """
     for t in ("tickers", "daily", "sep"):
         if not lake.exists(t):
@@ -93,24 +111,30 @@ def build_from_lake(lake, as_of: str, *, excluded_tickers=frozenset(),
             SELECT ticker, marketcap FROM (
                 SELECT ticker, marketcap,
                        row_number() OVER (PARTITION BY ticker ORDER BY date DESC) rn
-                FROM {lake.sql_table('daily')} WHERE date <= ?
+                FROM {lake.sql_table('daily')}
+                WHERE date <= ?
+                  AND CAST(date AS DATE) >= CAST(? AS DATE) - INTERVAL {_MCAP_WINDOW_DAYS} DAY
             ) WHERE rn = 1
         ),
         px AS (
             SELECT ticker, max_by(close, date) AS price,
-                   avg(close * volume) AS dollar_vol_20d
+                   avg(close * volume) AS dollar_vol_20d,
+                   max(CAST(date AS DATE)) AS last_date
             FROM (
                 SELECT ticker, date, close, volume,
                        row_number() OVER (PARTITION BY ticker ORDER BY date DESC) rn
-                FROM {lake.sql_table('sep')} WHERE date <= ?
+                FROM {lake.sql_table('sep')}
+                WHERE date <= ?
+                  AND CAST(date AS DATE) >= CAST(? AS DATE) - INTERVAL {_PX_WINDOW_DAYS} DAY
             ) WHERE rn <= 20
             GROUP BY ticker
         )
         SELECT s.permaticker, s.ticker, s.sector,
                m.marketcap * 1e6 AS mcap_usd, p.price, p.dollar_vol_20d
         FROM secs s JOIN mcap m USING(ticker) JOIN px p USING(ticker)
+        WHERE p.last_date >= CAST(? AS DATE) - INTERVAL {STALENESS_DAYS} DAY
     """
-    df = lake.query(sql, [as_of, as_of])
+    df = lake.query(sql, [as_of, as_of, as_of, as_of, as_of])
     return build_snapshot(as_of, df.to_dict("records"), excluded_tickers)
 
 

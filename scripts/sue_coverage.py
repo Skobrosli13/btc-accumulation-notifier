@@ -64,8 +64,9 @@ def run(sample: int = 25, tickers: list[str] | None = None, years: int = 10) -> 
         if not cik:
             quarters[tk] = 0
             continue
-        payload = xbrl_eps.fetch_diluted_eps(cik, cfg.sec_user_agent)
-        sue = xbrl_eps.seasonal_sue(xbrl_eps.parse_companyconcept(payload)) if payload else {}
+        # sue_for_cik merges the diluted + basic-and-diluted concepts (loss-year
+        # filers switch tags), which is what lifts mid/small coverage.
+        sue = xbrl_eps.sue_for_cik(cik, cfg.sec_user_agent)
         # count only the SUEs within the last `years` (~4/yr)
         quarters[tk] = sum(1 for (fy, _q) in sue if fy >= 2026 - years)
         print(f"  {tk:<8} {quarters[tk]:>3} SUE quarters")

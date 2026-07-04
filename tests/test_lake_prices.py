@@ -23,6 +23,22 @@ def test_bars_from_sep_rows_adjusts_ohl_by_closeadj_factor():
     assert bars[0]["ts"] < bars[1]["ts"]            # oldest -> newest, epoch ms
 
 
+def test_sep_bars_bulk_matches_per_ticker_reads(tmp_path):
+    lake = Lake(tmp_path / "lake")
+    assert prices.sep_bars_bulk(lake, ["AAPL"]) == {}       # no SEP yet
+    sep = pd.DataFrame({
+        "ticker": ["AAPL"] * 3 + ["MSFT"] * 2,
+        "date": ["2026-01-02", "2026-01-03", "2026-01-06", "2026-01-02", "2026-01-03"],
+        "open": [10.0, 11.0, 12.0, 99.0, 98.0], "high": [10.0, 11.0, 12.0, 99.0, 98.0],
+        "low": [10.0, 11.0, 12.0, 99.0, 98.0], "close": [10.0, 11.0, 12.0, 99.0, 98.0],
+        "closeadj": [10.0, 11.0, 12.0, 99.0, 98.0], "volume": [1.0] * 5})
+    lake.write("sep", sep)
+    bulk = prices.sep_bars_bulk(lake, ["AAPL", "MSFT", "NOPE"], limit=2)
+    assert set(bulk) == {"AAPL", "MSFT"}                    # absent name just missing
+    assert bulk["AAPL"] == prices.sep_bars(lake, "AAPL", limit=2)   # identical shape
+    assert bulk["MSFT"] == prices.sep_bars(lake, "MSFT", limit=2)
+
+
 def test_sep_bars_reads_recent_oldest_to_newest(tmp_path):
     lake = Lake(tmp_path / "lake")
     assert prices.sep_bars(lake, "AAPL") == []      # SEP not ingested yet

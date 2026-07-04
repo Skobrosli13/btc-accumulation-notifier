@@ -9,6 +9,17 @@ volume}]`` oldest→newest — with **split+dividend-adjusted** prices: ``close`
 ``closeadj`` and O/H/L are scaled by the same ``closeadj/close`` factor, so
 returns / DMAs / RSI are never distorted by a split. Raw prices (``closeunadj``)
 are for paper-order fills only, not the signal.
+
+Vendor-restatement caveat (verified live on the AAPL/TSLA 2020 splits): Sharadar
+retroactively restates SEP ``open/high/low/close`` for splits — ``closeadj`` adds
+only the dividend adjustment on top, and the TRUE as-traded series is
+``closeunadj``. Split-safety therefore depends on the sep table carrying the
+restated history: after a split the vendor bumps ``lastupdated`` on the restated
+rows, so a ``lastupdated.gte`` incremental refresh picks them up and the
+(ticker, date) upsert replaces the stale bars; a bulk pull is a full snapshot and
+is always consistent. Never append post-split rows without merging restated
+history. (QA note: feed ``detect_price_spikes`` the ``closeunadj`` series —
+``close`` is already split-adjusted and will never show the cliff.)
 """
 from __future__ import annotations
 
@@ -62,3 +73,28 @@ def sep_bars(lake, ticker: str, limit: int = 400) -> list[dict]:
         return []
     rows = df.iloc[::-1].to_dict("records")     # DESC -> oldest→newest
     return bars_from_sep_rows(rows)
+
+
+def sep_bars_bulk(lake, tickers: list[str], limit: int = 400) -> dict[str, list[dict]]:
+    """Adjusted daily bars for MANY tickers in one DuckDB pass.
+
+    One window-function query beats thousands of per-ticker parquet scans
+    (the full-universe screen dropped from tens of minutes to seconds). Returns
+    ``{ticker: bars}`` (same shape as :func:`sep_bars`); names with no rows are
+    simply absent.
+    """
+    if not lake.exists("sep") or not tickers:
+        return {}
+    uniq = sorted({t.upper() for t in tickers})
+    placeholders = ",".join("?" for _ in uniq)
+    df = lake.query(
+        f"SELECT ticker, date, open, high, low, close, closeadj, volume FROM ("
+        f"  SELECT ticker, date, open, high, low, close, closeadj, volume,"
+        f"         row_number() OVER (PARTITION BY ticker ORDER BY date DESC) rn"
+        f"  FROM {lake.sql_table('sep')} WHERE ticker IN ({placeholders})"
+        f") WHERE rn <= ? ORDER BY ticker, date ASC",
+        [*uniq, int(limit)])
+    out: dict[str, list[dict]] = {}
+    for tk, grp in df.groupby("ticker", sort=False):
+        out[str(tk)] = bars_from_sep_rows(grp.to_dict("records"))
+    return out

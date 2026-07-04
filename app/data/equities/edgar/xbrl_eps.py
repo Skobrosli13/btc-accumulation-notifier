@@ -174,11 +174,18 @@ def seasonal_sue(eps: dict[tuple[int, int], float], *, window: int = _WINDOW,
 # --- Network boundary (EDGAR companyconcept; free, key-less) ------------------
 
 _CONCEPT_URL = ("https://data.sec.gov/api/xbrl/companyconcept/"
-                "CIK{cik10}/us-gaap/EarningsPerShareDiluted.json")
+                "CIK{cik10}/us-gaap/{concept}.json")
+# Primary + fallback EPS concepts. Loss-year filers commonly tag
+# EarningsPerShareBasicAndDiluted INSTEAD of EarningsPerShareDiluted (basic ==
+# diluted when antidilutive), so fetching only the diluted tag loses whole years
+# for growth/loss names (the M1 coverage check measured mid-caps at 74% / small
+# at 66% on the single tag). Diluted wins per-quarter where both exist.
+_CONCEPTS = ("EarningsPerShareDiluted", "EarningsPerShareBasicAndDiluted")
 
 
-def fetch_diluted_eps(cik: str, user_agent: str) -> dict | None:
-    """Fetch the raw ``EarningsPerShareDiluted`` companyconcept JSON (or None).
+def fetch_diluted_eps(cik: str, user_agent: str,
+                      concept: str = "EarningsPerShareDiluted") -> dict | None:
+    """Fetch one EPS companyconcept JSON (or None).
 
     Fail-soft like every adapter; the pure ``parse_companyconcept`` /
     ``seasonal_sue`` do the work. Import of the shared HTTP helper is local to
@@ -190,13 +197,33 @@ def fetch_diluted_eps(cik: str, user_agent: str) -> dict | None:
     except (ValueError, TypeError):
         return None
     headers = {"User-Agent": user_agent, "Accept-Encoding": "gzip, deflate"}
-    data = get_json(_CONCEPT_URL.format(cik10=cik10), headers=headers)
+    data = get_json(_CONCEPT_URL.format(cik10=cik10, concept=concept), headers=headers)
     return data if isinstance(data, dict) else None
 
 
+def merged_eps_and_ends(cik: str, user_agent: str
+                        ) -> tuple[dict[tuple[int, int], float], dict[tuple[int, int], str]]:
+    """PIT quarterly EPS + period-ends merged across the EPS concepts.
+
+    Fetches diluted first, then the basic-and-diluted fallback; per (fy, q) the
+    DILUTED value wins where both tagged the quarter (mixing tags across years
+    is sound for seasonal differencing — for loss quarters the two are equal,
+    which is exactly when filers switch tags). Returns ({}, {}) on failure."""
+    eps: dict[tuple[int, int], float] = {}
+    ends: dict[tuple[int, int], str] = {}
+    # Iterate fallback FIRST so the diluted concept overwrites on merge.
+    for concept in reversed(_CONCEPTS):
+        payload = fetch_diluted_eps(cik, user_agent, concept=concept)
+        if not payload:
+            continue
+        eps.update(parse_companyconcept(payload))
+        ends.update(period_ends(payload))
+    return eps, ends
+
+
 def sue_for_cik(cik: str, user_agent: str, *, adjust=None) -> dict[tuple[int, int], float]:
-    """End-to-end: fetch -> parse (PIT) -> SUE. Returns {} on any failure."""
-    payload = fetch_diluted_eps(cik, user_agent)
-    if not payload:
+    """End-to-end: fetch (both concepts) -> parse (PIT) -> SUE. {} on failure."""
+    eps, _ends = merged_eps_and_ends(cik, user_agent)
+    if not eps:
         return {}
-    return seasonal_sue(parse_companyconcept(payload), adjust=adjust)
+    return seasonal_sue(eps, adjust=adjust)

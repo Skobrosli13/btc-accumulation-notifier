@@ -19,8 +19,14 @@ number to apply. The ACTIONS join + SEP terminal-return lookup are orchestration
 """
 from __future__ import annotations
 
-# ACTIONS action codes (verified live against the Sharadar bundle).
-MERGER_ACTIONS = frozenset({"acquisitionby", "acquisitionof"})
+# ACTIONS action codes (verified live against the Sharadar bundle; the M1
+# acceptance sweep of all 352k rows found the full delisting-relevant set:
+# delisted=9401, acquisitionby/of=2421 each, bankruptcyliquidation=1220,
+# regulatorydelisting=474, voluntarydelisting=158, mergerto=62 — every mergerto
+# co-occurs with 'delisted' and NEVER with acquisitionby/of, so it is its own
+# merger-exit class; 'mergerfrom' marks the SURVIVING entity and is not a
+# delisting signal).
+MERGER_ACTIONS = frozenset({"acquisitionby", "acquisitionof", "mergerto"})
 PERFORMANCE_ACTIONS = frozenset({"bankruptcyliquidation"})
 DELISTED_ACTION = "delisted"
 

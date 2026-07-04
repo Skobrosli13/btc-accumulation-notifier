@@ -83,6 +83,32 @@ def test_build_from_lake_joins_tickers_daily_sep(tmp_path):
     assert by["PENNY"]["tier"] is None and by["PENNY"]["included"] is False  # sub-micro
 
 
+def test_build_from_lake_stale_names_fall_out_of_later_snapshots(tmp_path):
+    """Regression for the M1-acceptance FAIL: a delisted name's frozen final bars
+    must not keep it 'included' in snapshots after its delisting (TWTR was still
+    in the 2026 universe at its Oct-2022 acquisition price)."""
+    lake = Lake(tmp_path / "lake")
+    lake.write("tickers", pd.DataFrame({
+        "table": ["SEP", "SEP"], "permaticker": [1, 2],
+        "ticker": ["LIVE", "DEAD"], "sector": ["Tech", "Tech"],
+        "category": ["Domestic Common Stock"] * 2}))
+    lake.write("daily", pd.DataFrame({
+        "ticker": ["LIVE", "DEAD"],
+        "date": ["2026-06-29", "2022-10-27"],          # DEAD's last mcap = delisting day
+        "marketcap": [50_000.0, 40_000.0]}))
+    lake.write("sep", pd.DataFrame({
+        "ticker": ["LIVE", "LIVE", "DEAD", "DEAD"],
+        "date": ["2026-06-26", "2026-06-29", "2022-10-26", "2022-10-27"],
+        "close": [100.0, 101.0, 53.0, 53.7],
+        "volume": [1e6, 1e6, 1e8, 1e8]}))
+    # As of mid-2026: only LIVE. DEAD's 2022 bars must NOT resurrect it.
+    snap_2026 = {r["ticker"] for r in universe.build_from_lake(lake, "2026-06-30")}
+    assert snap_2026 == {"LIVE"}
+    # As of its own era, DEAD was alive -> in the snapshot (PIT semantics).
+    snap_2022 = {r["ticker"] for r in universe.build_from_lake(lake, "2022-10-28")}
+    assert "DEAD" in snap_2022
+
+
 # --- delisting-return policy (Shumway) ---------------------------------------
 
 def test_delisting_merger_closes_at_final_price():
@@ -90,6 +116,16 @@ def test_delisting_merger_closes_at_final_price():
     acts = ["delisted", "acquisitionby"]
     assert delisting.is_merger(acts) is True
     assert delisting.terminal_return(acts, final_return=0.02) == 0.02
+    assert delisting.terminal_return(acts, final_return=None) == 0.0
+
+
+def test_delisting_mergerto_is_a_merger_exit():
+    """Regression for the M1-acceptance PARTIAL: Sharadar tags stock-mergers as
+    'mergerto' (e.g. WRK 2024-07-05) with NO acquisitionby/of row — they must
+    route as merger exits, never take the -30% performance haircut."""
+    acts = ["delisted", "mergerto"]
+    assert delisting.is_merger(acts) is True
+    assert delisting.is_performance_delisting(acts) is False
     assert delisting.terminal_return(acts, final_return=None) == 0.0
 
 

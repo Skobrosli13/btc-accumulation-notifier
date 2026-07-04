@@ -41,9 +41,12 @@ def screen(as_of: str | None = None, top: int = 20, want_pead: bool = False) -> 
         print("universe empty — ingest TICKERS/DAILY/SEP first "
               "(python -m scripts.ingest SEP --bulk, etc.)")
         return []
+    # One bulk DuckDB pass for every name's bars (per-ticker scans over the
+    # multi-GB SEP parquet take tens of minutes; this takes seconds).
+    bars_by = prices.sep_bars_bulk(lake, [r["ticker"] for r in uni], limit=300)
     scored = []
     for r in uni:
-        bars = prices.sep_bars(lake, r["ticker"], limit=300)
+        bars = bars_by.get(r["ticker"])
         feat = stock_scoring.features(bars) if bars else None
         if not feat or feat.get("ret_63") is None:
             continue

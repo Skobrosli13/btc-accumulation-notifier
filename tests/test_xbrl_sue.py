@@ -71,6 +71,28 @@ def test_seasonal_sue_winsorizes():
     assert sue[(2, 4)] == 10.0        # winsorized
 
 
+def test_merged_eps_prefers_diluted_and_fills_gaps(monkeypatch):
+    """Loss-year filers tag EarningsPerShareBasicAndDiluted instead of ...Diluted;
+    the merged fetch fills those quarters, with diluted winning where both exist."""
+    diluted = {"units": {"USD/shares": [
+        _fact(2022, "Q1", "2022-01-01", "2022-03-31", 1.0, "2022-04-15"),
+    ]}}
+    basic_and_diluted = {"units": {"USD/shares": [
+        # same quarter tagged differently (must LOSE to the diluted value)...
+        _fact(2022, "Q1", "2022-01-01", "2022-03-31", 9.9, "2022-04-15"),
+        # ...and a quarter ONLY present under the fallback tag (must be kept)
+        _fact(2022, "Q2", "2022-04-01", "2022-06-30", -0.5, "2022-07-15"),
+    ]}}
+    payloads = {"EarningsPerShareDiluted": diluted,
+                "EarningsPerShareBasicAndDiluted": basic_and_diluted}
+    monkeypatch.setattr(xbrl_eps, "fetch_diluted_eps",
+                        lambda cik, ua, concept="EarningsPerShareDiluted": payloads[concept])
+    eps, ends = xbrl_eps.merged_eps_and_ends("123", "ua")
+    assert eps[(2022, 1)] == 1.0      # diluted wins the shared quarter
+    assert eps[(2022, 2)] == -0.5     # fallback-only quarter recovered
+    assert ends[(2022, 2)] == "2022-06-30"
+
+
 def test_split_adjust_callable_is_applied():
     # Without adjustment the two years' Q1 differ only by a 2x split; with a
     # factor that halves the pre-split year, the seasonal diff shrinks.
