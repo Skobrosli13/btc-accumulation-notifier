@@ -103,6 +103,8 @@ class CoreConfig:
     resend_api_key: str | None
     email_from: str
     email_to: str | None
+    tax_st_rate: float
+    tax_lt_rate: float
 
 
 @dataclass(frozen=True)
@@ -148,6 +150,7 @@ class BtcConfig:
     st_strong_sell_threshold: float
     st_regime_suppress: bool
     st_require_confluence: bool
+    cost_bps_btc: float
 
 
 @dataclass(frozen=True)
@@ -176,6 +179,11 @@ class EquityConfig:
     stock_cost_bps: float
     stock_lt_top_n: int
     stock_lt_min_dollar_vol: float
+    cost_bps_large: float
+    cost_bps_mid: float
+    cost_bps_small: float
+    cost_bps_micro: float
+    exclude_tickers_path: str | None
 
 
 @dataclass(frozen=True)
@@ -300,6 +308,20 @@ class Config:
     # SQLite keeps operational state only. Shared by equities + crypto archives.
     data_lake_path: str = "data_lake"
 
+    # --- Harness (M2 §5.4): costs, taxes, universe exclusions ------------
+    # Round-trip cost assumptions (bps) per equity cap tier + BTC spot; used by
+    # harness.costs for net expectancy. Constants in config, enforced in code.
+    cost_bps_large: float = 10.0
+    cost_bps_mid: float = 20.0
+    cost_bps_small: float = 40.0
+    cost_bps_micro: float = 80.0
+    cost_bps_btc: float = 10.0
+    # Marginal tax rates for after-tax expectancy (owner-set; §9).
+    tax_st_rate: float = 0.40
+    tax_lt_rate: float = 0.24
+    # Owner-maintained exclusion list (one ticker per line; MNPI guard §9).
+    exclude_tickers_path: str | None = None
+
     # Freshness budget for DAILY-cadence sources (bitcoin-data /last, BGeometrics
     # files, Fear & Greed, hashrate): a dated reading older than this many days is
     # treated as missing (None) instead of scored as current, so a frozen upstream
@@ -322,7 +344,8 @@ class Config:
             ntfy_topic=self.ntfy_topic, ntfy_server=self.ntfy_server,
             telegram_bot_token=self.telegram_bot_token, telegram_chat_id=self.telegram_chat_id,
             resend_api_key=self.resend_api_key, email_from=self.email_from,
-            email_to=self.email_to)
+            email_to=self.email_to,
+            tax_st_rate=self.tax_st_rate, tax_lt_rate=self.tax_lt_rate)
 
     @property
     def btc(self) -> BtcConfig:
@@ -349,7 +372,8 @@ class Config:
             st_sell_threshold=self.st_sell_threshold,
             st_strong_sell_threshold=self.st_strong_sell_threshold,
             st_regime_suppress=self.st_regime_suppress,
-            st_require_confluence=self.st_require_confluence)
+            st_require_confluence=self.st_require_confluence,
+            cost_bps_btc=self.cost_bps_btc)
 
     @property
     def equity(self) -> EquityConfig:
@@ -368,7 +392,10 @@ class Config:
             stock_atr_k_t2=self.stock_atr_k_t2, stock_time_stop_days=self.stock_time_stop_days,
             stock_cooldown_days=self.stock_cooldown_days, stock_allow_shorts=self.stock_allow_shorts,
             stock_cost_bps=self.stock_cost_bps, stock_lt_top_n=self.stock_lt_top_n,
-            stock_lt_min_dollar_vol=self.stock_lt_min_dollar_vol)
+            stock_lt_min_dollar_vol=self.stock_lt_min_dollar_vol,
+            cost_bps_large=self.cost_bps_large, cost_bps_mid=self.cost_bps_mid,
+            cost_bps_small=self.cost_bps_small, cost_bps_micro=self.cost_bps_micro,
+            exclude_tickers_path=self.exclude_tickers_path)
 
     # --- Derived helpers -------------------------------------------------
 
@@ -545,6 +572,14 @@ def load_config() -> Config:
         stock_lt_min_dollar_vol=_get_float("STOCK_LT_MIN_DOLLAR_VOL", 3_000_000.0),
         nasdaq_data_link_api_key=_opt("NASDAQ_DATA_LINK_API_KEY"),
         data_lake_path=_get("DATA_LAKE_PATH", "data_lake"),
+        cost_bps_large=_get_float("COST_BPS_LARGE", 10.0),
+        cost_bps_mid=_get_float("COST_BPS_MID", 20.0),
+        cost_bps_small=_get_float("COST_BPS_SMALL", 40.0),
+        cost_bps_micro=_get_float("COST_BPS_MICRO", 80.0),
+        cost_bps_btc=_get_float("COST_BPS_BTC", 10.0),
+        tax_st_rate=_get_float("TAX_ST_RATE", 0.40),
+        tax_lt_rate=_get_float("TAX_LT_RATE", 0.24),
+        exclude_tickers_path=_opt("EXCLUDE_TICKERS_PATH"),
         freshness_budget_days=_get_float("FRESHNESS_BUDGET_DAYS", 3.0),
         api_token=_opt("API_TOKEN"),
         api_cors_origin=_opt("API_CORS_ORIGIN"),
