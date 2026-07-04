@@ -1,6 +1,8 @@
 # Pinned with upper bounds so a major upstream release can't silently break a
 # prod `pip install -r` (there is no lockfile for the backend). Bump deliberately.
-pandas>=2.0,<3.0
+# pandas 3 is the tested config (local dev + prod both ran 3.0.3; the code
+# carries pandas-3 compat, e.g. StringIO for read_html). Deliberate bump.
+pandas>=2.0,<4.0
 requests>=2.31,<3.0
 python-dotenv>=1.0,<2.0
 fastapi>=0.110,<1.0
