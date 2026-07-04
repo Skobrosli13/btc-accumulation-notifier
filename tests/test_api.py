@@ -321,6 +321,45 @@ def test_studies_endpoint_serves_verdicts(tmp_path):
         api.app.dependency_overrides.clear()
 
 
+def test_studies_recent_events_feed(tmp_path):
+    import time as _time
+
+    from app.harness import schema as hs
+    db = str(tmp_path / "ev.db")
+    conn = store.connect(db)
+    store.init_db(conn)
+    hs.init_harness_db(conn)
+    hs.register_study(conn, name="insider_cluster", asset="EQ", evaluator="car",
+                      tier="alpha", spec_path="x", registered_at=1,
+                      primary_horizon=21)
+    hs.set_study_status(conn, "insider_cluster", "PROMOTED", verdict_at=2)
+    now = int(_time.time() * 1000)
+    hs.insert_events(conn, [
+        {"study": "insider_cluster", "asset": "EQ", "ticker": "AAA",
+         "event_ts": now - 86_400_000, "direction": "LONG", "strength": 1.5,
+         "tier": "small", "sector": "Tech", "meta": {"agg_usd": 90_000}},
+        {"study": "insider_cluster", "asset": "EQ", "ticker": "OLD",
+         "event_ts": now - 90 * 86_400_000, "direction": "LONG"},  # outside window
+    ])
+    hs.record_results(conn, [{"study": "insider_cluster", "segment": "OOS",
+                              "horizon": 21, "n_events": 3823, "n_months": 54,
+                              "t_clustered": 3.55, "win_rate": 0.52,
+                              "exp_after_tax": 0.0091}])
+    conn.close()
+    cfg = make_config(db_path=db, api_token="secret")
+    api.app.dependency_overrides[api.get_config] = lambda: cfg
+    try:
+        c = TestClient(api.app)
+        j = c.get("/api/studies/events?days=14", headers=_auth()).json()
+        assert j["status"] == "PROMOTED"
+        assert j["gate_stats"]["t_clustered"] == 3.55
+        assert len(j["events"]) == 1                      # OLD filtered by window
+        assert j["events"][0]["ticker"] == "AAA"
+        assert j["events"][0]["meta"]["agg_usd"] == 90_000
+    finally:
+        api.app.dependency_overrides.clear()
+
+
 def test_studies_endpoint_empty_on_fresh_db(tmp_path):
     db = str(tmp_path / "fresh.db")
     conn = store.connect(db)

@@ -26,6 +26,55 @@ def _rows(conn, sql: str, params=()) -> list[dict]:
         return []          # harness tables not created yet on this box
 
 
+@router.get("/api/studies/events")
+def recent_events(study: str = "insider_cluster", days: int = 14,
+                  cfg: Config = Depends(get_config),
+                  _=Depends(require_token)) -> dict:
+    """Recent live events for one study — the dashboard's 'Lab signals' feed.
+
+    Serves events with the study's CURRENT verdict + gate stats attached so the
+    UI can label them honestly (a KILLED study's events render as recording,
+    never as picks). Events arrive via the nightly emit+sync."""
+    import time
+    days = max(1, min(int(days), 90))
+    since = int((time.time() - days * 86_400) * 1000)
+    conn = _conn(cfg)
+    try:
+        study_row = _rows(conn, "SELECT * FROM studies WHERE name = ?", (study,))
+        evs = _rows(conn,
+                    "SELECT ticker, event_ts, direction, strength, tier, sector, "
+                    "days_since_earnings, meta FROM events "
+                    "WHERE study = ? AND event_ts >= ? ORDER BY event_ts DESC "
+                    "LIMIT 100", (study, since))
+        # The study's primary-horizon OOS row = the honest stats badge.
+        stats = _rows(conn,
+                      "SELECT * FROM study_results WHERE study = ? AND "
+                      "segment = 'OOS' AND horizon = "
+                      "(SELECT primary_horizon FROM studies WHERE name = ?)",
+                      (study, study))
+    finally:
+        conn.close()
+    for e in evs:
+        try:
+            e["meta"] = json.loads(e.get("meta") or "{}")
+        except (json.JSONDecodeError, TypeError):
+            e["meta"] = {}
+    s = study_row[0] if study_row else None
+    st = stats[0] if stats else None
+    return {"study": study,
+            "status": s["status"] if s else None,
+            "primary_horizon": s["primary_horizon"] if s else None,
+            "gate_stats": ({"t_clustered": st["t_clustered"],
+                            "n_events": st["n_events"],
+                            "n_months": st["n_months"],
+                            "exp_after_tax": st["exp_after_tax"],
+                            "win_rate": st["win_rate"]} if st else None),
+            "days": days, "events": evs,
+            "note": ("Events from a pre-registered study; the status/gate stats "
+                     "are the label. LIVE forward evidence accrues from these — "
+                     "not investment advice.")}
+
+
 @router.get("/api/studies")
 def studies(cfg: Config = Depends(get_config), _=Depends(require_token)) -> dict:
     conn = _conn(cfg)
