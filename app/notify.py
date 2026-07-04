@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+from datetime import datetime, timezone
 
 import requests
 
@@ -23,6 +24,27 @@ log = logging.getLogger(__name__)
 _SEVERITY_PRIORITY = {"ACT": "high", "RISK": "high", "FAIL": "urgent"}
 
 
+def _in_quiet_hours(window: str, now: datetime | None = None) -> bool:
+    """True when ``now`` (UTC) falls in an "HH-HH" quiet window (may wrap
+    midnight, e.g. "22-06"). Malformed/empty windows disable quiet hours."""
+    try:
+        lo_s, hi_s = window.split("-")
+        lo, hi = int(lo_s), int(hi_s)
+    except (ValueError, AttributeError):
+        return False
+    h = (now or datetime.now(timezone.utc)).hour
+    return lo <= h < hi if lo <= hi else (h >= lo or h < hi)
+
+
+def _push_priority(cfg: Config, severity: str | None) -> str:
+    """§4: severity tier, muted by quiet hours for everything except FAIL —
+    the dead-man's-switch must always ring; nothing else gets to at 3am."""
+    pri = _SEVERITY_PRIORITY.get(severity or "", "default")
+    if severity != "FAIL" and _in_quiet_hours(cfg.quiet_hours_utc):
+        return "min"
+    return pri
+
+
 def _send_ntfy(cfg: Config, title: str, body: str,
                severity: str | None = None) -> bool:
     url = f"{cfg.ntfy_server}/{cfg.ntfy_topic}"
@@ -31,7 +53,7 @@ def _send_ntfy(cfg: Config, title: str, body: str,
             url,
             data=body.encode("utf-8"),
             headers={"Title": title,
-                     "Priority": _SEVERITY_PRIORITY.get(severity or "", "default"),
+                     "Priority": _push_priority(cfg, severity),
                      "Tags": "chart_with_downwards_trend"},
             timeout=15,
         )

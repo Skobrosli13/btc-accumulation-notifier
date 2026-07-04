@@ -39,11 +39,19 @@ _COMPONENT_LABELS = {
 
 @lru_cache(maxsize=1)
 def _track_record_data() -> dict:
-    """Read app/track_record.json once (emitted by scripts/calibrate.py). {} if absent."""
+    """Read app/track_record.json once (emitted by scripts/calibrate.py). {} if absent.
+
+    Provenance (§5): the served payload carries the artifact's content sha so
+    the UI can render 'generated <date> · sha <8>' — a committed JSON without
+    provenance is unfalsifiable."""
     try:
-        return json.loads((_APP_DIR / "track_record.json").read_text())
+        raw = (_APP_DIR / "track_record.json").read_text()
+        data = json.loads(raw)
     except (OSError, json.JSONDecodeError):
         return {}
+    import hashlib
+    data["artifact_sha"] = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:8]
+    return data
 
 
 @router.get("/api/live_performance")

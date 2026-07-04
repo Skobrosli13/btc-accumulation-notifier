@@ -1,18 +1,18 @@
-"""Confidence model (pure, I/O-free).
+"""Confidence model (pure, I/O-free) — RECORDING-ONLY since the P3 retirement.
 
-Confidence must be *measured then earned*, not asserted. Two layers:
+The winrates artifact + its calibrate script live in ``archive/v1/`` (every
+alerted cell measured statistically indistinguishable from a coin flip), so the
+live caller (``stock_collect``) passes ``winrates={}`` and everything below runs
+on the conservative built-in PRIORs. The output is stored in the signal's
+detail_json as an honest record of what the ranking used — it is never
+displayed as a measured probability anywhere (design law: verdicts or
+explicitly-unscored context, no third kind of number).
 
-1. **Base rate** — the archetype's historical win-rate + expectancy (avg R) from
-   ``stock_st_winrates.json`` (emitted offline by ``scripts/stock_calibrate.py``).
-   Absent → a conservative built-in PRIOR, explicitly flagged not-live-confirmed.
+Layers: 1. **Base rate** — the archetype's cell from a winrates dict when one
+is supplied (only tests do now); absent → the PRIOR, flagged not-live-confirmed.
 2. **Modifiers** — signal-strength, cross-sectional relative strength, regime
-   alignment and context confluence nudge the base rate within a bounded band.
-
-The output probability is capped at 0.80 (an honesty ceiling — we never claim near
-certainty) and, until the live position tracker has enough closed trades, is
-labelled a "backtested prior". Win-rate is reported ALONGSIDE expectancy because a
-sub-50% win-rate with big winners is still profitable — expectancy (avg R) is the
-real target, not raw accuracy.
+alignment and context confluence nudge the base rate within a bounded band.
+Probability capped at 0.80; expectancy (avg R) reported alongside win-rate.
 """
 from __future__ import annotations
 

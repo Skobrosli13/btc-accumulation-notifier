@@ -18,6 +18,15 @@ from ..config import Config
 
 router = APIRouter()
 
+# §3 Lab: "link to the surface it powers" — served, not hardcoded in the UI.
+_POWERS = {
+    "insider_cluster": {"label": "Stocks → Picks", "href": "/stocks"},
+    "sue_pead": {"label": "Stocks → Swing (recording)", "href": "/stocks"},
+    "btc_trend_policy": {"label": "Bitcoin → Policies", "href": "/btc"},
+    "btc_accum_policy": {"label": "Bitcoin → Policies", "href": "/btc"},
+    "lt_factor": {"label": "Stocks → Factor screen (unscored)", "href": "/stocks?h=lt"},
+}
+
 
 def _rows(conn, sql: str, params=()) -> list[dict]:
     try:
@@ -89,6 +98,12 @@ def studies(cfg: Config = Depends(get_config), _=Depends(require_token)) -> dict
         results = _rows(conn, "SELECT * FROM study_results ORDER BY study, segment, horizon")
         counts = {r["study"]: r["n"] for r in _rows(
             conn, "SELECT study, count(*) AS n FROM events GROUP BY study")}
+        # §3 Lab: LIVE-segment accrual — events filed since registration are
+        # the only uncontaminated evidence; the card states how many exist.
+        live_counts = {r["study"]: r["n"] for r in _rows(
+            conn, "SELECT e.study, count(*) AS n FROM events e "
+                  "JOIN studies s ON s.name = e.study "
+                  "WHERE e.event_ts >= s.registered_at GROUP BY e.study")}
     finally:
         conn.close()
     by_study: dict[str, list[dict]] = {}
@@ -101,8 +116,17 @@ def studies(cfg: Config = Depends(get_config), _=Depends(require_token)) -> dict
     out = []
     for s in studs:
         rows = by_study.get(s["name"], [])
+        # Collision note from the OOS row's extras when the evaluator recorded
+        # one (car.collision_report) — overlap honesty rides the payload.
+        collision = next((r["extra"].get("collision")
+                          for r in rows
+                          if r["segment"] == "OOS" and r["extra"].get("collision")),
+                         None)
         out.append({**s,
                     "n_events_emitted": counts.get(s["name"], 0),
+                    "n_live_events": live_counts.get(s["name"], 0),
+                    "powers": _POWERS.get(s["name"]),
+                    "collision": collision,
                     "results": [r for r in rows if r["segment"] != "PLACEBO"],
                     "placebo": next((r for r in rows if r["segment"] == "PLACEBO"),
                                     None)})

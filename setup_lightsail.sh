@@ -68,12 +68,13 @@ CRONS=$(cat <<EOF
 */10 * * * * cd $HERE && $PY -m app.collect_once >> $HERE/logs/collect.log 2>&1
 0 */6 * * * cd $HERE && $PY -m app.run_once >> $HERE/logs/run.log 2>&1
 0 */8 * * * cd $HERE && $PY -m app.watchdog >> $HERE/logs/watchdog.log 2>&1
+45 12 * * 1-5 cd $HERE && $PY -m scripts.send_digest >> $HERE/logs/digest.log 2>&1
 EOF
 )
 # Pipefail-safe: an empty/absent crontab makes grep -v exit 1, which would abort
 # under `set -euo pipefail` — guard both the read and the filter with `|| true`.
-{ (crontab -l 2>/dev/null || true) | grep -vE 'app\.(collect_once|run_once|watchdog)' || true; echo "$CRONS"; } | crontab -
-echo "  crons:"; crontab -l | grep -E 'app\.' | sed 's/^/    /'
+{ (crontab -l 2>/dev/null || true) | grep -vE 'app\.(collect_once|run_once|watchdog)|scripts\.send_digest' || true; echo "$CRONS"; } | crontab -
+echo "  crons:"; crontab -l | grep -E 'app\.|scripts\.' | sed 's/^/    /'
 
 echo ""
 echo "==> Done with the automated parts. Remaining (see DEPLOY.md):"

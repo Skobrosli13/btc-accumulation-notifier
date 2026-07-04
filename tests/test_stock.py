@@ -636,21 +636,31 @@ def _alert_payload(ticker="AAA"):
     return {"sig": sig, "detail": detail, "ts": DAY}
 
 
-def test_alert_arms_cooldown_when_no_transport_configured(monkeypatch):
+def test_alert_records_without_instant_send():
+    # §4 fatigue budget: swing setups are recording-only — the row is written
+    # sent=True (it IS the record, arming the cooldown) and nothing is pushed.
     conn = _conn_mem()
     now = datetime.now(timezone.utc)
-    # empty-.env mode: send() is a no-op returning False, but the alert row is the
-    # canonical record -> the cooldown must arm off creation (nothing to retry).
-    monkeypatch.setattr(stock_collect.notify, "send", lambda *a, **k: False)
-    monkeypatch.setattr(stock_collect.notify, "has_transport", lambda cfg: False)
-    stock_collect._maybe_alert(conn, CFG, [_alert_payload("AAA")], now, False)
+    fired = stock_collect._maybe_alert(conn, CFG, [_alert_payload("AAA")], now, False)
+    assert fired == ["AAA/momentum"]
     assert stock_store.last_stock_alert(conn, "AAA", "momentum") is not None
-    assert stock_store.unsent_stock_alerts(conn) == []   # no dead retry queued
-    # a send FAILURE with a CONFIGURED transport keeps retry semantics: unarmed
-    monkeypatch.setattr(stock_collect.notify, "has_transport", lambda cfg: True)
-    stock_collect._maybe_alert(conn, CFG, [_alert_payload("BBB")], now, False)
-    assert stock_store.last_stock_alert(conn, "BBB", "momentum") is None
-    assert len(stock_store.unsent_stock_alerts(conn)) == 1
+    assert stock_store.unsent_stock_alerts(conn) == []   # nothing queued to send
+    row = stock_store.recent_stock_alerts(conn, 1)[0]
+    # no confidence % / maturity stamp in the stored message (retired numbers)
+    assert "conf " not in row["message"] and "Proven edge" not in row["message"]
+    assert "recording only" in row["message"]
+    conn.close()
+
+
+def test_legacy_unsent_rows_drained_without_send():
+    conn = _conn_mem()
+    stock_store.record_stock_alert(conn, ts=DAY, created_at="2026-01-01T00:00:00+00:00",
+                                   ticker="CCC", archetype="momentum", direction="BUY",
+                                   entry=10.0, stop=9.0, t1=11.0, t2=12.0,
+                                   confidence=0.6, message="m", sent=False)
+    out = stock_collect._retry_unsent_alerts(conn, CFG, False)
+    assert out == ["CCC/momentum"]
+    assert stock_store.unsent_stock_alerts(conn) == []   # marked recorded, not resent
     conn.close()
 
 

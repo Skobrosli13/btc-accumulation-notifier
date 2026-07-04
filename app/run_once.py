@@ -210,7 +210,7 @@ def run(cfg: Config, *, dry_run: bool = False) -> dict:
         if dry_run:
             log.info("[dry-run] TIER ALERT\n%s\n%s", title, body)
         else:
-            tier_send_ok = notify.send(cfg, title, body, conn=conn)
+            tier_send_ok = notify.send(cfg, title, body, conn=conn, severity="ACT")
     elif decisions["exit_alert"]:
         title, body = alerting.build_exit_message(prev_tier=prev_notified_tier,
                                                   cats_changed=decisions["cats_changed"],
@@ -218,7 +218,7 @@ def run(cfg: Config, *, dry_run: bool = False) -> dict:
         if dry_run:
             log.info("[dry-run] EXIT ALERT\n%s\n%s", title, body)
         else:
-            tier_send_ok = notify.send(cfg, title, body, conn=conn)
+            tier_send_ok = notify.send(cfg, title, body, conn=conn, severity="ACT")
 
     flash_send_ok = False
     if decisions["flash_alert"]:
@@ -227,7 +227,7 @@ def run(cfg: Config, *, dry_run: bool = False) -> dict:
             log.info("[dry-run] FLASH ALERT\n%s\n%s", title, body)
             flash_send_ok = True
         else:
-            flash_send_ok = notify.send(cfg, title, body, conn=conn)
+            flash_send_ok = notify.send(cfg, title, body, conn=conn, severity="ACT")
 
     # Sell-side overheat crossing (OWNER-ONLY: no conn => no subscriber
     # broadcast — the froth side is a small-sample heuristic, not the product).
@@ -241,7 +241,7 @@ def run(cfg: Config, *, dry_run: bool = False) -> dict:
         if dry_run:
             log.info("[dry-run] FROTH ALERT\n%s\n%s", title, body)
         else:
-            froth_send_ok = notify.send(cfg, title, body)
+            froth_send_ok = notify.send(cfg, title, body, severity="RISK")
     # Cursor semantics (incl. the oscillation debounce) live in next_froth_cursor.
     notified_froth_band = alerting.next_froth_cursor(
         froth["band"], prev_notified_froth, froth_alert, froth_send_ok)

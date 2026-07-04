@@ -213,6 +213,21 @@ def _run_car(conn, study: dict, events: list[dict]) -> list[dict]:
     rows_by, cov_by, unhedged_by = _price_events(
         lake, usable, controls, HORIZONS_CAR, seg_of)
 
+    # §5.2 collision note: events within ±5 sessions of ANOTHER study's event on
+    # the same name. Stamped into the primary-horizon rows' extras so /api/studies
+    # can serve it on the Lab card (redesign §3).
+    other_events: dict[str, list[dict]] = {}
+    for row in conn.execute(
+            "SELECT study, permaticker, ticker, event_ts FROM events "
+            "WHERE study != ?", (study["name"],)).fetchall():
+        d = dict(row)
+        other_events.setdefault(d["study"], []).append(d)
+    col = car.collision_report(usable, other_events)
+    collision_note = (f"{col['pct'] * 100:.1f}% of events within ±5 sessions of "
+                      f"another study's event"
+                      + (f" ({', '.join(f'{s}: {n}' for s, n in col['by_study'].items())})"
+                         if col["by_study"] else ""))
+
     sha, now = emitter_sha(), _now_ms()
     p = {"horizons": HORIZONS_CAR, "k": car.K_CONTROLS,
          "min_cohort": car.MIN_COHORT, "monthly_snapshots": True}
@@ -245,7 +260,8 @@ def _run_car(conn, study: dict, events: list[dict]) -> list[dict]:
                           # per-event CAR dispersion — the paper book's Kelly
                           # denominator (σ² of the trade distribution)
                           "car_std": (statistics.stdev(cars_h)
-                                      if len(cars_h) >= 2 else None)}})
+                                      if len(cars_h) >= 2 else None),
+                          "collision": collision_note}})
     return out_rows
 
 

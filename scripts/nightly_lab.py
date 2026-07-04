@@ -162,6 +162,16 @@ def backup_verdict_registry() -> None:
     subprocess.run(["git", "commit", "-q", "-m",
                     "nightly: verdict registry snapshot"],
                    cwd=REPO, check=True, timeout=60)
+    # GAP E is only closed once the snapshot leaves this disk — a commit that
+    # stays on the laptop is not a backup. Push failure is non-fatal (offline
+    # laptop); the next nightly retries.
+    try:
+        subprocess.run(["git", "push", "-q", "origin", "main"],
+                       cwd=REPO, check=True, timeout=120)
+        log.info("verdict registry snapshot pushed to origin")
+    except (subprocess.SubprocessError, OSError) as exc:
+        log.warning("registry snapshot committed but push failed (%s) — "
+                    "will retry next nightly", exc)
 
 
 def main(argv=None) -> int:

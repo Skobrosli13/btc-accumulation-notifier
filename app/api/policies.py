@@ -34,6 +34,33 @@ def _study_status(conn, name: str) -> str | None:
         return None
 
 
+def _gate_stats(conn, name: str, segment: str) -> dict | None:
+    """One-line gate numbers for a policy chip (§3: 'PROMOTED chip and one-line
+    gate stats') — the study_results row's overlay-vs-baseline evidence, served
+    verbatim so the chip is never a bare claim."""
+    import json as _json
+    try:
+        row = conn.execute(
+            "SELECT n_events, extra_json FROM study_results "
+            "WHERE study=? AND segment=? ORDER BY computed_at DESC LIMIT 1",
+            (name, segment)).fetchone()
+    except sqlite3.Error:
+        return None
+    if not row:
+        return None
+    try:
+        extra = _json.loads(row["extra_json"] or "{}")
+    except (ValueError, TypeError):
+        extra = {}
+    if extra.get("overlay_return") is None:
+        return None
+    return {"segment": segment, "n_days": row["n_events"],
+            "overlay_return": extra.get("overlay_return"),
+            "baseline_return": extra.get("baseline_return"),
+            "overlay_maxdd": extra.get("overlay_maxdd"),
+            "baseline_maxdd": extra.get("baseline_maxdd")}
+
+
 @router.get("/api/policies/state")
 def policies_state(cfg: Config = Depends(get_config),
                    _=Depends(require_token)) -> dict:
@@ -44,6 +71,10 @@ def policies_state(cfg: Config = Depends(get_config),
         latest = store.latest_run(conn)
         trend_status = _study_status(conn, "btc_trend_policy")
         accum_status = _study_status(conn, "btc_accum_policy")
+        # OOS for trend (event-split study), BACKTEST for accum (a DCA curve
+        # can't be split at a boundary — see harness.schema segment notes).
+        trend_gate = _gate_stats(conn, "btc_trend_policy", "OOS")
+        accum_gate = _gate_stats(conn, "btc_accum_policy", "BACKTEST")
     finally:
         conn.close()
 
@@ -61,8 +92,10 @@ def policies_state(cfg: Config = Depends(get_config),
     return {
         "trend": {"status": trend_status, "state": "LONG" if state >= 1.0 else "FLAT",
                   "warming_up": warming, "period": pol.TREND_PERIOD,
-                  "band_pct": pol.TREND_BAND * 100, "n_closes": len(closes)},
-        "accum": {"status": accum_status, "tier": tier, "dca_multiplier": scale},
+                  "band_pct": pol.TREND_BAND * 100, "n_closes": len(closes),
+                  "gate_stats": trend_gate},
+        "accum": {"status": accum_status, "tier": tier, "dca_multiplier": scale,
+                  "gate_stats": accum_gate},
         "note": ("Discipline overlays — not alpha (POLICY tier). Trend manages "
                  "the HELD stack; accumulation tilts NEW capital. Statuses are "
                  "machine verdicts; see /lab."),

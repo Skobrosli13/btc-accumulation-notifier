@@ -212,10 +212,11 @@ def current_regime(daily_close: "pd.Series | None", period: int = 200) -> str:
     return "bull" if float(daily_close.iloc[-1]) >= ma else "bear"
 
 
-# Trigger keys that are CONTEXT-ONLY for the confluence gate. The replay that
-# produces st_winrates.json (scripts/st_validation) can only model triggers
-# derivable from candle history, so the funding/OI-driven triggers carry no
-# backtested cell; counting them toward the same-direction confluence tally
+# Trigger keys that are CONTEXT-ONLY for the confluence gate. The candle-replay
+# calibration (retired to archive/v1 with st_winrates.json — every alerted cell
+# measured coin-flip) could only model triggers derivable from candle history,
+# so the funding/OI-driven triggers never had a backtested cell; counting them
+# toward the same-direction confluence tally
 # would let an unvalidated fire promote a lone near-coin-flip candle trigger
 # into an alert from a population the calibration never measured. They can
 # still alert on their own merits (the single-trigger regime-aligned path) —

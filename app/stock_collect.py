@@ -22,9 +22,8 @@ import random
 import sys
 import time
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
-from . import (maturity, notify, stock_confidence, stock_levels, stock_positions,
+from . import (stock_confidence, stock_levels, stock_positions,
                stock_scoring, stock_store, store)
 from .config import Config, load_config
 from .sources.stocks import earnings, estimates, insider, prices, universe
@@ -540,36 +539,31 @@ def run(cfg: Config, *, dry_run: bool = False, limit: int | None = None,
 
 
 def _maybe_alert(conn, cfg: Config, to_alert: list[dict], now, dry_run: bool) -> list[str]:
+    """Record new surfaced setups — WITHOUT an instant send (§4 fatigue budget).
+
+    The redesign reserves instant push for ACT/RISK/FAIL, and swing setups are
+    none of those (no verified edge — recording only). The alert row is still
+    the canonical "we surfaced this" record: it arms the cooldown, opens the
+    forward-test position, and shows on the dashboard's recording surfaces.
+    No confidence %/maturity stamp in the stored message either — the retired
+    calibration measured coin-flip, so those numbers were false precision.
+    """
     if not to_alert:
         return []
-    lines = []
-    for a in to_alert:
-        s, d = a["sig"], a["detail"]
-        conf = d["confidence"]
-        # Same maturity rung the dashboard card shows — derived from the measured
-        # win-rates cell (edge_class), never a hardcoded archetype set.
-        mat = maturity.EDGE if d.get("edge_class") == "edge" else maturity.FORWARD
-        lines.append(
-            f"[{mat}] {s['direction']} {s['ticker']} — {d['archetype_label']} "
-            f"(conf {conf['prob']*100:.0f}% {conf['label']})\n"
-            f"  {d.get('catalyst','')}\n"
-            f"  entry {s['entry']}  stop {s['stop']}  T1 {s['t1']}  T2 {s['t2']}  "
-            f"({s['rr']}R, risk {d['levels'].get('risk_pct')}%)")
-    title = f"Stock swing setups ({len(to_alert)})"
-    body = ("New swing setups (alert-only, not advice; confidence is a backtested "
-            "prior until the live tracker confirms it):\n\n" + "\n\n".join(lines))
+    lines = [
+        f"{a['sig']['direction']} {a['sig']['ticker']} — {a['detail']['archetype_label']}\n"
+        f"  {a['detail'].get('catalyst', '')}\n"
+        f"  entry {a['sig']['entry']}  stop {a['sig']['stop']}  "
+        f"T1 {a['sig']['t1']}  T2 {a['sig']['t2']}  "
+        f"({a['sig']['rr']}R, risk {a['detail']['levels'].get('risk_pct')}%)"
+        for a in to_alert]
+    body = ("Recorded swing setups (recording only — no verified edge, no instant "
+            "alert; see the dashboard):\n\n" + "\n\n".join(lines))
     if dry_run:
-        log.info("[dry-run] STOCK ALERT x%d\n%s\n%s", len(to_alert), title, body)
+        log.info("[dry-run] STOCK SETUPS RECORDED x%d\n%s", len(to_alert), body)
         return [f"{a['sig']['ticker']}/{a['sig']['archetype']}" for a in to_alert]
-    ok = notify.send(cfg, title, body)
-    # The alert row is written EITHER way (sent=0 on failure) so a failed send is
-    # retried exactly once next run; only a sent=1 row arms the cooldown. With NO
-    # transport configured (documented empty-.env mode) the row itself is the
-    # canonical "we alerted" record: arm the cooldown off creation, or the dead
-    # retry loop leaves stock_cooldown_days permanently unarmed and the tracker
-    # re-opens the same ticker/archetype the day after every close. A send FAILURE
-    # with a configured transport still stays unarmed (retry semantics unchanged).
-    armed = ok or not notify.has_transport(cfg)
+    # sent=True: the row IS the record now (no transport involved), and it must
+    # arm the cooldown exactly as the old delivered-alert path did.
     fired = []
     for a in to_alert:
         s = a["sig"]
@@ -577,32 +571,23 @@ def _maybe_alert(conn, cfg: Config, to_alert: list[dict], now, dry_run: bool) ->
             conn, ts=a["ts"], created_at=now.isoformat(), ticker=s["ticker"],
             archetype=s["archetype"], direction=s["direction"], entry=s["entry"],
             stop=s["stop"], t1=s["t1"], t2=s["t2"], confidence=s["confidence"],
-            message=body, sent=armed)
-        if ok:
-            fired.append(f"{s['ticker']}/{s['archetype']}")
-    if not ok and notify.has_transport(cfg):
-        log.warning("stock alert send failed; queued %d alerts for one retry next run",
-                    len(to_alert))
+            message=body, sent=True)
+        fired.append(f"{s['ticker']}/{s['archetype']}")
+    log.info("recorded %d swing setups (no instant alert — §4 fatigue budget)",
+             len(fired))
     return fired
 
 
 def _retry_unsent_alerts(conn, cfg: Config, dry_run: bool) -> list[str]:
-    """Retry alert rows whose send failed last run — exactly once, then drop them.
-    A successful retry sets sent=1, which is what arms the cooldown."""
+    """Drain legacy sent=0 rows from before the instant-send retirement — mark
+    them sent (the row is the record) so the cooldown arms; nothing is emailed."""
     rows = stock_store.unsent_stock_alerts(conn)
     if not rows or dry_run:
         return []
-    lines = [f"{r['direction']} {r['ticker']} — {r['archetype']}  "
-             f"entry {r['entry']}  stop {r['stop']}  T1 {r['t1']}  T2 {r['t2']}"
-             for r in rows]
-    ok = notify.send(cfg, f"Stock swing setups (resend x{len(rows)})",
-                     "Resending setups whose alert delivery failed last run "
-                     "(levels are as of the original signal):\n\n" + "\n".join(lines))
     for r in rows:
-        stock_store.mark_stock_alert_retry(conn, r["id"], sent=ok)
-    if not ok:
-        log.warning("stock alert resend failed; dropping %d alerts (retry-once)", len(rows))
-        return []
+        stock_store.mark_stock_alert_retry(conn, r["id"], sent=True)
+    log.info("marked %d legacy queued alerts as recorded (instant send retired)",
+             len(rows))
     return [f"{r['ticker']}/{r['archetype']}" for r in rows]
 
 

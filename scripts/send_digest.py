@@ -34,21 +34,38 @@ def render(payload: dict) -> tuple[str, str]:
         for a in payload["act"]:
             when = (datetime.fromtimestamp(a["ts"] / 1000, tz=timezone.utc)
                     .date().isoformat() if a.get("ts") else "")
-            lines.append(f"  • [{a['label']}] {a['ticker']} "
+            # Gap C: a stale-synced event is recording, not a fresh pick.
+            label = a["label"] + (" — STALE FEED" if a.get("stale") else "")
+            lines.append(f"  • [{label}] {a['ticker']} "
                          f"{a.get('direction') or ''} {a.get('detail') or ''} {when}".rstrip())
     else:
         lines.append("Nothing needs you today.")
     p = payload["paper"]
     if p["nav"] is not None:
         lines.append("")
-        lines.append(f"Paper book: NAV {p['nav']:.4f} vs SPY {p['bench']:.4f} "
+        at = (f", after-tax {p['nav_after_tax']:.4f}"
+              if p.get("nav_after_tax") is not None else "")
+        lines.append(f"Paper book: NAV {p['nav']:.4f}{at} vs SPY {p['bench']:.4f} "
                      f"({p['open']} open, {p['pending']} pending, {p['closed']} closed)")
     lines.append("")
-    lines.append("Testing: " + "; ".join(
-        f"{t['name']}={t['status']}" for t in payload["testing"]))
-    if payload["lab_sync"].get("overdue"):
-        lines.append("")
-        lines.append("⚠ Lab sync OVERDUE — the laptop nightly missed; events above may be stale.")
+    lines.append("Testing:")
+    for t in payload["testing"]:
+        lines.append(f"  {t['name']} = {t['status']} — {t.get('next_decision', '')}".rstrip(" —"))
+    # §4: the digest carries the health summary — quiet ≠ healthy.
+    h = payload.get("health") or {}
+    lab = payload["lab_sync"]
+    def _age(v):  # noqa: E306
+        return f"{v:.1f}h" if v is not None else "never"
+    lines.append("")
+    lines.append(f"Health: collector {_age(h.get('collect_age_hours'))}"
+                 f"{' STALE' if h.get('collect_stale') else ''} · "
+                 f"LT run {_age(h.get('run_age_hours'))}"
+                 f"{' STALE' if h.get('run_stale') else ''} · "
+                 f"lab sync {_age(lab.get('age_hours'))}"
+                 f"{' OVERDUE' if lab.get('overdue') else ''}")
+    if lab.get("overdue"):
+        lines.append("⚠ Lab sync OVERDUE — the laptop nightly missed; stock event "
+                     "rows may be missing or stale.")
     lines.append("")
     lines.append(payload["note"])
     n_act = len(payload["act"])

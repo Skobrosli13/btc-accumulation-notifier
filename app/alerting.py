@@ -307,10 +307,10 @@ def build_flash_message(*, composite: float, tier: str, subscores: dict,
 
 # --- Short-term swing alerts -------------------------------------------------
 
-# Applies to EVERY swing trigger, not just order-flow: the committed calibration
-# (app/st_winrates.json) measures the ALERTED (post-confluence) population as
-# statistically indistinguishable from the base rate — the email must not imply
-# a conviction the system's own numbers refute.
+# Applies to EVERY swing trigger, not just order-flow: the retired calibration
+# (archive/v1/app/st_winrates.json) measured the ALERTED (post-confluence)
+# population as statistically indistinguishable from the base rate — the email
+# must not imply a conviction the system's own numbers refute.
 _ST_NO_EDGE_LINE = ("Swing triggers overall: measured ~ coin-flip vs the base rate "
                     "on the alerted population (no demonstrated edge) - timing "
                     "context, not conviction.")

@@ -25,6 +25,7 @@ from bisect import bisect_right
 from datetime import datetime, timezone
 
 from ..harness import costs as hcosts
+from ..harness import tax as htax
 from . import limits, sizing
 
 EXPIRY_SESSIONS = 5          # a pending with no fill within ~a week expires
@@ -204,21 +205,29 @@ def mark_nav(conn: sqlite3.Connection, study: str,
     for b in dates:
         ts = b["ts"]
         nav = 1.0
+        nav_at = 1.0    # after-tax: realized legs taxed (meta-gate judges after tax)
         n_open = 0
         for p in pos:
             if p["entry_ts"] > ts or not p["entry_px"]:
                 continue
             if p["status"] == "CLOSED" and p["exit_ts"] <= ts:
-                nav += p["qty"] * (p["exit_px"] / p["entry_px"] - 1.0)
+                pnl = p["qty"] * (p["exit_px"] / p["entry_px"] - 1.0)
+                nav += pnl
+                # Every Stage-0 hold is <= its horizon (~21 sessions) — short-term
+                # rate; unrealized marks stay untaxed until they close.
+                nav_at += htax.after_tax(pnl)
             else:
                 mark = px_at(p["ticker"], ts)
                 if mark:
-                    nav += p["qty"] * (mark / p["entry_px"] - 1.0)
+                    unreal = p["qty"] * (mark / p["entry_px"] - 1.0)
+                    nav += unreal
+                    nav_at += unreal
                     n_open += 1
         conn.execute(
-            "INSERT OR REPLACE INTO paper_nav (study, date, nav, bench, n_open) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (study, _iso(ts), nav, b["close"] / bench0, n_open))
+            "INSERT OR REPLACE INTO paper_nav "
+            "(study, date, nav, nav_after_tax, bench, n_open) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (study, _iso(ts), nav, nav_at, b["close"] / bench0, n_open))
         n += 1
     conn.commit()
     return n

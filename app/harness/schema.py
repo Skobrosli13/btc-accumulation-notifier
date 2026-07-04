@@ -112,7 +112,8 @@ CREATE TABLE IF NOT EXISTS paper_positions (
 CREATE TABLE IF NOT EXISTS paper_nav (
   study TEXT,
   date TEXT,                             -- ISO session date
-  nav REAL,                              -- book NAV (starts 1.0)
+  nav REAL,                              -- book NAV (starts 1.0), pre-tax
+  nav_after_tax REAL,                    -- realized legs taxed (harness.tax st_rate)
   bench REAL,                            -- benchmark TR normalized to book start
   n_open INTEGER,
   PRIMARY KEY (study, date)
@@ -126,9 +127,19 @@ CREATE TABLE IF NOT EXISTS lab_meta (
 """
 
 
+def _add_column_if_missing(conn: sqlite3.Connection, table: str, column: str,
+                           decl: str) -> None:
+    cols = {r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    if column not in cols:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+
+
 def init_harness_db(conn: sqlite3.Connection) -> None:
     """Idempotent DDL — safe on every connect (additive-migration convention)."""
     conn.executescript(_DDL)
+    # Additive migrations for pre-existing DBs (CREATE IF NOT EXISTS won't
+    # alter an old table) — same convention as store.init_db.
+    _add_column_if_missing(conn, "paper_nav", "nav_after_tax", "REAL")
     conn.commit()
 
 

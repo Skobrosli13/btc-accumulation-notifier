@@ -37,6 +37,13 @@ SUSER="${SUSER:-team}"
 SPASS="${SPASS:-$(openssl rand -base64 18 | tr -dc 'A-Za-z0-9' | head -c 14)}"
 sudo htpasswd -bc /etc/nginx/.btc_htpasswd "$SUSER" "$SPASS" >/dev/null 2>&1
 
+# Owner credentials (GAP A / directive 6): PROMOTED study output — /lab, the
+# Today Act rows, the paper book — is gated on the authenticated USER, which
+# nginx forwards as X-Auth-User. `team` sees the shared context surfaces only.
+OUSER="${OUSER:-owner}"
+OPASS="${OPASS:-$(openssl rand -base64 18 | tr -dc 'A-Za-z0-9' | head -c 14)}"
+sudo htpasswd -b /etc/nginx/.btc_htpasswd "$OUSER" "$OPASS" >/dev/null 2>&1
+
 # Final HTTPS + basic-auth reverse proxy (API stays localhost-only)
 sudo tee /etc/nginx/sites-available/btc >/dev/null <<NGINX
 server {
@@ -70,6 +77,9 @@ server {
         proxy_pass http://127.0.0.1:3000;
         proxy_http_version 1.1;
         proxy_set_header Host \$host;
+        # Directive 6: the app gates owner-only surfaces on this header — it
+        # must be SET here (never pass through a client-supplied value).
+        proxy_set_header X-Auth-User \$remote_user;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
@@ -79,5 +89,5 @@ server {
 }
 NGINX
 sudo nginx -t && sudo systemctl reload nginx
-echo "Dashboard live at https://$DOMAIN  (user=$SUSER pass=$SPASS)"
-echo "Rotate the password later:  sudo htpasswd /etc/nginx/.btc_htpasswd $SUSER"
+echo "Dashboard live at https://$DOMAIN  (team=$SUSER pass=$SPASS | owner=$OUSER pass=$OPASS)"
+echo "Rotate a password later:  sudo htpasswd /etc/nginx/.btc_htpasswd <user>"

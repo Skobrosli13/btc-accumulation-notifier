@@ -192,13 +192,19 @@ def positions(cfg: Config = Depends(_cfg), _=Depends(_require_token)) -> dict:
         openp = stock_store.open_positions(conn)
         pending = stock_store.pending_positions(conn)
         closed = stock_store.closed_positions(conn)
+        # GAP G (audit finding): pending-expired = alerted setups that never
+        # filled. They never entered the record — but hiding the count would
+        # overstate how much of what was surfaced actually got tested.
+        n_expired = conn.execute(
+            "SELECT count(*) FROM stock_positions WHERE status='EXPIRED'"
+        ).fetchone()[0]
     finally:
         conn.close()
     summary = stock_positions.summarize(closed)  # excludes voided ('rebased') rows
     recent_closed = sorted(closed, key=lambda r: r.get("closed_ts") or 0, reverse=True)[:40]
     return {"open": openp, "pending": pending, "recent_closed": recent_closed,
             "summary": summary, "n_open": len(openp), "n_pending": len(pending),
-            "n_closed": len(closed),
+            "n_closed": len(closed), "n_expired": n_expired,
             "note": ("Forward-tested on the tracker's own signals — out-of-sample, "
                      "grows over time. Fills are at the NEXT session's open (pending "
                      "until then); voided/rebased rows never count.")}

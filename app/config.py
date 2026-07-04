@@ -329,6 +329,13 @@ class Config:
     # category at a stale level. .env: FRESHNESS_BUDGET_DAYS (default 3).
     freshness_budget_days: float = 3.0
 
+    # Quiet hours for push (§4/§8 fatigue budget): "HH-HH" UTC window during
+    # which non-FAIL ntfy pushes drop to silent ("min") priority — the message
+    # still arrives, it just doesn't ring at 3am. FAIL (dead-man) always rings.
+    # Default 03-11 UTC ≈ 11pm-7am ET. Empty string disables.
+    # .env: QUIET_HOURS_UTC (default "03-11").
+    quiet_hours_utc: str = "03-11"
+
     # --- Namespaced views (§0.5) -----------------------------------------
     # Typed groupings built from the flat fields above. Pure views (no state of
     # their own), so they can never drift from the source config.
@@ -585,4 +592,5 @@ def load_config() -> Config:
         api_cors_origin=_opt("API_CORS_ORIGIN"),
         public_base_url=_get("PUBLIC_BASE_URL", "https://btc.riverviewweb.com").rstrip("/"),
         watchdog_stale_hours=_get_float("WATCHDOG_STALE_HOURS", 3),
+        quiet_hours_utc=_get("QUIET_HOURS_UTC", "03-11"),
     )

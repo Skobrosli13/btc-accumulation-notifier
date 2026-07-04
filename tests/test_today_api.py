@@ -82,10 +82,16 @@ def test_aggregate_promoted_events_only_inside_window(conn):
     events = [a for a in out["act"] if a["kind"] == "event"]
     assert [e["ticker"] for e in events] == ["ABC"]
     assert events[0]["label"] == "PROMOTED"
+    assert events[0]["stale"] is True   # never-synced lab -> demoted framing
     assert "3 insider(s)" in events[0]["detail"]
-    # testing strip carries every study verbatim
+    # testing strip carries every study verbatim + a concrete next decision
     assert {t["name"]: t["status"] for t in out["testing"]} == {
         "insider_cluster": "PROMOTED", "sue_pead": "EXTEND"}
+    extend = next(t for t in out["testing"] if t["name"] == "sue_pead")
+    assert "review" in extend["next_decision"] and "1" in extend["next_decision"]
+    # §4: the digest's one-line health summary rides the same payload
+    assert set(out["health"]) == {"collect_age_hours", "run_age_hours",
+                                  "collect_stale", "run_stale"}
 
 
 def test_aggregate_policy_studies_never_emit_event_rows(conn):
@@ -99,24 +105,59 @@ def test_aggregate_policy_studies_never_emit_event_rows(conn):
     assert [a for a in out["act"] if a["kind"] == "event"] == []
 
 
-def _record_run(conn, ts, tier):
+def _record_run(conn, ts, tier, froth=None):
     store.record_run(conn, run_ts=ts, price=60000, composite=50.0, tier=tier,
                      active_cats=["price"], readings={}, tier_alerted=False,
-                     flash_alerted=False, notified_tier=tier)
+                     flash_alerted=False, notified_tier=tier, froth=froth)
 
 
-def test_aggregate_btc_tier_change(conn):
-    _record_run(conn, "2026-07-01T00:00:00+00:00", "WATCH")
-    _record_run(conn, "2026-07-01T06:00:00+00:00", "ACCUMULATE")
+def _iso_at(offset_ms: int) -> str:
+    return datetime.fromtimestamp((_now_ms() + offset_ms) / 1000,
+                                  tz=timezone.utc).isoformat()
+
+
+DAY = 86_400_000
+
+
+def test_aggregate_btc_tier_change_across_window(conn):
+    # Gap D: the comparison is latest-vs-pre-window state, so a change ~12h old
+    # (well past the previous 6h run) is still reported.
+    _record_run(conn, _iso_at(-4 * DAY), "WATCH")           # pre-window state
+    _record_run(conn, _iso_at(-12 * 3_600_000), "ACCUMULATE")
+    _record_run(conn, _iso_at(0), "ACCUMULATE")             # latest, no flap
     out = aggregate_today(conn)
     tiers = [a for a in out["act"] if a["kind"] == "btc_tier"]
     assert len(tiers) == 1 and tiers[0]["detail"] == "WATCH → ACCUMULATE"
 
 
 def test_aggregate_no_tier_change_when_stable(conn):
-    _record_run(conn, "2026-07-01T00:00:00+00:00", "WATCH")
-    _record_run(conn, "2026-07-01T06:00:00+00:00", "WATCH")
+    _record_run(conn, _iso_at(-4 * DAY), "WATCH")
+    _record_run(conn, _iso_at(0), "WATCH")
     assert [a for a in aggregate_today(conn)["act"] if a["kind"] == "btc_tier"] == []
+
+
+def test_aggregate_stale_pipeline_reports_no_change(conn):
+    # Latest run itself predates the window -> the state at window start IS the
+    # current state; nothing happened "today".
+    _record_run(conn, _iso_at(-6 * DAY), "WATCH")
+    _record_run(conn, _iso_at(-5 * DAY), "ACCUMULATE")
+    assert [a for a in aggregate_today(conn)["act"] if a["kind"] == "btc_tier"] == []
+
+
+def test_aggregate_froth_escalation(conn):
+    # WARMING (30) -> FROTHY (60) inside the window = an act row; de-escalation
+    # is deliberately NOT actionable.
+    _record_run(conn, _iso_at(-4 * DAY), "WATCH", froth=30.0)
+    _record_run(conn, _iso_at(0), "WATCH", froth=60.0)
+    out = aggregate_today(conn)
+    froths = [a for a in out["act"] if a["kind"] == "froth"]
+    assert len(froths) == 1 and froths[0]["detail"] == "WARMING → FROTHY"
+
+
+def test_aggregate_froth_deescalation_silent(conn):
+    _record_run(conn, _iso_at(-4 * DAY), "WATCH", froth=60.0)
+    _record_run(conn, _iso_at(0), "WATCH", froth=30.0)
+    assert [a for a in aggregate_today(conn)["act"] if a["kind"] == "froth"] == []
 
 
 def test_aggregate_trend_flip_inside_window(conn):
@@ -146,7 +187,8 @@ def test_aggregate_paper_and_sync_blocks(conn):
                  (datetime.now(timezone.utc).isoformat(),))
     conn.commit()
     out = aggregate_today(conn)
-    assert out["paper"] == {"nav": 1.0132, "bench": 1.0050, "date": "2026-07-02",
+    assert out["paper"] == {"nav": 1.0132, "bench": 1.0050, "nav_after_tax": None,
+                            "date": "2026-07-02",
                             "open": 1, "pending": 1, "closed": 1}
     assert out["lab_sync"]["overdue"] is False
 
@@ -187,10 +229,24 @@ def test_digest_render_with_act_rows(conn):
                                  "ticker": "ABC", "event_ts": _now_ms(),
                                  "direction": "LONG",
                                  "meta": {"n_managers": 2, "agg_usd": 90_000}}])
+    conn.execute("INSERT INTO lab_meta (key, value) VALUES ('last_sync', ?)",
+                 (datetime.now(timezone.utc).isoformat(),))
+    conn.commit()
     title, body = render(aggregate_today(conn))
     assert title.startswith("Daily digest — 1 item")
-    assert "[PROMOTED] ABC LONG" in body
-    assert "insider_cluster=PROMOTED" in body
+    assert "[PROMOTED] ABC LONG" in body      # fresh sync -> no STALE FEED tag
+    assert "insider_cluster = PROMOTED" in body
+    assert "Health: collector" in body        # §4 health summary rides along
+
+
+def test_digest_render_stale_feed_demotes_events(conn):
+    # Gap C: never-synced lab -> the digest tags the event row STALE FEED.
+    _register(conn, "insider_cluster", "alpha", "PROMOTED")
+    schema.insert_events(conn, [{"study": "insider_cluster", "asset": "EQ",
+                                 "ticker": "ABC", "event_ts": _now_ms(),
+                                 "direction": "LONG"}])
+    _, body = render(aggregate_today(conn))
+    assert "[PROMOTED — STALE FEED] ABC" in body
 
 
 def test_digest_render_quiet_day(conn):
