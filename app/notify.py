@@ -15,13 +15,24 @@ from .config import Config
 log = logging.getLogger(__name__)
 
 
-def _send_ntfy(cfg: Config, title: str, body: str) -> bool:
+# §8 fatigue budget: instant push carries exactly three severities. Everything
+# else belongs in the daily digest (severity=None -> default priority).
+#   ACT  — execution-required (a proposed order)        -> high
+#   RISK — drawdown threshold / forced de-risk           -> high
+#   FAIL — QA red / job dead / dead-man missed           -> urgent
+_SEVERITY_PRIORITY = {"ACT": "high", "RISK": "high", "FAIL": "urgent"}
+
+
+def _send_ntfy(cfg: Config, title: str, body: str,
+               severity: str | None = None) -> bool:
     url = f"{cfg.ntfy_server}/{cfg.ntfy_topic}"
     try:
         r = requests.post(
             url,
             data=body.encode("utf-8"),
-            headers={"Title": title, "Priority": "default", "Tags": "chart_with_downwards_trend"},
+            headers={"Title": title,
+                     "Priority": _SEVERITY_PRIORITY.get(severity or "", "default"),
+                     "Tags": "chart_with_downwards_trend"},
             timeout=15,
         )
         r.raise_for_status()
@@ -82,13 +93,16 @@ def _email_recipients(cfg: Config, conn: sqlite3.Connection | None) -> dict[str,
 
 
 def send(cfg: Config, title: str, body: str,
-         conn: sqlite3.Connection | None = None) -> bool:
+         conn: sqlite3.Connection | None = None,
+         severity: str | None = None) -> bool:
     """Send via whatever transports are configured. Returns True if any succeeded.
 
     Email (Resend) is the primary channel after the pivot; ntfy/Telegram are
     optional secondaries. All are no-ops when unconfigured. When ``conn`` is
     given, the email goes to the owner AND every active dashboard subscriber,
-    each with a personal unsubscribe link.
+    each with a personal unsubscribe link. ``severity`` ('ACT'|'RISK'|'FAIL')
+    raises the push priority — reserved for the §8 instant tier; everything
+    else rides the daily digest.
     """
     from . import notify_email
 
@@ -100,7 +114,7 @@ def send(cfg: Config, title: str, body: str,
             sent = notify_email.send_email(cfg, title, body, to=email,
                                            unsubscribe_url=unsub) or sent
     if cfg.ntfy_topic:
-        sent = _send_ntfy(cfg, title, body) or sent
+        sent = _send_ntfy(cfg, title, body, severity=severity) or sent
     if cfg.telegram_bot_token and cfg.telegram_chat_id:
         sent = _send_telegram(cfg, title, body) or sent
     if not cfg.notifications_configured():

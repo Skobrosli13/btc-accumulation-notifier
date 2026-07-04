@@ -137,7 +137,7 @@ def check(cfg: Config, *, dry_run: bool = False) -> dict:
         result["alerted"] = should_alert
     elif should_alert:
         # Send over every configured transport (the broken piece may be one of them).
-        sent = notify.send(cfg, title, body)
+        sent = notify.send(cfg, title, body, severity="FAIL")   # §8 instant tier
         if not sent:
             log.error("watchdog: STALE but NO transport delivered the alert")
         store.set_meta(conn, _META_KEY, now.isoformat())

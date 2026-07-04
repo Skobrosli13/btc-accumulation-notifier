@@ -79,6 +79,20 @@ def lab_sync_state(last_sync_iso: str | None, now: datetime | None = None) -> di
             "overdue": age_h > LAB_SYNC_OVERDUE_H}
 
 
+def act_window_start_ms(now: datetime | None = None) -> int:
+    """The Today/digest 'Act' window start: PREVIOUS BUSINESS DAY 00:00 ET
+    (Gap D: one shared definition so the page and the digest can never
+    disagree; localStorage read-state is cosmetic only)."""
+    from zoneinfo import ZoneInfo
+    et = ZoneInfo("America/New_York")
+    now_et = _utc(now or datetime.now(timezone.utc)).astimezone(et)
+    d = now_et.date() - timedelta(days=1)
+    while d.weekday() > 4:                      # Sat/Sun -> previous Friday
+        d -= timedelta(days=1)
+    start = datetime(d.year, d.month, d.day, tzinfo=et)
+    return int(start.timestamp() * 1000)
+
+
 def btc_schedule(now: datetime | None = None) -> dict:
     now = now or datetime.now(timezone.utc)
     return {"collect_next": next_minute_grid(now, 10).isoformat(),

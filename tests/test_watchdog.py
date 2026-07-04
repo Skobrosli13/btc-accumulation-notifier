@@ -17,7 +17,7 @@ def db(tmp_path, monkeypatch):
     # by stubbing notify.send to a recorder.
     sent = []
     monkeypatch.setattr(watchdog.notify, "send",
-                        lambda cfg, title, body: sent.append(title) or True)
+                        lambda cfg, title, body, severity=None: sent.append(title) or True)
     return path, sent
 
 
