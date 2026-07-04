@@ -10,3 +10,6 @@ __pycache__/
 venv/
 .pytest_cache/
 scripts/_tops_cache.csv
+
+# M1 Parquet research lake — re-derivable from the raw vendor cache, never committed
+data_lake/
