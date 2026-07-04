@@ -6,3 +6,9 @@ python-dotenv>=1.0,<2.0
 fastapi>=0.110,<1.0
 uvicorn[standard]>=0.29,<1.0
 resend>=2.0,<3.0
+# M1 equities data lake: Parquet write + DuckDB query over the research series
+# (Sharadar bundle, EDGAR, prices). The app SQLite keeps operational state only.
+# DuckDB handles Parquet natively; pyarrow only sweetens pandas<->parquet. Wide
+# upper bounds because only pyarrow>=24 ships a cp314 wheel (source builds fail).
+duckdb>=1.0,<2.0
+pyarrow>=15.0,<25.0

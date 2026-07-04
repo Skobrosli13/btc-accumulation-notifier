@@ -90,6 +90,7 @@ def _parse_date(raw: str, default: date) -> date:
 class CoreConfig:
     """Asset-agnostic infra: notifications, DB, the API gate, watchdog, freshness."""
     db_path: str
+    data_lake_path: str
     api_token: str | None
     api_cors_origin: str | None
     public_base_url: str
@@ -157,6 +158,7 @@ class EquityConfig:
     alpaca_secret_key: str | None
     tiingo_api_key: str | None
     massive_api_key: str | None
+    nasdaq_data_link_api_key: str | None
     sec_user_agent: str
     stock_insider_enabled: bool
     stock_universe_path: str
@@ -289,6 +291,14 @@ class Config:
     massive_api_key: str | None = None
     stock_lt_top_n: int = 30           # long-buys conviction list size
     stock_lt_min_dollar_vol: float = 3_000_000.0  # liquidity floor for the LT universe
+    # Sharadar Core US Equities Bundle (Nasdaq Data Link) — the M1 equities
+    # backbone (SEP/SF1/SF2/SF3/DAILY/TICKERS/ACTIONS). Presence of the key
+    # activates the PIT ingest. Non-professional personal license (no entity
+    # trading, no redistribution).
+    nasdaq_data_link_api_key: str | None = None
+    # Parquet lake root (research series live here, queried via DuckDB); the app
+    # SQLite keeps operational state only. Shared by equities + crypto archives.
+    data_lake_path: str = "data_lake"
 
     # Freshness budget for DAILY-cadence sources (bitcoin-data /last, BGeometrics
     # files, Fear & Greed, hashrate): a dated reading older than this many days is
@@ -304,7 +314,8 @@ class Config:
     @property
     def core(self) -> CoreConfig:
         return CoreConfig(
-            db_path=self.db_path, api_token=self.api_token,
+            db_path=self.db_path, data_lake_path=self.data_lake_path,
+            api_token=self.api_token,
             api_cors_origin=self.api_cors_origin, public_base_url=self.public_base_url,
             watchdog_stale_hours=self.watchdog_stale_hours,
             freshness_budget_days=self.freshness_budget_days,
@@ -345,7 +356,9 @@ class Config:
         return EquityConfig(
             finnhub_api_key=self.finnhub_api_key, alpaca_api_key=self.alpaca_api_key,
             alpaca_secret_key=self.alpaca_secret_key, tiingo_api_key=self.tiingo_api_key,
-            massive_api_key=self.massive_api_key, sec_user_agent=self.sec_user_agent,
+            massive_api_key=self.massive_api_key,
+            nasdaq_data_link_api_key=self.nasdaq_data_link_api_key,
+            sec_user_agent=self.sec_user_agent,
             stock_insider_enabled=self.stock_insider_enabled,
             stock_universe_path=self.stock_universe_path, stock_top_n=self.stock_top_n,
             stock_pead_lookback_days=self.stock_pead_lookback_days,
@@ -411,6 +424,11 @@ class Config:
     @property
     def massive_active(self) -> bool:
         return bool(self.massive_api_key)
+
+    @property
+    def sharadar_active(self) -> bool:
+        """The Sharadar bundle (M1 equities backbone) lights up from its key."""
+        return bool(self.nasdaq_data_link_api_key)
 
     @property
     def stock_price_source(self) -> str:
@@ -525,6 +543,8 @@ def load_config() -> Config:
         massive_api_key=_opt("MASSIVE_API_KEY"),
         stock_lt_top_n=_get_int("STOCK_LT_TOP_N", 30),
         stock_lt_min_dollar_vol=_get_float("STOCK_LT_MIN_DOLLAR_VOL", 3_000_000.0),
+        nasdaq_data_link_api_key=_opt("NASDAQ_DATA_LINK_API_KEY"),
+        data_lake_path=_get("DATA_LAKE_PATH", "data_lake"),
         freshness_budget_days=_get_float("FRESHNESS_BUDGET_DAYS", 3.0),
         api_token=_opt("API_TOKEN"),
         api_cors_origin=_opt("API_CORS_ORIGIN"),
