@@ -47,6 +47,20 @@ Git history is the tamper-evidence; never rewrite an entry.
   t=3.55 @ h21, n=3,823, after-tax +0.91%/event; IS consistent (+, t=3.43).
   Verdict pending the placebo suite (running).
 
+## 2026-07-04 — insider_cluster → PROMOTED (first ALPHA promotion)
+
+Gate legs, all passed on OOS (2022→registration): clustered t=3.55 ≥ 3.0;
+n_events=3,823 ≥ 100; n_months=54 ≥ 12; after-tax +0.91%/event at modal-tier
+costs; sign-consistent (IS mean +, OOS mean +); placebo CLEAN (p95|t|=1.61,
+exceedance 4% — passes even the plan's literal <2 bar). Horizon profile: OOS
+t 6.97/5.45/3.55/3.39 at h 5/10/21/63.
+
+Honesty notes carried with the promotion: the hypothesis is literature-known
+(CMP 2012) so OOS is less-contaminated rather than clean; the population is
+2016+ (vendor window); LIVE forward evidence + the collision re-run vs
+sue_pead (once it lands) are the remaining tests. Meta-gate precondition
+(≥1 ALPHA-PROMOTED) now satisfied pending the live paper curve vs SPY.
+
 ## 2026-07-04 — Deferrals (deliberate, revisit at collector cutover)
 
 - Legacy candle-replay backtest scripts + winrate/track-record JSON loaders
