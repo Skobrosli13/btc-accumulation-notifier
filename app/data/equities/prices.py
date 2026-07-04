@@ -77,7 +77,8 @@ def sep_bars(lake, ticker: str, limit: int = 400) -> list[dict]:
 
 def sep_bars_bulk(lake, tickers: list[str], limit: int = 400,
                   start_date: str | None = None,
-                  end_date: str | None = None) -> dict[str, list[dict]]:
+                  end_date: str | None = None,
+                  table: str = "sep") -> dict[str, list[dict]]:
     """Adjusted daily bars for MANY tickers in one DuckDB pass.
 
     One window-function query beats thousands of per-ticker parquet scans
@@ -86,7 +87,7 @@ def sep_bars_bulk(lake, tickers: list[str], limit: int = 400,
     simply absent. ``start_date``/``end_date`` (ISO) bound the scan — chunked
     evaluations use this to keep memory flat instead of loading whole histories.
     """
-    if not lake.exists("sep") or not tickers:
+    if not lake.exists(table) or not tickers:
         return {}
     uniq = sorted({t.upper() for t in tickers})
     placeholders = ",".join("?" for _ in uniq)
@@ -101,7 +102,7 @@ def sep_bars_bulk(lake, tickers: list[str], limit: int = 400,
         f"SELECT ticker, date, open, high, low, close, closeadj, volume FROM ("
         f"  SELECT ticker, date, open, high, low, close, closeadj, volume,"
         f"         row_number() OVER (PARTITION BY ticker ORDER BY date DESC) rn"
-        f"  FROM {lake.sql_table('sep')} WHERE ticker IN ({placeholders}){bounds}"
+        f"  FROM {lake.sql_table(table)} WHERE ticker IN ({placeholders}){bounds}"
         f") WHERE rn <= ? ORDER BY ticker, date ASC",
         [*uniq, *params, int(limit)])
     out: dict[str, list[dict]] = {}

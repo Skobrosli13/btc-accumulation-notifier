@@ -91,6 +91,38 @@ CREATE TABLE IF NOT EXISTS decisions (
   reason_code TEXT,
   ts INTEGER
 );
+
+-- Stage-0 paper book (§7 / meta-gate): one row per paper position opened from a
+-- PROMOTED study's events; NAV series marks the book daily vs a benchmark.
+CREATE TABLE IF NOT EXISTS paper_positions (
+  id INTEGER PRIMARY KEY,
+  study TEXT NOT NULL,
+  ticker TEXT NOT NULL,
+  event_ts INTEGER NOT NULL,
+  qty REAL,                              -- NAV fraction sized at entry
+  entry_ts INTEGER, entry_px REAL,
+  exit_ts INTEGER, exit_px REAL,
+  status TEXT CHECK(status IN ('PENDING','OPEN','CLOSED','SKIPPED')),
+  skip_reason TEXT,                      -- limits violation etc. (honest record)
+  horizon_sessions INTEGER,
+  tier TEXT, sector TEXT,
+  UNIQUE(study, ticker, event_ts)
+);
+
+CREATE TABLE IF NOT EXISTS paper_nav (
+  study TEXT,
+  date TEXT,                             -- ISO session date
+  nav REAL,                              -- book NAV (starts 1.0)
+  bench REAL,                            -- benchmark TR normalized to book start
+  n_open INTEGER,
+  PRIMARY KEY (study, date)
+);
+
+-- Small key/value meta (lab sync marker etc.).
+CREATE TABLE IF NOT EXISTS lab_meta (
+  key TEXT PRIMARY KEY,
+  value TEXT
+);
 """
 
 

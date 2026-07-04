@@ -48,21 +48,34 @@ def _step(name: str, fn) -> bool:
 
 def sync_lab_to_box() -> None:
     """Dump the harness tables and apply them on the box (WAL tolerates the
-    brief write alongside the running services)."""
+    brief write alongside the running services). Also stamps lab_meta.last_sync
+    on BOTH sides — the dashboard's freshness/staleness source of truth."""
     import sqlite3
+    from datetime import datetime, timezone
     cfg = load_config()
+    now_iso = datetime.now(timezone.utc).isoformat()
     src = sqlite3.connect(cfg.db_path)
-    tables = ("studies", "study_results", "events", "fills", "decisions")
+    tables = ("studies", "study_results", "events", "fills", "decisions",
+              "paper_positions", "paper_nav")
+    from app.harness import schema as _schema
     with tempfile.NamedTemporaryFile("w", suffix=".sql", delete=False,
                                      encoding="utf-8") as f:
         dump_path = f.name
+        # Carry the harness DDL so the box can never lag the laptop's schema
+        # (CREATE TABLE IF NOT EXISTS — idempotent, additive).
+        f.write(_schema._DDL + "\n")
         f.write("BEGIN;\n")
         for t in tables:
             f.write(f"DELETE FROM {t};\n")
         for line in src.iterdump():
             if any(line.startswith(f'INSERT INTO "{t}"') for t in tables):
                 f.write(line + "\n")
+        f.write("INSERT OR REPLACE INTO lab_meta (key, value) VALUES "
+                f"('last_sync', '{now_iso}');\n")
         f.write("COMMIT;\n")
+    src.execute("INSERT OR REPLACE INTO lab_meta (key, value) VALUES (?, ?)",
+                ("last_sync", now_iso))
+    src.commit()
     src.close()
     subprocess.run(["scp", "-i", SSH_KEY, dump_path, f"{BOX}:/tmp/lab_sync.sql"],
                    check=True, timeout=300)
@@ -74,6 +87,81 @@ def sync_lab_to_box() -> None:
          "c.commit(); c.close()\" && rm /tmp/lab_sync.sql"],
         check=True, timeout=300)
     Path(dump_path).unlink(missing_ok=True)
+
+
+def paper_book_step() -> None:
+    """Stage-0 paper book (§7/meta-gate): trade every PROMOTED car-study's new
+    events on paper — pending -> next-open fill (limits+sizing) -> horizon exit
+    -> daily NAV vs SPY total return. Only PROMOTED studies trade; a demoted
+    study's book freezes (positions close out, nothing new opens)."""
+    import json as _json
+    import sqlite3
+    from datetime import datetime, timezone
+
+    from app.data.equities import prices as eq_prices
+    from app.data_lake import Lake
+    from app.harness import schema
+    from app.portfolio import book
+
+    cfg = load_config()
+    lake = Lake(cfg.data_lake_path)
+    conn = sqlite3.connect(cfg.db_path)
+    conn.row_factory = sqlite3.Row
+    schema.init_harness_db(conn)
+    try:
+        studies = [dict(r) for r in conn.execute(
+            "SELECT * FROM studies WHERE tier='alpha' AND evaluator='car'")]
+        spy = eq_prices.sep_bars_bulk(lake, ["SPY"], limit=5000,
+                                      table="sfp").get("SPY", [])
+        for s in studies:
+            if s["status"] == "PROMOTED":
+                events = [e for e in schema.events_for_study(conn, s["name"])
+                          if e["event_ts"] >= s["registered_at"]]
+                book.record_pending(conn, s["name"], events,
+                                    horizon=s["primary_horizon"] or 21)
+            tickers = [r[0] for r in conn.execute(
+                "SELECT DISTINCT ticker FROM paper_positions WHERE study=? "
+                "AND status IN ('PENDING','OPEN','CLOSED')", (s["name"],))]
+            if not tickers:
+                continue
+            bars = eq_prices.sep_bars_bulk(lake, tickers, limit=200)
+            oos = conn.execute(
+                "SELECT exp_after_tax, extra_json FROM study_results WHERE "
+                "study=? AND segment='OOS' AND horizon=?",
+                (s["name"], s["primary_horizon"])).fetchone()
+            exp = oos["exp_after_tax"] if oos else None
+            car_std = (_json.loads(oos["extra_json"] or "{}").get("car_std")
+                       if oos else None)
+            st = book.process(conn, s["name"], bars,
+                              expectancy=exp, car_std=car_std)
+            n = book.mark_nav(conn, s["name"], bars, spy)
+            log.info("paper book %s: %s, nav rows %d", s["name"], st, n)
+    finally:
+        conn.close()
+
+
+def backup_verdict_registry() -> None:
+    """Commit a tiny JSON snapshot of the studies table — verdict timestamps are
+    the one non-re-derivable lab fact; git is the tamper-evident backup until
+    Litestream lands."""
+    import json as _json
+    import sqlite3
+
+    cfg = load_config()
+    conn = sqlite3.connect(cfg.db_path)
+    conn.row_factory = sqlite3.Row
+    rows = [dict(r) for r in conn.execute(
+        "SELECT * FROM studies ORDER BY registered_at")]
+    conn.close()
+    out = REPO / "studies" / "registry_snapshot.json"
+    new = _json.dumps(rows, indent=1, sort_keys=True, default=str)
+    if out.exists() and out.read_text(encoding="utf-8") == new:
+        return                                   # unchanged — no commit churn
+    out.write_text(new, encoding="utf-8")
+    subprocess.run(["git", "add", str(out)], cwd=REPO, check=True, timeout=60)
+    subprocess.run(["git", "commit", "-q", "-m",
+                    "nightly: verdict registry snapshot"],
+                   cwd=REPO, check=True, timeout=60)
 
 
 def main(argv=None) -> int:
@@ -94,6 +182,8 @@ def main(argv=None) -> int:
                 lambda: emit_events.main(["insider_cluster"]))
     ok &= _step("emit sue_pead", lambda: emit_events.main(["sue_pead"]))
     ok &= _step("emit clone13f", lambda: emit_events.main(["clone13f"]))
+    ok &= _step("paper book", paper_book_step)
+    ok &= _step("verdict registry backup", backup_verdict_registry)
     if ok and not args.no_sync:
         ok &= _step("sync lab tables to box", sync_lab_to_box)
     elif not ok:

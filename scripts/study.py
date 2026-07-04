@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import statistics
 import subprocess
 import sys
 import time
@@ -240,7 +241,11 @@ def _run_car(conn, study: dict, events: list[dict]) -> list[dict]:
                 "computed_at": now,
                 "extra": {"mean_controls": (sum(covs) / len(covs)) if covs else None,
                           "n_events_with_unhedged_sessions":
-                              unhedged_by.get((segment, h), 0)}})
+                              unhedged_by.get((segment, h), 0),
+                          # per-event CAR dispersion — the paper book's Kelly
+                          # denominator (σ² of the trade distribution)
+                          "car_std": (statistics.stdev(cars_h)
+                                      if len(cars_h) >= 2 else None)}})
     return out_rows
 
 
