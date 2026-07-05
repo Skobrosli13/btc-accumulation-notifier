@@ -138,6 +138,22 @@ def _fetch_insider(conn, cfg: Config, universe_rows: list[dict], dry_run: bool
     return clusters, attempted, ok
 
 
+def _load_insider_clusters(conn, cfg: Config, tickers: list[str]) -> dict[str, dict]:
+    """Read cached open-market BUY clusters from the store — populated out-of-band by
+    the weekly ``stock_insider_scan`` cron. Lets the daily collector use insider
+    context for PEAD ranking WITHOUT doing 500+ live SEC fetches on the hot path
+    (the reason the daily cron runs ``--skip-insider`` in the first place)."""
+    if not cfg.stock_insider_active:
+        return {}
+    since = int((datetime.now(timezone.utc) - timedelta(days=_INSIDER_LOOKBACK_DAYS)).timestamp() * 1000)
+    out: dict[str, dict] = {}
+    for tk in tickers:
+        c = stock_store.insider_cluster(conn, tk, since)
+        if c.get("buyers"):
+            out[tk] = c
+    return out
+
+
 def _snapshot_estimates(conn, cfg: Config, tickers: list[str]) -> dict[str, dict]:
     """Snapshot recommendation trends (accrues revision history) and return the
     revision delta per ticker where two snapshots now exist. Writes when live (the
@@ -380,8 +396,13 @@ def run(cfg: Config, *, dry_run: bool = False, limit: int | None = None,
                     coverage * 100, _MIN_PRICE_COVERAGE * 100)
 
     earnings_by, earnings_rows_n = _fetch_earnings(conn, cfg, tset, dry_run)
-    insider_by, insider_attempted, insider_ok = (
-        ({}, 0, 0) if skip_insider else _fetch_insider(conn, cfg, universe_rows, dry_run))
+    if skip_insider:
+        # Insider is ingested out-of-band by the weekly `stock_insider_scan` cron;
+        # read its cached clusters here (cheap SQLite) instead of 500+ live SEC hits.
+        insider_by = _load_insider_clusters(conn, cfg, tickers)
+        insider_attempted, insider_ok = 0, len(insider_by)
+    else:
+        insider_by, insider_attempted, insider_ok = _fetch_insider(conn, cfg, universe_rows, dry_run)
     # Estimate snapshots are 1 Finnhub call/ticker -> only snapshot names that just
     # REPORTED (revision-confirmation matters most post-earnings) so the free 60/min
     # limit isn't blown by the full universe.
@@ -509,7 +530,10 @@ def run(cfg: Config, *, dry_run: bool = False, limit: int | None = None,
     readings = {"regime": regime, "universe_n": len(universe_rows), "scored_n": len(ranked),
                 "coverage": round(coverage, 3), "degraded": degraded, "counts": counts,
                 "layers": {"prices": bool(bars_by_ticker), "earnings": cfg.finnhub_active,
-                           "insider": cfg.stock_insider_active and not skip_insider,
+                           # active whenever we have insider context to score with —
+                           # cached from the weekly scan even when the daily run skips
+                           # the live fetch.
+                           "insider": cfg.stock_insider_active and bool(insider_by),
                            "revision": bool(revision_by)},
                 "price_source": cfg.stock_price_source,   # config preference
                 "price_venues": venue_counts}             # venues actually used
