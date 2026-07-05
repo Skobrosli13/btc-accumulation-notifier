@@ -32,17 +32,14 @@ sudo nginx -t && sudo systemctl reload nginx && sudo systemctl enable nginx >/de
 sudo certbot certonly --webroot -w /var/www/certbot -d "$DOMAIN" \
   --non-interactive --agree-tos -m "$EMAIL" --deploy-hook "systemctl reload nginx"
 
-# Shared credentials (override SUSER/SPASS to choose your own)
+# Single login (owner decision 2026-07-05: the team/owner split was friction
+# for a one-person tool). This one user IS the owner — the app treats any
+# authenticated request as authorized (see btc-dashboard/lib/owner.ts). The
+# X-Auth-User header is still forwarded below so the app can fail closed if a
+# request ever reaches it without passing basic auth.
 SUSER="${SUSER:-team}"
 SPASS="${SPASS:-$(openssl rand -base64 18 | tr -dc 'A-Za-z0-9' | head -c 14)}"
 sudo htpasswd -bc /etc/nginx/.btc_htpasswd "$SUSER" "$SPASS" >/dev/null 2>&1
-
-# Owner credentials (GAP A / directive 6): PROMOTED study output — /lab, the
-# Today Act rows, the paper book — is gated on the authenticated USER, which
-# nginx forwards as X-Auth-User. `team` sees the shared context surfaces only.
-OUSER="${OUSER:-owner}"
-OPASS="${OPASS:-$(openssl rand -base64 18 | tr -dc 'A-Za-z0-9' | head -c 14)}"
-sudo htpasswd -b /etc/nginx/.btc_htpasswd "$OUSER" "$OPASS" >/dev/null 2>&1
 
 # Final HTTPS + basic-auth reverse proxy (API stays localhost-only)
 sudo tee /etc/nginx/sites-available/btc >/dev/null <<NGINX
@@ -89,5 +86,5 @@ server {
 }
 NGINX
 sudo nginx -t && sudo systemctl reload nginx
-echo "Dashboard live at https://$DOMAIN  (team=$SUSER pass=$SPASS | owner=$OUSER pass=$OPASS)"
+echo "Dashboard live at https://$DOMAIN  (user=$SUSER pass=$SPASS)"
 echo "Rotate a password later:  sudo htpasswd /etc/nginx/.btc_htpasswd <user>"
