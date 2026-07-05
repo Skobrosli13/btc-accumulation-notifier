@@ -8,7 +8,11 @@ from tests.factories import make_config
 
 
 def _cfg():
-    return make_config(ntfy_topic="t", ntfy_server="https://ntfy.example")
+    # quiet hours disabled: these tests pin the severity->priority mapping and
+    # must not depend on the wall clock (the default 03-11 UTC window mutes
+    # ACT/RISK to "min" when the suite happens to run inside it).
+    return make_config(ntfy_topic="t", ntfy_server="https://ntfy.example",
+                       quiet_hours_utc="")
 
 
 def _priority_sent(severity):

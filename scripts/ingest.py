@@ -117,8 +117,11 @@ def ingest_bulk(table: str, *, lake: Lake | None = None, api_key: str | None = N
             z.extract(csv_name, td)
             csv_path = os.path.join(td, csv_name).replace(os.sep, "/")
         log.info("%s: converting CSV -> Parquet via DuckDB...", table)
-        con = duckdb.connect()
+        # Lake connection = memory-capped + disk-spilling, so a multi-GB CSV
+        # conversion fits the 2GB box; order is the CSV's, not contractual.
+        con = lake._connect()
         try:
+            con.execute("SET preserve_insertion_order=false")
             con.execute(
                 f"COPY (SELECT * FROM read_csv_auto('{csv_path}', header=true, "
                 f"sample_size=-1)) TO '{out.as_posix()}' (FORMAT PARQUET)")

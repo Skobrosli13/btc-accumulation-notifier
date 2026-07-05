@@ -1,6 +1,6 @@
-"""Monthly research review (§9.5) — runs LOCALLY on the 1st.
+"""Monthly research review (§9.5) — cron on the prod box on the 1st, --no-sync.
 
-    python -m scripts.monthly_review
+    python -m scripts.monthly_review [--no-sync]
 
 1. Refresh the SUE crawl (re-crawl names whose newest event is >75 days old —
    a new fiscal quarter has landed for them).
@@ -9,7 +9,8 @@
    * portfolio policies verdict inside their runner;
    * ALPHA studies get gates.alpha_verdict via `study verdict` — a study
      already EXTENDed that misses again is KILLED by the gate.
-3. Sync the lab tables to the box.
+3. With --no-sync (box-resident mode) stamp lab_meta.last_sync in place;
+   without it, scp-sync the lab tables to the box (legacy laptop-master mode).
 4. Print the report — paste the interesting lines into studies/DECISIONS.md
    with rationale (the notebook entry is deliberately human; §9.5).
 
@@ -19,6 +20,7 @@ changes, and any Class-B event-definition change re-registers as <study>-v2
 """
 from __future__ import annotations
 
+import argparse
 import logging
 import sys
 from pathlib import Path
@@ -32,9 +34,13 @@ from app.harness import schema              # noqa: E402
 log = logging.getLogger("monthly-review")
 
 
-def main() -> int:
+def main(argv=None) -> int:
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    p = argparse.ArgumentParser()
+    p.add_argument("--no-sync", action="store_true",
+                   help="box-resident mode: stamp freshness in place, no scp")
+    args = p.parse_args(argv)
     from scripts import crawl_sue, emit_events, nightly_lab
     from scripts import study as study_cli
 
@@ -60,7 +66,10 @@ def main() -> int:
         except SystemExit as exc:      # a BLOCKED/no-events study is a report line
             log.warning("%s: %s", s["name"], exc)
 
-    nightly_lab.sync_lab_to_box()
+    if args.no_sync:
+        nightly_lab.stamp_lab_fresh()
+    else:
+        nightly_lab.sync_lab_to_box()
     log.info("=== report ===")
     study_cli.main(["report"])
     print("\nAppend the month's decisions + rationale to studies/DECISIONS.md.")

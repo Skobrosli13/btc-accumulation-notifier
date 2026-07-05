@@ -1,4 +1,4 @@
-"""Nightly lab maintenance (runs LOCALLY — the lake lives on the dev machine).
+"""Nightly lab maintenance (box-resident: cron on the prod box, --no-sync).
 
     python -m scripts.nightly_lab [--no-sync]
 
@@ -6,13 +6,17 @@
    SF2/ACTIONS by their append columns) + the BTC daily archive.
 2. Re-emit events (INSERT OR IGNORE — new SF2 filings become new insider
    clusters; sue_pead re-emits from the existing crawl, refreshed monthly).
-3. Sync the lab tables (studies/study_results/events/fills/decisions) to the
-   prod box so the /lab page tracks local research.
+3. Freshness: with --no-sync (box-resident mode — the lake and lab tables live
+   beside the services) a successful run stamps lab_meta.last_sync in place.
+   WITHOUT the flag it scp-syncs the lab tables to the box instead — the
+   legacy laptop-master mode, kept as a fallback if the box nightly is ever
+   pulled back onto the dev machine.
 
 Verdicts are NOT touched here — that is the monthly review's job (§9.5).
-Fail-soft per step: a dead source skips with a log line; the sync only runs
-when everything before it succeeded, so prod never receives a half-ingested
-state. Exit code 1 on any failure (visible in Task Scheduler history).
+Fail-soft per step: a dead source skips with a log line; the sync/stamp only
+runs when everything before it succeeded, so the dashboard never reports a
+half-ingested state as fresh. Exit code 1 on any failure (visible in cron
+mail / Task Scheduler history).
 """
 from __future__ import annotations
 
@@ -87,6 +91,24 @@ def sync_lab_to_box() -> None:
          "c.commit(); c.close()\" && rm /tmp/lab_sync.sql"],
         check=True, timeout=300)
     Path(dump_path).unlink(missing_ok=True)
+
+
+def stamp_lab_fresh() -> None:
+    """Box-resident mode: the lab tables were updated in place, so freshness =
+    this run's completion. Stamps lab_meta.last_sync — the dashboard's
+    staleness source of truth — with no scp hop."""
+    import sqlite3
+    from datetime import datetime, timezone
+    from app.harness import schema as _schema
+    cfg = load_config()
+    conn = sqlite3.connect(cfg.db_path)
+    try:
+        _schema.init_harness_db(conn)
+        conn.execute("INSERT OR REPLACE INTO lab_meta (key, value) VALUES (?, ?)",
+                     ("last_sync", datetime.now(timezone.utc).isoformat()))
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def paper_book_step() -> None:
@@ -196,8 +218,10 @@ def main(argv=None) -> int:
     ok &= _step("verdict registry backup", backup_verdict_registry)
     if ok and not args.no_sync:
         ok &= _step("sync lab tables to box", sync_lab_to_box)
-    elif not ok:
-        log.error("skipping box sync — an earlier step failed")
+    elif ok:
+        ok &= _step("stamp lab freshness", stamp_lab_fresh)
+    else:
+        log.error("skipping box sync/freshness stamp — an earlier step failed")
     log.info("nightly lab %s", "complete" if ok else "FINISHED WITH FAILURES")
     return 0 if ok else 1
 
