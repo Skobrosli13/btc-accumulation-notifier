@@ -59,7 +59,7 @@ def _longbuy(s: dict) -> dict:
 
 @router.get("/screener")
 def screener(cfg: Config = Depends(_cfg), _=Depends(_require_token)) -> dict:
-    """Latest conviction 'long buys' (surfaced top-N) + the rest of the survivors."""
+    """Latest factor-screen ranking (unscored watchlist; surfaced top-N) + survivors."""
     conn = _conn(cfg)
     try:
         latest = stock_lt_store.latest_lt_run(conn)
@@ -74,15 +74,16 @@ def screener(cfg: Config = Depends(_cfg), _=Depends(_require_token)) -> dict:
         "survivors_n": (latest or {}).get("survivors_n"),
         "long_buys": [b for b in buys if b["surfaced"]],
         "watchlist": [b for b in buys if not b["surfaced"]][:40],
-        "note": ("Quality+value+momentum factor tilt (gate purges value traps). "
-                 "Long-horizon accumulation, measured vs SPY over quarters. Not advice."),
+        "note": ("Unscored factor screen (lab verdict: WATCHLIST — it did not beat a "
+                 "50/50 VTV+QUAL ETF blend over 2017-2026). Value+quality+momentum tilt "
+                 "after a value-trap gate; research context, not a buy list. Not advice."),
     }
 
 
 @router.get("/forward_test")
 def forward_test(cfg: Config = Depends(_cfg), _=Depends(_require_token)) -> dict:
-    """Benchmark-relative (vs SPY) forward-test of the conviction picks: realized excess
-    return on closed holdings + live mark-to-market on open ones."""
+    """Benchmark-relative (vs SPY) forward-test of the factor-screen holdings: realized
+    excess return on closed holdings + live mark-to-market on open ones."""
     conn = _conn(cfg)
     try:
         openh = stock_lt_store.open_lt_holdings(conn)
@@ -109,4 +110,5 @@ def forward_test(cfg: Config = Depends(_cfg), _=Depends(_require_token)) -> dict
     return {"open": agg(live_ex), "closed": agg(closed_ex),
             "n_open": len(openh), "n_closed": len(closed),
             "live": sorted(live, key=lambda x: x["excess_return"], reverse=True)[:30],
-            "note": "Excess return vs SPY. Long-horizon edge shows over quarters; grows over time."}
+            "note": ("Paper excess vs SPY for the unscored factor screen — measurement only. "
+                     "The screen has not beaten a passive VTV+QUAL blend. Not advice.")}
