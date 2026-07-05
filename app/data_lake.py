@@ -226,6 +226,11 @@ class Lake:
             if sort_col and sort_col in cols:
                 rank.insert(0, f"{_q(sort_col)} DESC NULLS FIRST")
             col_list = ", ".join(_q(c) for c in cols)
+            # The parquet writer buffers columns x row_group_size cells per
+            # group; a ~3M-cell budget keeps narrow tables (SEP, 10 cols) at
+            # DuckDB's default group size while shrinking wide ones (SF1,
+            # 112 cols) enough to merge inside a 512MB cap.
+            row_group = max(10_000, min(122_880, 3_000_000 // max(1, len(cols))))
             sql = (f"COPY ("
                    f"SELECT {col_list} FROM {old_expr} o WHERE NOT EXISTS "
                    f"(SELECT 1 FROM {inc_expr} i WHERE {match}) "
@@ -237,7 +242,8 @@ class Lake:
                    f"(SELECT 1 FROM {inc_expr} i WHERE {match}) "
                    f"UNION ALL SELECT * FROM {inc_expr})"
                    f") WHERE __lake_rn = 1"
-                   f") TO '{tmp_out.as_posix()}' (FORMAT PARQUET)")
+                   f") TO '{tmp_out.as_posix()}' "
+                   f"(FORMAT PARQUET, ROW_GROUP_SIZE {row_group})")
             log.debug("upsert %s: %s", table, sql)
             n = con.execute(sql).fetchone()[0]
         except BaseException:
