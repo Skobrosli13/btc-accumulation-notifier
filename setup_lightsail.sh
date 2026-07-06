@@ -6,8 +6,9 @@
 # Run from inside the notifier directory:  bash setup_lightsail.sh
 #
 # Automates: Python venv + deps, Node 20, dashboard build, systemd services
-# (api + dashboard), and the three crons. Cloudflare tunnel/Access, Litestream,
-# and S3 are guided steps in DEPLOY.md (they need your accounts).
+# (api + dashboard), and the pipeline crons (BTC collect/run/watchdog, the stock
+# swing/long-term/insider scans, and the edge-lab nightly/monthly + digest).
+# Cloudflare tunnel/Access, Litestream, and S3 are guided steps in DEPLOY.md.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -64,16 +65,27 @@ curl -fsS http://127.0.0.1:8000/api/health >/dev/null && echo "  api /health OK"
 
 echo "==> Install crons (idempotent)"
 PY="$HERE/.venv/bin/python"
+# NOTE on cadence: the watchdog watches each pipeline against its OWN threshold and
+# assumes every pipeline records a heartbeat run on EVERY cron invocation, even a
+# closed-market day (see app/watchdog.py). So the stock crons MUST run 7 days a week
+# (`* * *`), NOT weekday-only (`1-5`): a Fri->Mon weekday-only gap is ~72h and would
+# trip STOCK_SWING_STALE_HOURS (50h) every weekend with a false "pipeline stale"
+# alert. Only `send_digest` (a courtesy email, unwatched) is weekday-only on purpose.
 CRONS=$(cat <<EOF
 */10 * * * * cd $HERE && $PY -m app.collect_once >> $HERE/logs/collect.log 2>&1
 0 */6 * * * cd $HERE && $PY -m app.run_once >> $HERE/logs/run.log 2>&1
-0 */8 * * * cd $HERE && $PY -m app.watchdog >> $HERE/logs/watchdog.log 2>&1
+0 * * * * cd $HERE && $PY -m app.watchdog >> $HERE/logs/watchdog.log 2>&1
+30 22 * * * cd $HERE && $PY -m app.stock_collect --skip-insider >> $HERE/logs/stock_collect.log 2>&1
+0 6 * * 0 cd $HERE && $PY -m app.stock_insider_scan >> $HERE/logs/stock_insider.log 2>&1
+0 8 * * 0 cd $HERE && $PY -m app.stock_lt_collect >> $HERE/logs/stock_lt.log 2>&1
 45 12 * * 1-5 cd $HERE && $PY -m scripts.send_digest >> $HERE/logs/digest.log 2>&1
+0 8 * * * cd $HERE && $PY -m scripts.nightly_lab --no-sync >> $HERE/logs/nightly_lab.log 2>&1
+0 9 1 * * cd $HERE && $PY -m scripts.monthly_review --no-sync >> $HERE/logs/monthly_review.log 2>&1
 EOF
 )
 # Pipefail-safe: an empty/absent crontab makes grep -v exit 1, which would abort
 # under `set -euo pipefail` — guard both the read and the filter with `|| true`.
-{ (crontab -l 2>/dev/null || true) | grep -vE 'app\.(collect_once|run_once|watchdog)|scripts\.send_digest' || true; echo "$CRONS"; } | crontab -
+{ (crontab -l 2>/dev/null || true) | grep -vE 'app\.(collect_once|run_once|watchdog|stock_collect|stock_insider_scan|stock_lt_collect)|scripts\.(send_digest|nightly_lab|monthly_review)' || true; echo "$CRONS"; } | crontab -
 echo "  crons:"; crontab -l | grep -E 'app\.|scripts\.' | sed 's/^/    /'
 
 echo ""
