@@ -1,15 +1,25 @@
-# Deploy — always-on BTC signal stack (Lightsail 2GB)
+# Deploy — always-on signal stack, BTC + stocks + edge lab (Lightsail 2GB)
 
-This describes the **live** box. The system is:
+This describes the **live** box (crons match the actual `crontab -l`; `setup_lightsail.sh`
+installs this exact set). All times are UTC. The system is:
 
 ```
 Lightsail 2GB (Ubuntu, systemd) — STATIC IP
- ├─ cron */10  → python -m app.collect_once   # short-term swing (4h/1d) → candles/derivs/signals → alerts
- ├─ cron 0 */6 → python -m app.run_once        # long-term accumulation score
- ├─ cron hourly→ python -m app.watchdog        # dead-man's-switch (run >= as often as WATCHDOG_STALE_HOURS)
- ├─ systemd    → uvicorn app.api:app (127.0.0.1:8000)   # read-only JSON API, localhost only
- ├─ systemd    → next start (btc-dashboard, 127.0.0.1:3000)   # localhost only
- └─ nginx      → TLS (Let's Encrypt) + HTTP basic auth → reverse-proxy :3000
+ # BTC (the original core)
+ ├─ cron */10        → app.collect_once   # short-term swing (4h/1d) → candles/derivs/signals → alerts
+ ├─ cron 0 */6       → app.run_once        # long-term accumulation score
+ ├─ cron hourly      → app.watchdog        # dead-man's-switch (run >= as often as WATCHDOG_STALE_HOURS)
+ # Stocks (7-day cadence — see the watchdog note below)
+ ├─ cron 22:30       → app.stock_collect --skip-insider   # swing screener, DAILY incl. weekends
+ ├─ cron Sun 06:00   → app.stock_insider_scan             # SEC insider clusters (feeds the daily swing run)
+ ├─ cron Sun 08:00   → app.stock_lt_collect               # long-term QVM "long buys"
+ # Edge lab + owner digest
+ ├─ cron 08:00       → scripts.nightly_lab --no-sync      # lake ingest → re-emit events → paper book
+ ├─ cron 1st 09:00   → scripts.monthly_review --no-sync   # re-crawl SUE → re-run studies → re-verdict
+ ├─ cron 12:45 Mon-Fri → scripts.send_digest              # owner daily digest email (weekday-only, unwatched)
+ ├─ systemd          → uvicorn app.api:app (127.0.0.1:8000)   # read-only JSON API, localhost only
+ ├─ systemd          → next start (btc-dashboard, 127.0.0.1:3000)   # localhost only
+ └─ nginx            → TLS (Let's Encrypt) + HTTP basic auth → reverse-proxy :3000
 
 Public:  https://btc.riverviewweb.com  → nginx (basic auth) → dashboard
 ```
@@ -117,6 +127,13 @@ next run without a restart). The local Windows `.env` is separate from prod.
 
 ## Notes
 
+- **Watchdog cadence assumption — stock crons must be 7-day, not `1-5`.** The
+  watchdog (`app/watchdog.py`) checks each pipeline against its own stale threshold
+  and assumes every pipeline records a heartbeat run on *every* cron invocation,
+  including closed-market days. `stock_collect` therefore runs **daily** (`30 22 * * *`),
+  not weekday-only: a Fri→Mon weekday gap is ~72h and would trip
+  `STOCK_SWING_STALE_HOURS` (50h) with a false "pipeline stale" alert every weekend.
+  Only `send_digest` is intentionally weekday-only (it's an unwatched courtesy email).
 - **Binance is 451 from AWS/US** — the data layer uses **OKX** (primary) with a
   **Kraken** fallback and CoinGecko as a last-resort price source. No action needed.
 - **Free-tier ceiling**: real liquidation-cascade + order-flow are paid
