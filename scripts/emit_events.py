@@ -87,7 +87,7 @@ def enrich(lake: Lake, events: list[dict]) -> list[dict]:
     return out
 
 
-def emit_insider_cluster(lake: Lake) -> list[dict]:
+def _insider_fills(lake: Lake) -> list[dict]:
     fills = lake.query(f"""
         SELECT ticker, ownername, officertitle, isofficer, isdirector,
                transactiondate, filingdate, transactionvalue,
@@ -98,9 +98,34 @@ def emit_insider_cluster(lake: Lake) -> list[dict]:
           AND transactiondate IS NOT NULL
     """).to_dict("records")
     log.info("SF2 code-P officer/director buys: %d rows", len(fills))
-    events = insider_cluster.cluster_events(fills)
+    return fills
+
+
+def emit_insider_cluster(lake: Lake) -> list[dict]:
+    events = insider_cluster.cluster_events(_insider_fills(lake))
     log.info("clusters emitted: %d", len(events))
     return [{"study": "insider_cluster", "direction": "LONG", **e} for e in events]
+
+
+def emit_insider_cluster_q(lake: Lake) -> list[dict]:
+    """Quarter-hold sibling of insider_cluster: byte-identical events, tagged
+    for the h=63 study so the two can never drift apart (the only difference is
+    the verdict horizon, set at registration). See studies/insider_cluster_q.md."""
+    events = insider_cluster.cluster_events(_insider_fills(lake))
+    log.info("clusters emitted (quarter-hold sibling): %d", len(events))
+    return [{"study": "insider_cluster_q", "direction": "LONG", **e} for e in events]
+
+
+def emit_insider_cluster_hi(lake: Lake) -> list[dict]:
+    """High-conviction subset of insider_cluster: a meaningful-sized cluster
+    (>= $250k aggregate) in which a CEO/CFO participated. Tests whether the edge
+    concentrates in the highest-conviction clusters (Cohen-Malloy-Pomorski:
+    opportunistic, executive, large). Same clustering machinery, stricter filter.
+    See studies/insider_cluster_hi.md."""
+    events = insider_cluster.cluster_events(_insider_fills(lake), min_agg_usd=250_000.0)
+    hi = [e for e in events if e.get("strength", 1.0) >= insider_cluster.EXEC_STRENGTH]
+    log.info("high-conviction clusters: %d (of %d >=$250k)", len(hi), len(events))
+    return [{"study": "insider_cluster_hi", "direction": "LONG", **e} for e in hi]
 
 
 def emit_sue_pead(lake: Lake) -> list[dict]:
@@ -132,6 +157,74 @@ def emit_sue_pead(lake: Lake) -> list[dict]:
                                  "quarter": int(r["quarter"]),
                                  "hour": r.get("hour") or ""}})
     log.info("sue_pead decile events: %d", len(out))
+    return out
+
+
+_PEAD_REACTION_MIN = 0.0     # the announcement-day move must CONFIRM the positive surprise
+
+
+def emit_sue_pead_confirmed(lake: Lake) -> list[dict]:
+    """Top-decile SUE (LONG only) CONFIRMED by a positive announcement-day move.
+
+    The refinement for sue_pead's OOS decay (t=0.87@h21): post-earnings drift
+    concentrates in surprises the market moved WITH — a credible/under-reacted
+    beat — not ones it shrugged off. Reaction = the event-DATE total return
+    (closeadj[report_date]/closeadj[prior bar] − 1); keep LONG events with
+    reaction > 0. LOOK-AHEAD-SAFE: the reaction ends at report_date's close, and
+    the car evaluator enters at the NEXT session's open, so the filter uses only
+    information available before entry. (Limitation: for after-market 8-Ks the
+    event-date move can precede the true reaction — a noise source, documented, not
+    look-ahead.) The bottom-decile SHORT leg is dropped: the SEC CIK crawl is
+    survivorship-biased against delisted names. See studies/sue_pead_confirmed.md."""
+    if not lake.exists("sue_events"):
+        raise SystemExit("lake sue_events missing — run scripts.crawl_sue first")
+    df = lake.read("sue_events")
+    cand: list[dict] = []
+    for (_fy, _q), grp in df.groupby(["fy", "quarter"]):
+        if len(grp) < 20:
+            continue
+        hi = grp["sue"].quantile(0.90)
+        for _, r in grp.iterrows():
+            if r["sue"] >= hi:
+                cand.append({"ticker": r["ticker"], "event_ts": int(r["report_ts"]),
+                             "sue": float(r["sue"]), "fy": int(r["fy"]),
+                             "quarter": int(r["quarter"]), "hour": r.get("hour") or ""})
+    log.info("sue_pead top-decile LONG candidates: %d", len(cand))
+    if not cand:
+        return []
+    tmp = pd.DataFrame([{"idx": i, "ticker": c["ticker"], "rd": _date_iso(c["event_ts"])}
+                        for i, c in enumerate(cand)])
+    lake.write("_tmp_pead", tmp)
+    try:
+        react = lake.query(f"""
+            WITH d AS (
+              SELECT e.idx, s.date AS dt, s.closeadj AS c
+              FROM {lake.sql_table('_tmp_pead')} e
+              JOIN {lake.sql_table('sep')} s ON e.ticker = s.ticker
+               AND CAST(s.date AS DATE) <= CAST(e.rd AS DATE)
+               AND CAST(s.date AS DATE) >= CAST(e.rd AS DATE) - INTERVAL 12 DAY),
+            r AS (
+              SELECT idx, c, row_number() OVER (PARTITION BY idx ORDER BY dt DESC) AS rn
+              FROM d)
+            SELECT a.idx AS idx, a.c AS evt, b.c AS pre
+            FROM r a JOIN r b ON a.idx = b.idx AND a.rn = 1 AND b.rn = 2""")
+    finally:
+        lake.path("_tmp_pead").unlink(missing_ok=True)
+    reaction_by: dict[int, float] = {}
+    for _, rr in react.iterrows():
+        if rr["pre"] and rr["evt"] and float(rr["pre"]) > 0:
+            reaction_by[int(rr["idx"])] = float(rr["evt"]) / float(rr["pre"]) - 1.0
+    out: list[dict] = []
+    for i, c in enumerate(cand):
+        rx = reaction_by.get(i)
+        if rx is None or rx <= _PEAD_REACTION_MIN:
+            continue
+        out.append({"study": "sue_pead_confirmed", "ticker": c["ticker"],
+                    "event_ts": c["event_ts"], "direction": "LONG",
+                    "strength": float(abs(c["sue"])),
+                    "meta": {"sue": c["sue"], "fy": c["fy"], "quarter": c["quarter"],
+                             "hour": c["hour"], "reaction": round(rx, 4)}})
+    log.info("sue_pead_confirmed events (positive reaction): %d of %d", len(out), len(cand))
     return out
 
 
@@ -171,7 +264,11 @@ def emit_clone13f(lake: Lake) -> list[dict]:
     return [{"study": "clone13f", **e} for e in events]
 
 
-EMITTERS = {"insider_cluster": emit_insider_cluster, "sue_pead": emit_sue_pead,
+EMITTERS = {"insider_cluster": emit_insider_cluster,
+            "insider_cluster_q": emit_insider_cluster_q,
+            "insider_cluster_hi": emit_insider_cluster_hi,
+            "sue_pead": emit_sue_pead,
+            "sue_pead_confirmed": emit_sue_pead_confirmed,
             "clone13f": emit_clone13f}
 
 

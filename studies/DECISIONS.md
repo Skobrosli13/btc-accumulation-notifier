@@ -180,3 +180,59 @@ Deliberately NOT done: Playwright (curl smoke script instead —
 scripts/smoke.sh runs post-deploy); Litestream/healthchecks (owner-input);
 Lake→DuckDB streaming merge (laptop nightly stays the lab's data source,
 freshness self-reported via lab_meta.last_sync).
+
+## 2026-07-06 — Four new equity studies registered; ALL fail to certify a new pick
+
+Owner asked what else the captured data can turn into long-term stock picks.
+Four pre-registered studies were run (register → emit → car/portfolio run →
+placebo → verdict). Result: **no new certified pursue surface** — the promoted
+h21 `insider_cluster` remains the only equity alpha. The honesty machinery
+rejected all four, three of them exactly as the M2 survey predicted (long
+horizons underpowered; factors commoditized).
+
+- **buyback → WATCHLIST** (POLICY/portfolio, `_run_buyback`). Monthly-rebalance
+  long the top-30 net repurchasers (buyback yield = −ncfcommon/marketcap) vs the
+  equal-weight PIT universe AND PKW. OOS active-return t = **−0.52 vs universe /
+  −1.03 vs PKW** (bar 2.0) — net repurchasers *underperformed* passive 2022–2026.
+  An honest null, same shape as `lt_factor`: just buy PKW.
+- **insider_cluster_hi → KILLED (duplicate).** High-conviction subset of the
+  promoted signal (≥$250k cluster + CEO/CFO participation). Passed the raw gate
+  (OOS h21 t=3.19) but is a ~100% SUBSET of `insider_cluster` — every hi event is
+  a base event — and on the same fresh lake the FULL population scored *better*
+  (OOS h21 t=4.99, +1.17%/event) than the strict subset (t=3.19, +0.93%). No
+  concentration benefit; killed-duplicate per §5.2. The plain ≥2-insider/≥$50k
+  cluster is the better signal — extra "conviction" filters add nothing.
+- **insider_cluster_q → KILLED (dirty placebo).** Same events as
+  `insider_cluster`, verdict at h=63 (quarter hold). Point estimate looked huge
+  (OOS h63 t=5.73, after-tax **+3.59%/event**, monotonically rising CAR) BUT the
+  h63 placebo came back **DIRTY: exceedance 30% (bar 10%), p95|t|=3.02**. Insider
+  clusters fire year-round, so at a 63-session hold adjacent events' forward
+  windows OVERLAP and the MONTH-clustered t overstates significance — the t=5.73
+  is inflated, not real. NOT "no edge" (the h21 base is promoted and its drift
+  clearly continues); it is "not certifiable at a quarter under month-clustering."
+- **sue_pead_confirmed → KILLED (dirty placebo + soft t).** The genuinely novel
+  idea and the biggest near-miss: top-decile SUE conditioned on a LOOK-AHEAD-SAFE
+  positive announcement-day reaction (revive the drift where the market confirmed
+  the surprise). It **lifted the dead `sue_pead` from OOS t=0.87 → 2.98** at h21
+  (after-tax +0.19% → **+1.60%/event**) — the refinement clearly works
+  economically. But (a) 2.98 is a hair under the 3.0 bar, and (b) the placebo is
+  badly DIRTY: **exceedance 56%, p95|t|=3.55**. Earnings events cluster in season
+  and the reaction-selection concentrates them further, so overlapping h21 windows
+  inflate the month-clustered null. Point estimate promising, significance not
+  certifiable.
+
+**Machinery lesson (Class A, re-affirmed and now BLOCKING two live leads).** The
+`clone13f` kill already flagged that studies whose events share/overlap windows
+need **quarter-level (or event-date + non-overlap-horizon) clustering** instead
+of month-clustering. TWO economically-promising signals just died on this exact
+issue — the quarter-hold insider drift and the confirmed-PEAD revival both have
+inflated month-clustered t / dirty placebos. Building that clustering fix is the
+single highest-value machinery investment: it is the ONLY thing that could
+certify either signal (though the honest quarter/event-clustered t may still fall
+short — the fix reduces the effective sample). Until then, neither is a pick.
+
+Net: emitters (`emit_insider_cluster_q/_hi`, `emit_sue_pead_confirmed`, refactored
+`_insider_fills`), the `_run_buyback` portfolio runner, and four specs are
+committed as the reproducible record. No dashboard change — nothing promoted. The
+studies live locally; a box register/emit/run would add graveyard rows to /lab
+(deferred — no picks to surface).
