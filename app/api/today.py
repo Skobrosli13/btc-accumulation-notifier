@@ -8,6 +8,8 @@ SAME aggregation (Gap D: one source, page and digest can never disagree):
     froth band escalations (§3's four actionable kinds). Every comparison is
     against the last state BEFORE the window opened, not merely the previous
     run — a change 12h old is still news if it happened inside the window.
+    Study events window on ARRIVAL (ingested_at), not event_ts — see the
+    query comment in aggregate_today for why.
   * testing — one line per study: status verbatim + the concrete next
     decision date (monthly review = 1st of next month).
   * paper — the Stage-0 book's latest NAV (pre- and after-tax) vs SPY.
@@ -39,6 +41,7 @@ from .health import _RUN_STALE_HOURS
 router = APIRouter()
 
 _BAND_ORDER = [name for name, _ in scoring.FROTH_BANDS]
+_DAY_MS = 86_400_000
 # Monthly review (Task Scheduler, 1st 04:00): the concrete "what decides next"
 # per status — §3 Today item 3 wants a date, not a generic phrase.
 _NEXT_DECISION = {
@@ -91,18 +94,30 @@ def aggregate_today(conn, cfg: Config | None = None) -> dict:
         lab_sync_row[0]["value"] if lab_sync_row else None, now)
 
     # --- new events from PROMOTED studies (the live picks) -------------------
-    promoted = [r["name"] for r in _rows(
-        conn, "SELECT name FROM studies WHERE status='PROMOTED' AND tier='alpha'")]
-    for study in promoted:
+    # "New" means newly ARRIVED (ingested_at), not newly dated: event_ts is
+    # stamped midnight UTC of the trade date and the nightly ingests it ≥1 day
+    # later, so `event_ts >= window` (midnight ET = 04:00 UTC) could never
+    # match — the owner can only act once the row lands anyway. COALESCE keeps
+    # the old semantics for rows without an ingest stamp. The event_ts bound
+    # keeps a mass re-crawl (late-filed Form 4s, monthly SUE refresh) from
+    # surfacing near-expired events as fresh picks: only the first half of a
+    # study's holding window is worth acting on (sessions → calendar ≈ ×7/5).
+    promoted = _rows(conn, "SELECT name, primary_horizon FROM studies "
+                           "WHERE status='PROMOTED' AND tier='alpha'")
+    now_ms = int(now.timestamp() * 1000)
+    for s in promoted:
+        horizon_days = round((s.get("primary_horizon") or 21) * 7 / 5)
+        min_event_ts = now_ms - horizon_days * _DAY_MS // 2
         for e in _rows(conn,
                        "SELECT ticker, event_ts, direction, strength, tier, sector, meta "
-                       "FROM events WHERE study=? AND event_ts >= ? "
-                       "ORDER BY event_ts DESC LIMIT 20", (study, window_ms)):
+                       "FROM events WHERE study=? AND COALESCE(ingested_at, event_ts) >= ? "
+                       "AND event_ts >= ? "
+                       "ORDER BY event_ts DESC LIMIT 20", (s["name"], window_ms, min_event_ts)):
             try:
                 meta = json.loads(e.get("meta") or "{}")
             except (json.JSONDecodeError, TypeError):
                 meta = {}
-            act.append({"kind": "event", "study": study, "ticker": e["ticker"],
+            act.append({"kind": "event", "study": s["name"], "ticker": e["ticker"],
                         "direction": e["direction"], "ts": e["event_ts"],
                         "tier": e.get("tier"), "sector": e.get("sector"),
                         "detail": f"{meta.get('n_managers') or len(meta.get('owners', []))} "

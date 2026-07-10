@@ -132,6 +132,77 @@ def test_exit_message_includes_degraded_caveat_when_flagged():
     assert "data-outage artifact" in body
 
 
+def test_messages_flag_partial_outage_when_indicators_went_dark():
+    # The 2026-07-05 gap: on-chain stayed ACTIVE (degraded=False, cats unchanged)
+    # yet 4 of its indicators went 503-dark and renormalized away — enough to
+    # cross a tier floor. The email must say so, on both the tier and exit paths.
+    changed = {"composite_delta": -16.4, "tier_from": "WATCH", "tier_to": "NEUTRAL",
+               "newly_in_zone": [], "dropped_out": [],
+               "went_dark": ["LTH-MVRV", "LTH-SOPR", "Reserve Risk"],
+               "since": "2026-06-19T21:19:10+00:00"}
+    _, body = alerting.build_exit_message(
+        composite=37.7, tier="NEUTRAL", subscores={}, price_struct={"price": 63140.0},
+        readings={}, active_cats=["onchain", "price"], onchain_active=True,
+        prev_tier="WATCH", changed=changed)
+    assert "Data outage: LTH-MVRV, LTH-SOPR, Reserve Risk" in body
+    assert "went dark (no data): LTH-MVRV" in body   # the What-changed line too
+    _, body_tier = alerting.build_tier_message(
+        composite=61.0, tier="ACCUMULATE", subscores={}, price_struct={"price": 50000.0},
+        readings={}, active_cats=["onchain", "price"], onchain_active=True,
+        changed=changed)
+    assert "Data outage:" in body_tier
+    # and stays quiet when nothing went dark (or with no prior alert to diff)
+    quiet = dict(changed, went_dark=[])
+    _, body_q = alerting.build_exit_message(
+        composite=37.7, tier="NEUTRAL", subscores={}, price_struct={"price": 63140.0},
+        readings={}, active_cats=["onchain", "price"], onchain_active=True,
+        prev_tier="WATCH", changed=quiet)
+    assert "Data outage:" not in body_q
+
+
+def test_recovery_from_outage_is_caveated_not_sold_as_confluence():
+    # The mirror direction: the first upgrade after a dark source recovers must
+    # carry the outage caveat, and the restored indicators must not appear
+    # under "new in-zone".
+    changed = {"composite_delta": 16.4, "tier_from": "NEUTRAL", "tier_to": "WATCH",
+               "newly_in_zone": [], "came_back": ["LTH-MVRV", "Reserve Risk"],
+               "dropped_out": [], "went_dark": [],
+               "since": "2026-07-05T00:00:06+00:00"}
+    _, body = alerting.build_tier_message(
+        composite=54.0, tier="WATCH", subscores={}, price_struct={"price": 64000.0},
+        readings={}, active_cats=["onchain", "price"], onchain_active=True,
+        changed=changed)
+    assert "Data outage:" in body and "resumed returning data" in body
+    assert "back in-zone (data restored): LTH-MVRV, Reserve Risk" in body
+    assert "new in-zone" not in body
+
+
+def test_flash_message_carries_outage_caveat():
+    changed = {"composite_delta": -10.0, "tier_from": "WATCH", "tier_to": "WATCH",
+               "newly_in_zone": [], "came_back": [], "dropped_out": [],
+               "went_dark": ["LTH-SOPR"], "since": "2026-07-05T00:00:06+00:00"}
+    _, body = alerting.build_flash_message(
+        composite=45.0, tier="WATCH", subscores={},
+        price_struct={"price": 52000.0}, readings={"drop_24_48h_pct": -16.0, "fng": 12},
+        active_cats=["onchain", "price"], onchain_active=True, changed=changed)
+    assert "Data outage:" in body
+
+
+def test_degraded_suppresses_overlapping_outage_caveat():
+    # Whole-category outage: _DEGRADED_CAVEAT already covers it — don't stack a
+    # second near-duplicate warning block.
+    changed = {"composite_delta": -20.0, "tier_from": "WATCH", "tier_to": "NEUTRAL",
+               "newly_in_zone": [], "came_back": [], "dropped_out": [],
+               "went_dark": ["LTH-MVRV", "MVRV Z-Score"],
+               "since": "2026-07-05T00:00:06+00:00"}
+    _, body = alerting.build_exit_message(
+        composite=30.0, tier="NEUTRAL", subscores={}, price_struct={"price": 60000.0},
+        readings={}, active_cats=["price"], onchain_active=True,
+        prev_tier="WATCH", changed=changed, degraded=True)
+    assert "data-outage artifact" in body          # the category-level caveat
+    assert "Data outage: LTH-MVRV" not in body     # no stacked duplicate
+
+
 # --- DEEP_VALUE gate-driven exit (hysteresis) --------------------------------
 
 def test_deep_value_exits_when_price_clears_band_despite_high_composite():

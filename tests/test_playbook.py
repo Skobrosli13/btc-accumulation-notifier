@@ -71,4 +71,41 @@ def test_diff_since():
     assert d["composite_delta"] == pytest.approx(17.0)
     assert d["tier_from"] == "WATCH" and d["tier_to"] == "ACCUMULATE"
     assert "MVRV Z-Score" in d["newly_in_zone"]   # 0.5 -> 0.7 crosses IN_ZONE_THRESHOLD
+    assert d["went_dark"] == [] and d["came_back"] == []
     assert alerting.diff_since(None, cur) is None
+
+
+def test_diff_since_splits_dark_from_out_of_zone():
+    # The 2026-07-05 shape: an in-zone indicator whose source goes 503-dark must
+    # be reported as an outage, not as a market exit; one that stays lit but
+    # falls below the zone threshold is a genuine "left zone".
+    prev = {"composite": 54.0, "tier": "WATCH",
+            "subscores": {"lth_mvrv": 0.82, "mvrv_z": 0.75, "fng": 0.9},
+            "run_ts": "2026-06-19T00:00:00+00:00"}
+    cur = {"composite": 37.7, "tier": "NEUTRAL",
+           "subscores": {"lth_mvrv": None, "mvrv_z": 0.3, "fng": 0.9}}
+    d = alerting.diff_since(prev, cur)
+    assert d["went_dark"] == ["LTH-MVRV"]
+    assert d["dropped_out"] == ["MVRV Z-Score"]
+    # a key absent from cur entirely (not just None) also counts as dark
+    cur2 = {"composite": 37.7, "tier": "NEUTRAL", "subscores": {"mvrv_z": 0.7, "fng": 0.9}}
+    d2 = alerting.diff_since(prev, cur2)
+    assert d2["went_dark"] == ["LTH-MVRV"] and d2["dropped_out"] == []
+
+
+def test_diff_since_flags_recovery_from_dark_as_came_back():
+    # The mirror of went_dark: a dark source recovering must not read as fresh
+    # market confluence (the first alert after the 2026-07-05 outage ends).
+    prev = {"composite": 37.7, "tier": "NEUTRAL",
+            "subscores": {"lth_mvrv": None, "fng": 0.9},
+            "run_ts": "2026-07-05T00:00:06+00:00"}
+    cur = {"composite": 54.0, "tier": "WATCH",
+           "subscores": {"lth_mvrv": 0.82, "fng": 0.9}}
+    d = alerting.diff_since(prev, cur)
+    assert d["came_back"] == ["LTH-MVRV"]
+    assert d["newly_in_zone"] == []
+    # a key the previous run never scored is genuinely new, not a recovery
+    prev2 = {"composite": 37.7, "tier": "NEUTRAL", "subscores": {"fng": 0.9},
+             "run_ts": "2026-07-05T00:00:06+00:00"}
+    d2 = alerting.diff_since(prev2, cur)
+    assert d2["newly_in_zone"] == ["LTH-MVRV"] and d2["came_back"] == []

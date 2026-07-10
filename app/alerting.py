@@ -222,6 +222,46 @@ _DEGRADED_CAVEAT = (
 )
 
 
+def _data_outage_caveat(went_dark: list[str], came_back: list[str]) -> str:
+    """The partial-outage cousin of _DEGRADED_CAVEAT: the category survived, but
+    indicators lost (or regained) their data feed since the last alert and were
+    renormalized out of (or back into) the composite — enough to cross a tier
+    floor on its own, in either direction. The ``came_back`` leg matters as much
+    as the dark one: a recovery-driven upgrade otherwise reads as fresh market
+    confluence."""
+    parts = []
+    if went_dark:
+        parts.append(", ".join(went_dark) + " stopped returning data since the "
+                     "last alert (upstream stale/dark) and dropped out of the "
+                     "composite")
+    if came_back:
+        parts.append(", ".join(came_back) + " resumed returning data and "
+                     "re-entered the composite")
+    return (
+        "[!] Data outage: " + "; ".join(parts) + " — the affected weight "
+        "renormalized accordingly. Part of this move is a data-availability "
+        "artifact, not a market change; confirm against the indicator "
+        "breakdown before acting."
+    )
+
+
+def _caveat_lines(*, cats_changed: bool, degraded: bool,
+                  changed: dict | None) -> list[str]:
+    """The shared [!] caveat blocks for tier/exit/flash bodies. The partial-
+    outage caveat is suppressed when _DEGRADED_CAVEAT already covers the outage
+    (a fully-dark on-chain run would otherwise stack two overlapping warnings)."""
+    lines: list[str] = []
+    if cats_changed:
+        lines += ["", _CATS_CHANGED_CAVEAT]
+    if degraded:
+        lines += ["", _DEGRADED_CAVEAT]
+    went_dark = (changed or {}).get("went_dark") or []
+    came_back = (changed or {}).get("came_back") or []
+    if (went_dark or came_back) and not degraded:
+        lines += ["", _data_outage_caveat(went_dark, came_back)]
+    return lines
+
+
 def build_tier_message(*, composite: float, tier: str, subscores: dict,
                        price_struct: dict, readings: dict, active_cats: list[str],
                        onchain_active: bool, changed: dict | None = None,
@@ -236,10 +276,8 @@ def build_tier_message(*, composite: float, tier: str, subscores: dict,
     body_lines += _common_lines(composite=composite, tier=tier, subscores=subscores,
                                 price_struct=price_struct, readings=readings,
                                 active_cats=active_cats, onchain_active=onchain_active)
-    if cats_changed:
-        body_lines += ["", _CATS_CHANGED_CAVEAT]
-    if degraded:
-        body_lines += ["", _DEGRADED_CAVEAT]
+    body_lines += _caveat_lines(cats_changed=cats_changed, degraded=degraded,
+                                changed=changed)
     pb = _playbook_lines(changed, what_to_do, plan)
     if pb:
         body_lines += ["", *pb]
@@ -269,10 +307,8 @@ def build_exit_message(*, composite: float, tier: str, subscores: dict,
     body_lines += _common_lines(composite=composite, tier=tier, subscores=subscores,
                                 price_struct=price_struct, readings=readings,
                                 active_cats=active_cats, onchain_active=onchain_active)
-    if cats_changed:
-        body_lines += ["", _CATS_CHANGED_CAVEAT]
-    if degraded:
-        body_lines += ["", _DEGRADED_CAVEAT]
+    body_lines += _caveat_lines(cats_changed=cats_changed, degraded=degraded,
+                                changed=changed)
     pb = _playbook_lines(changed, what_to_do, plan)
     if pb:
         body_lines += ["", *pb]
@@ -299,6 +335,9 @@ def build_flash_message(*, composite: float, tier: str, subscores: dict,
     body_lines += _common_lines(composite=composite, tier=tier, subscores=subscores,
                                 price_struct=price_struct, readings=readings,
                                 active_cats=active_cats, onchain_active=onchain_active)
+    # Flash has no cats/degraded params, but a partial outage still distorts the
+    # composite it quotes — the highest-urgency alert must not omit the caveat.
+    body_lines += _caveat_lines(cats_changed=False, degraded=False, changed=changed)
     pb = _playbook_lines(changed, what_to_do, plan)
     if pb:
         body_lines += ["", *pb]
@@ -322,17 +361,37 @@ _UNVALIDATED_NOTE = ("Funding/OI trigger: unvalidated - no backtest coverage "
 
 def diff_since(prev: dict | None, cur: dict) -> dict | None:
     """'What changed' between the last alerted run and now. prev/cur each carry
-    {composite, tier, subscores}. None when there's no prior alert to diff against."""
+    {composite, tier, subscores}. None when there's no prior alert to diff against.
+
+    ``dropped_out``/``newly_in_zone`` name indicators that moved WITH data;
+    ``went_dark`` names ones that "left" only because the source stopped
+    returning data (sub-score None → renormalized away), and ``came_back`` ones
+    that "entered" only because a dark source recovered. The split exists so a
+    data outage can't masquerade as a market move in either direction: the
+    2026-07-05 WATCH→NEUTRAL email listed four 503-dark BGeometrics series as
+    "left zone" when the outage alone accounted for most of the composite drop
+    — and their recovery would otherwise read as fresh bullish confluence."""
     if not prev:
         return None
-    prev_zone = set(scoring.indicators_in_zone(prev.get("subscores") or {}))
-    cur_zone = set(scoring.indicators_in_zone(cur.get("subscores") or {}))
+    prev_sub = prev.get("subscores") or {}
+    cur_sub = cur.get("subscores") or {}
+    prev_zone = scoring.in_zone_keys(prev_sub)
+    cur_zone = scoring.in_zone_keys(cur_sub)
+    dropped = prev_zone - cur_zone
+    dark = {k for k in dropped if cur_sub.get(k) is None}
+    entered = cur_zone - prev_zone
+    # strict `k in prev_sub`: a key the previous run never scored is genuinely
+    # new, not a recovery — only an explicit None back then counts as dark.
+    came_back = {k for k in entered if k in prev_sub and prev_sub[k] is None}
+    label = scoring.INDICATOR_LABELS
     return {
         "composite_delta": round((cur.get("composite") or 0.0) - (prev.get("composite") or 0.0), 1),
         "tier_from": prev.get("tier"),
         "tier_to": cur.get("tier"),
-        "newly_in_zone": sorted(cur_zone - prev_zone),
-        "dropped_out": sorted(prev_zone - cur_zone),
+        "newly_in_zone": sorted(label.get(k, k) for k in entered - came_back),
+        "came_back": sorted(label.get(k, k) for k in came_back),
+        "dropped_out": sorted(label.get(k, k) for k in dropped - dark),
+        "went_dark": sorted(label.get(k, k) for k in dark),
         "since": prev.get("run_ts"),
     }
 
@@ -348,8 +407,12 @@ def _playbook_lines(changed: dict | None, what_to_do: dict | None,
             parts.append(f"tier {changed['tier_from']}→{changed['tier_to']}")
         if changed["newly_in_zone"]:
             parts.append("new in-zone: " + ", ".join(changed["newly_in_zone"]))
+        if changed.get("came_back"):
+            parts.append("back in-zone (data restored): " + ", ".join(changed["came_back"]))
         if changed["dropped_out"]:
             parts.append("left zone: " + ", ".join(changed["dropped_out"]))
+        if changed.get("went_dark"):
+            parts.append("went dark (no data): " + ", ".join(changed["went_dark"]))
         lines.append(". ".join(parts) + ".")
     if what_to_do:
         lines.append(f"What to do now: {what_to_do['stance']} — {what_to_do['suggested_action']} "

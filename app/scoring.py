@@ -400,14 +400,20 @@ def cycle_multiplier(today: date, ath_date: date, peak_to_trough_days: int,
     return (1.0 + swing) - 2.0 * swing * frac
 
 
+def in_zone_keys(subscores: dict[str, float | None],
+                 threshold: float = IN_ZONE_THRESHOLD) -> set[str]:
+    """Keys of indicators whose sub-score is at/above the bottom-zone threshold —
+    the single source of the zone rule (``indicators_in_zone`` maps to labels;
+    ``alerting.diff_since`` diffs the key sets)."""
+    return {name for name, s in subscores.items()
+            if s is not None and s >= threshold}
+
+
 def indicators_in_zone(subscores: dict[str, float | None],
                        threshold: float = IN_ZONE_THRESHOLD) -> list[str]:
     """Labels of indicators whose sub-score is at/above the bottom-zone threshold."""
-    return [
-        INDICATOR_LABELS.get(name, name)
-        for name, s in subscores.items()
-        if s is not None and s >= threshold
-    ]
+    keys = in_zone_keys(subscores, threshold)
+    return [INDICATOR_LABELS.get(name, name) for name in subscores if name in keys]
 
 
 # --- Zone boundaries (inverse mapping, for "what flips this badge" display) ---

@@ -94,6 +94,39 @@ def test_aggregate_promoted_events_only_inside_window(conn):
                                   "collect_stale", "run_stale"}
 
 
+def test_aggregate_events_window_on_arrival_not_event_date(conn):
+    # The structural miss this guards against: event_ts is stamped midnight UTC
+    # of the trade date and ingest lags >=1 day, so an event dated BEFORE the
+    # midnight-ET window that ARRIVES inside it is news — filtering on event_ts
+    # alone would hide every event forever.
+    _register(conn, "insider_cluster", "alpha", "PROMOTED")
+    window = sched.act_window_start_ms()
+    day = 86_400_000
+    schema.insert_events(conn, [
+        # dated 2 days back (pre-window), landed just now -> must surface
+        {"study": "insider_cluster", "asset": "EQ", "ticker": "FRESH",
+         "event_ts": _now_ms() - 2 * day, "direction": "LONG",
+         "ingested_at": _now_ms()},
+        # late-filed Form 4 dated far outside its 21-session window, landed
+        # just now -> must NOT resurface as an actionable pick
+        {"study": "insider_cluster", "asset": "EQ", "ticker": "ANCIENT",
+         "event_ts": _now_ms() - 400 * day, "direction": "LONG",
+         "ingested_at": _now_ms()},
+        # landed now but most of the holding window is already spent (bound is
+        # half the study horizon: primary_horizon=10 sessions -> 7 calendar
+        # days) -> a mass re-crawl must not surface near-expired "picks"
+        {"study": "insider_cluster", "asset": "EQ", "ticker": "SPENT",
+         "event_ts": _now_ms() - 10 * day, "direction": "LONG",
+         "ingested_at": _now_ms()},
+        # recent date but ingested before the window opened -> already old news
+        {"study": "insider_cluster", "asset": "EQ", "ticker": "SEEN",
+         "event_ts": _now_ms() - 2 * day, "direction": "LONG",
+         "ingested_at": window - 1},
+    ])
+    events = [a for a in aggregate_today(conn)["act"] if a["kind"] == "event"]
+    assert [e["ticker"] for e in events] == ["FRESH"]
+
+
 def test_aggregate_policy_studies_never_emit_event_rows(conn):
     # tier='policy' PROMOTED studies act through tier-change/trend-flip rows,
     # not per-event picks — the query filters on tier='alpha'.
