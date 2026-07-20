@@ -92,16 +92,37 @@ CREATE TABLE IF NOT EXISTS decisions (
   ts INTEGER
 );
 
--- Stage-0 paper book (§7 / meta-gate): one row per paper position opened from a
--- PROMOTED study's events; NAV series marks the book daily vs a benchmark.
+-- Stage-0 paper book (§7 / meta-gate): one row per paper position, opened from a
+-- PROMOTED study's events OR from a surfaced stock pick; NAV marks daily vs a
+-- benchmark. `source` namespaces the three feeds that share this table:
+--   'lab'      — PROMOTED car-study events. Sized/limited under the ORIGINAL §7
+--                constants against lab positions ONLY, so the meta-gate curve
+--                stays a function of the constants the study registered under.
+--   'swing'    — surfaced stock_collect picks (carry stop/target/time-stop).
+--   'longterm' — surfaced stock_lt_collect long-buys (horizon exit).
+-- Non-lab sources have no validated OOS expectancy, so they size on vol-parity
+-- alone under a smaller cap and are never permitted to claim an edge.
 CREATE TABLE IF NOT EXISTS paper_positions (
   id INTEGER PRIMARY KEY,
-  study TEXT NOT NULL,
+  study TEXT NOT NULL,                   -- book namespace ('insider_cluster', 'swing:pead_drift', ...)
+  source TEXT NOT NULL DEFAULT 'lab'
+    CHECK(source IN ('lab','swing','longterm')),
   ticker TEXT NOT NULL,
   event_ts INTEGER NOT NULL,
+  direction TEXT NOT NULL DEFAULT 'LONG'
+    CHECK(direction IN ('LONG','SHORT')),
   qty REAL,                              -- NAV fraction sized at entry
+  sizing_basis TEXT,                     -- 'kelly_vol_cap' (validated) | 'vol_parity_only'
   entry_ts INTEGER, entry_px REAL,
   exit_ts INTEGER, exit_px REAL,
+  exit_reason TEXT,                      -- 'horizon' | 'stop' | 'target'
+  -- Stops travel as FRACTIONS of entry, never as absolute prices: the pick is
+  -- struck on the collector's as-traded basis while the book prices off the
+  -- lake's dividend+split-ADJUSTED bars, so an absolute stop would drift out of
+  -- basis on every dividend. Rebased to *_px against the book's own entry_px at
+  -- fill time; both NULL for horizon-only sources (lab, longterm).
+  stop_frac REAL, target_frac REAL,      -- signed distance from entry (-0.05 = 5% below)
+  stop_px REAL, target_px REAL,          -- rebased absolutes, written at fill (audit/display)
   status TEXT CHECK(status IN ('PENDING','OPEN','CLOSED','SKIPPED')),
   skip_reason TEXT,                      -- limits violation etc. (honest record)
   horizon_sessions INTEGER,
@@ -109,6 +130,10 @@ CREATE TABLE IF NOT EXISTS paper_positions (
   UNIQUE(study, ticker, event_ts)
 );
 
+-- NAV series. `study` is a real study/namespace name, or one of the two
+-- synthetic roll-ups (the '@' prefix cannot collide with a registered name):
+--   '@lab'      — lab-source positions only. THIS is the meta-gate curve.
+--   '@combined' — the whole book, every source. The portfolio view.
 CREATE TABLE IF NOT EXISTS paper_nav (
   study TEXT,
   date TEXT,                             -- ISO session date
@@ -138,8 +163,22 @@ def init_harness_db(conn: sqlite3.Connection) -> None:
     """Idempotent DDL — safe on every connect (additive-migration convention)."""
     conn.executescript(_DDL)
     # Additive migrations for pre-existing DBs (CREATE IF NOT EXISTS won't
-    # alter an old table) — same convention as store.init_db.
+    # alter an old table) — same convention as store.init_db. The CHECK clauses
+    # in the DDL above are deliberately omitted here: SQLite cannot retrofit a
+    # CHECK onto an existing table without a full rebuild, and every pre-existing
+    # paper_positions row is by definition a lab/LONG row, which the defaults
+    # give it for free.
     _add_column_if_missing(conn, "paper_nav", "nav_after_tax", "REAL")
+    _add_column_if_missing(conn, "paper_positions", "source",
+                           "TEXT NOT NULL DEFAULT 'lab'")
+    _add_column_if_missing(conn, "paper_positions", "direction",
+                           "TEXT NOT NULL DEFAULT 'LONG'")
+    _add_column_if_missing(conn, "paper_positions", "sizing_basis", "TEXT")
+    _add_column_if_missing(conn, "paper_positions", "exit_reason", "TEXT")
+    _add_column_if_missing(conn, "paper_positions", "stop_frac", "REAL")
+    _add_column_if_missing(conn, "paper_positions", "target_frac", "REAL")
+    _add_column_if_missing(conn, "paper_positions", "stop_px", "REAL")
+    _add_column_if_missing(conn, "paper_positions", "target_px", "REAL")
     conn.commit()
 
 

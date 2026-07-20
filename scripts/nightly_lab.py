@@ -111,11 +111,40 @@ def stamp_lab_fresh() -> None:
         conn.close()
 
 
+def _sector_map(lake, tickers: list[str]) -> dict[str, str]:
+    """{TICKER: sector} from the lake's TICKERS table — best-effort.
+
+    Without it the book's per-sector limit silently never binds for stock picks
+    (a NULL sector skips the check), which would be a quiet failure of a
+    pre-registered risk control rather than a visible one."""
+    if not tickers or not lake.exists("tickers"):
+        return {}
+    try:
+        uniq = sorted({t.upper() for t in tickers})
+        ph = ",".join("?" for _ in uniq)
+        df = lake.query(
+            f"SELECT ticker, sector FROM {lake.sql_table('tickers')} "
+            f"WHERE ticker IN ({ph})", uniq)
+        return {str(r["ticker"]).upper(): r["sector"]
+                for _, r in df.iterrows() if r.get("sector")}
+    except Exception as exc:                      # noqa: BLE001 - best-effort
+        log.warning("sector map unavailable (%s) — sector limits will not bind", exc)
+        return {}
+
+
 def paper_book_step() -> None:
-    """Stage-0 paper book (§7/meta-gate): trade every PROMOTED car-study's new
-    events on paper — pending -> next-open fill (limits+sizing) -> horizon exit
-    -> daily NAV vs SPY total return. Only PROMOTED studies trade; a demoted
-    study's book freezes (positions close out, nothing new opens)."""
+    """Stage-0 paper book (§7/meta-gate) — ONE book, three sources.
+
+    'lab'      every PROMOTED car-study's new events, sized from its OOS stats
+               under the original §7 limits, evaluated against lab positions
+               ONLY so the meta-gate curve stays reproducible.
+    'swing'    surfaced stock_collect picks (stop/target exits).
+    'longterm' surfaced stock_lt_collect long-buys (quarterly horizon).
+
+    Each namespace gets its own NAV series, plus two roll-ups: '@lab' (the
+    meta-gate evidence) and '@combined' (the portfolio view). Only PROMOTED
+    studies trade; a demoted study's book freezes (positions close out, nothing
+    new opens)."""
     import json as _json
     import sqlite3
     from datetime import datetime, timezone
@@ -123,7 +152,7 @@ def paper_book_step() -> None:
     from app.data.equities import prices as eq_prices
     from app.data_lake import Lake
     from app.harness import schema
-    from app.portfolio import book
+    from app.portfolio import book, bridge
 
     cfg = load_config()
     lake = Lake(cfg.data_lake_path)
@@ -131,22 +160,40 @@ def paper_book_step() -> None:
     conn.row_factory = sqlite3.Row
     schema.init_harness_db(conn)
     try:
-        studies = [dict(r) for r in conn.execute(
-            "SELECT * FROM studies WHERE tier='alpha' AND evaluator='car'")]
         spy = eq_prices.sep_bars_bulk(lake, ["SPY"], limit=5000,
                                       table="sfp").get("SPY", [])
-        for s in studies:
+
+        # --- file the stock picks (idempotent; new rows only) -----------------
+        # Bounded by the go-live floor: the collectors have months of history,
+        # and filing it would backfill a record the book never lived through.
+        # The FIRST run therefore files nothing and starts the clock.
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        since = bridge.go_live_ts(conn, now_ms)
+        pick_tickers = [r[0] for r in conn.execute(
+            "SELECT DISTINCT ticker FROM stock_positions "
+            "WHERE ticker IS NOT NULL AND opened_ts >= ? "
+            "UNION SELECT DISTINCT ticker FROM stock_lt_holdings "
+            "WHERE ticker IS NOT NULL AND opened_ts >= ?", (since, since))]
+        filed = bridge.file_picks(conn, since_ts=since,
+                                  sectors=_sector_map(lake, pick_tickers))
+        if any(filed.values()):
+            log.info("bridge filed: %s",
+                     {k: v for k, v in filed.items() if v})
+
+        # --- advance every namespace -----------------------------------------
+        # (study name, source, expectancy, car_std) — lab studies carry OOS
+        # stats; bridged picks pass None, which drops the Kelly leg rather than
+        # zeroing it (see sizing: None != 0.0).
+        jobs: list[tuple[str, str, float | None, float | None, int | None]] = []
+        for s in conn.execute(
+                "SELECT * FROM studies WHERE tier='alpha' AND evaluator='car'"):
+            s = dict(s)
             if s["status"] == "PROMOTED":
                 events = [e for e in schema.events_for_study(conn, s["name"])
                           if e["event_ts"] >= s["registered_at"]]
                 book.record_pending(conn, s["name"], events,
-                                    horizon=s["primary_horizon"] or 21)
-            tickers = [r[0] for r in conn.execute(
-                "SELECT DISTINCT ticker FROM paper_positions WHERE study=? "
-                "AND status IN ('PENDING','OPEN','CLOSED')", (s["name"],))]
-            if not tickers:
-                continue
-            bars = eq_prices.sep_bars_bulk(lake, tickers, limit=200)
+                                    horizon=s["primary_horizon"] or 21,
+                                    source="lab")
             oos = conn.execute(
                 "SELECT exp_after_tax, extra_json FROM study_results WHERE "
                 "study=? AND segment='OOS' AND horizon=?",
@@ -154,10 +201,28 @@ def paper_book_step() -> None:
             exp = oos["exp_after_tax"] if oos else None
             car_std = (_json.loads(oos["extra_json"] or "{}").get("car_std")
                        if oos else None)
-            st = book.process(conn, s["name"], bars,
-                              expectancy=exp, car_std=car_std)
-            n = book.mark_nav(conn, s["name"], bars, spy)
-            log.info("paper book %s: %s, nav rows %d", s["name"], st, n)
+            jobs.append((s["name"], "lab", exp, car_std, None))
+        for ns, src in conn.execute(
+                "SELECT DISTINCT study, source FROM paper_positions "
+                "WHERE source != 'lab'"):
+            jobs.append((ns, src, None, None, None))
+
+        all_bars: dict[str, list[dict]] = {}
+        for name, src, exp, car_std, _ in jobs:
+            tickers = [r[0] for r in conn.execute(
+                "SELECT DISTINCT ticker FROM paper_positions WHERE study=? "
+                "AND status IN ('PENDING','OPEN','CLOSED')", (name,))]
+            if not tickers:
+                continue
+            bars = eq_prices.sep_bars_bulk(lake, tickers, limit=400)
+            all_bars.update(bars)
+            st = book.process(conn, name, bars, expectancy=exp,
+                              car_std=car_std, source=src)
+            n = book.mark_nav(conn, name, bars, spy)
+            log.info("paper book %s [%s]: %s, nav rows %d", name, src, st, n)
+
+        rolled = book.mark_rollups(conn, all_bars, spy)
+        log.info("paper book roll-ups: %s", rolled)
     finally:
         conn.close()
 

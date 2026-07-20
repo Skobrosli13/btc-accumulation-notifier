@@ -14,24 +14,46 @@ MAX_MEAN_CORR = 0.6
 DD_HALVE_GROSS = 0.10
 DD_GO_FLAT = 0.15
 
+# Per-source budgets for the shared paper book. 'lab' deliberately re-states the
+# original §7 constants and is evaluated against LAB POSITIONS ONLY: the
+# meta-gate (§9) judges the program on the promoted study's curve, so that curve
+# must stay a function of the constants the study was registered under. Adding
+# swing/long-term feeds must not retroactively change which lab fills happened.
+SOURCE_LIMITS = {
+    "lab":      {"max_concurrent": MAX_CONCURRENT, "max_per_sector": MAX_PER_SECTOR},
+    "swing":    {"max_concurrent": 8,  "max_per_sector": 3},
+    "longterm": {"max_concurrent": 12, "max_per_sector": 4},
+}
+
+
+def limits_for(source: str) -> dict:
+    """Budget for a book source; unknown sources fall back to the §7 constants."""
+    return SOURCE_LIMITS.get(source, SOURCE_LIMITS["lab"])
+
 
 def check_candidate(open_positions: list[dict], candidate: dict, *,
-                    mean_corr_60d: float | None = None) -> list[str]:
+                    mean_corr_60d: float | None = None,
+                    max_concurrent: int = MAX_CONCURRENT,
+                    max_per_sector: int = MAX_PER_SECTOR) -> list[str]:
     """Violations that bar ``candidate`` from opening (empty list = admissible).
 
     ``open_positions``: [{ticker, sector, is_btc?}]; ``candidate`` likewise;
     ``mean_corr_60d``: candidate's mean 60d return correlation to the open book
     (None with an empty book, or when the caller couldn't compute it — an
     UNCOMPUTABLE correlation on a non-empty book is a violation: unpriced
-    crowding risk is rejected, not waved through)."""
+    crowding risk is rejected, not waved through).
+
+    ``max_concurrent``/``max_per_sector`` default to the §7 constants; the book
+    passes the calling source's budget (see :data:`SOURCE_LIMITS`). Callers pass
+    only their own source's open positions, so budgets never interact."""
     v: list[str] = []
-    if len(open_positions) >= MAX_CONCURRENT:
-        v.append(f"max_concurrent ({len(open_positions)}/{MAX_CONCURRENT})")
+    if len(open_positions) >= max_concurrent:
+        v.append(f"max_concurrent ({len(open_positions)}/{max_concurrent})")
     sector = candidate.get("sector")
     if sector:
         n_sector = sum(1 for p in open_positions if p.get("sector") == sector)
-        if n_sector >= MAX_PER_SECTOR:
-            v.append(f"max_per_sector ({sector}: {n_sector}/{MAX_PER_SECTOR})")
+        if n_sector >= max_per_sector:
+            v.append(f"max_per_sector ({sector}: {n_sector}/{max_per_sector})")
     if candidate.get("is_btc") and any(p.get("is_btc") for p in open_positions):
         v.append("btc_single_position")
     if open_positions:

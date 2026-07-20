@@ -115,3 +115,156 @@ def test_open_position_marks_in_nav_before_close():
     want = 1.0 + p["qty"] * (110.0 / p["entry_px"] - 1.0)     # marked at last close
     assert last["nav"] == pytest.approx(want)
     c.close()
+
+
+# --- stop / target exits (swing source) ----------------------------------------
+#
+# Entry is always bar 60: 60 alternating ±1% sessions give _vol60 real risk to
+# price, the event lands on day 59, and the fill is the next session's open.
+
+def _vol_bars(n: int = 60, level: float = 100.0) -> list[dict]:
+    out = []
+    for k in range(n):
+        close = level * (1.01 if k % 2 else 0.99)
+        out.append({"ts": k * DAY, "open": level, "high": max(level, close),
+                    "low": min(level, close), "close": close, "volume": 1.0})
+    return out
+
+
+def _bar(day, o, h, l, c_):
+    return {"ts": day * DAY, "open": o, "high": h, "low": l, "close": c_,
+            "volume": 1.0}
+
+
+def _swing(ticker="AAA", *, direction="LONG", stop_frac=-0.05, target_frac=0.05):
+    return {"ticker": ticker, "event_ts": 59 * DAY, "tier": "small",
+            "sector": "Tech", "direction": direction,
+            "stop_frac": stop_frac, "target_frac": target_frac}
+
+
+def _fill(c, bars, **kw):
+    """Record one swing pick and advance the book; returns the position row."""
+    book.record_pending(c, "swing:t", [_swing(**kw)], 10, source="swing")
+    book.process(c, "swing:t", {"AAA": bars}, source="swing", now_ms=80 * DAY)
+    return dict(c.execute("SELECT * FROM paper_positions").fetchone())
+
+
+def test_stop_and_target_rebase_onto_the_actual_fill():
+    """Levels arrive as fractions and are struck against the book's own entry —
+    the pick's absolute prices are on a different (unadjusted) basis entirely."""
+    c = _conn()
+    bars = _vol_bars() + [_bar(60, 100.0, 101.0, 99.0, 100.0)]
+    p = _fill(c, bars)
+    entry = 100.0 * 1.002                       # small tier 40bps RT, half crossed
+    assert p["entry_px"] == pytest.approx(entry)
+    assert p["stop_px"] == pytest.approx(entry * 0.95)
+    assert p["target_px"] == pytest.approx(entry * 1.05)
+    c.close()
+
+
+def test_stop_wins_a_same_bar_stop_and_target_tie():
+    """A bar that trades through BOTH levels is booked as the stop — the
+    pessimistic assumption, matching stock_positions.reprice."""
+    c = _conn()
+    bars = _vol_bars() + [_bar(60, 100.0, 101.0, 99.0, 100.0),
+                          _bar(61, 100.0, 130.0, 80.0, 100.0)]   # hits both
+    p = _fill(c, bars)
+    assert p["status"] == "CLOSED" and p["exit_reason"] == "stop"
+    c.close()
+
+
+def test_gap_through_the_stop_fills_at_the_open_not_the_stop():
+    """A price the tape never offered is not a fill. Opening below the stop
+    books the open — the loss a subscriber could actually take."""
+    c = _conn()
+    entry = 100.0 * 1.002
+    gap_open = entry * 0.90                     # opens well below the 5% stop
+    bars = _vol_bars() + [_bar(60, 100.0, 101.0, 99.0, 100.0),
+                          _bar(61, gap_open, gap_open, gap_open * 0.98, gap_open)]
+    p = _fill(c, bars)
+    assert p["exit_reason"] == "stop"
+    assert p["exit_px"] == pytest.approx(gap_open * 0.998)       # NOT the stop price
+    assert p["exit_px"] < entry * 0.95                           # worse than the stop
+    c.close()
+
+
+def test_target_closes_when_the_stop_is_untouched():
+    c = _conn()
+    entry = 100.0 * 1.002
+    bars = _vol_bars() + [_bar(60, 100.0, 101.0, 99.0, 100.0),
+                          _bar(61, 100.0, entry * 1.06, 99.5, 105.0)]
+    p = _fill(c, bars)
+    assert p["exit_reason"] == "target"
+    assert p["exit_px"] == pytest.approx(entry * 1.05 * 0.998)
+    c.close()
+
+
+def test_horizon_still_exits_when_no_level_trades():
+    c = _conn()
+    flat = [_bar(60 + k, 100.0, 100.5, 99.5, 100.0) for k in range(12)]
+    p = _fill(c, _vol_bars() + flat)
+    assert p["status"] == "CLOSED" and p["exit_reason"] == "horizon"
+    assert p["exit_ts"] == 70 * DAY             # entry bar 60 + 10-session horizon
+    c.close()
+
+
+def test_short_crosses_the_spread_the_other_way_and_profits_when_price_falls():
+    c = _conn()
+    bars = _vol_bars() + [_bar(60, 100.0, 101.0, 99.0, 100.0)] + \
+        [_bar(60 + k, 90.0, 90.5, 89.5, 90.0) for k in range(1, 12)]
+    p = _fill(c, bars, direction="SHORT", stop_frac=0.05, target_frac=-0.20)
+    # a short SELLS to open (hits the bid) and BUYS to close (pays the offer)
+    assert p["entry_px"] == pytest.approx(100.0 * 0.998)
+    assert p["status"] == "CLOSED"
+    assert p["exit_px"] > 90.0                  # paid up to cover
+
+    spy = [{"ts": b["ts"], "close": 100.0} for b in bars]
+    book.mark_nav(c, "swing:t", {"AAA": bars}, spy)
+    last = dict(c.execute("SELECT * FROM paper_nav ORDER BY date DESC LIMIT 1")
+                .fetchone())
+    assert last["nav"] > 1.0                    # price fell, the short made money
+    c.close()
+
+
+# --- roll-ups: the meta-gate wall ----------------------------------------------
+
+def test_rollups_separate_lab_from_the_rest():
+    """'@lab' must stay lab-only: the meta-gate judges the promoted study's
+    curve, and a forward-test pick must never be able to flatter or spoil it."""
+    c = _conn()
+    lab_bars, swing_bars = _bars(100), _bars(100, level=50.0, post=40.0)
+    spy = _bars(100, alt_until=0, post=100.0)
+    book.record_pending(c, "insider_cluster", [_event("AAA", 65)], 3, source="lab")
+    book.process(c, "insider_cluster", {"AAA": lab_bars},
+                 expectancy=0.009, car_std=0.09, source="lab", now_ms=99 * DAY)
+    book.record_pending(c, "swing:t", [_event("ZZZ", 65)], 3, source="swing")
+    book.process(c, "swing:t", {"ZZZ": swing_bars}, source="swing", now_ms=99 * DAY)
+
+    all_bars = {"AAA": lab_bars, "ZZZ": swing_bars}
+    rolled = book.mark_rollups(c, all_bars, spy)
+    assert rolled[book.NAV_LAB] > 0 and rolled[book.NAV_COMBINED] > 0
+
+    lab_only = book.mark_nav(c, "insider_cluster", all_bars, spy) and dict(c.execute(
+        "SELECT * FROM paper_nav WHERE study='insider_cluster' "
+        "ORDER BY date DESC LIMIT 1").fetchone())
+    at_lab = dict(c.execute(f"SELECT * FROM paper_nav WHERE study='{book.NAV_LAB}' "
+                            "ORDER BY date DESC LIMIT 1").fetchone())
+    at_all = dict(c.execute(f"SELECT * FROM paper_nav WHERE study='{book.NAV_COMBINED}'"
+                            " ORDER BY date DESC LIMIT 1").fetchone())
+    # the lab roll-up equals the lone lab study's own curve...
+    assert at_lab["nav"] == pytest.approx(lab_only["nav"])
+    # ...and the losing swing position drags @combined below it
+    assert at_all["nav"] < at_lab["nav"]
+    c.close()
+
+
+def test_swing_positions_are_sized_on_parity_not_on_a_borrowed_edge():
+    """A bridged pick carries no OOS stats, so it must land on the unvalidated
+    path — recorded on the row, so the book can never be re-read as if the pick
+    had been sized on a measured edge."""
+    c = _conn()
+    bars = _vol_bars() + [_bar(60 + k, 100.0, 100.5, 99.5, 100.0) for k in range(12)]
+    p = _fill(c, bars)
+    assert p["sizing_basis"] == "vol_parity_only"
+    assert p["qty"] == pytest.approx(0.02)      # the unvalidated cap, not 7%
+    c.close()

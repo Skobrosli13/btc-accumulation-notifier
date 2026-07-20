@@ -28,13 +28,43 @@ def test_quarter_kelly_hand_value():
 
 def test_position_size_takes_min_and_caps():
     # legs: parity 0.125, kelly 0.0625, cap 0.07 -> 0.0625
-    s = sizing.position_size(asset_vol_annual=0.60, n_concurrent=4,
-                             expectancy=0.01, variance=0.04)
+    s, basis = sizing.position_size(asset_vol_annual=0.60, n_concurrent=4,
+                                    expectancy=0.01, variance=0.04)
     assert s == pytest.approx(0.0625)
+    assert basis == "kelly_vol_cap"
     # huge kelly/parity -> the 7% cap binds; BTC caps at 15%
     big = dict(asset_vol_annual=0.10, n_concurrent=1, expectancy=0.05, variance=0.01)
-    assert sizing.position_size(**big) == pytest.approx(0.07)
-    assert sizing.position_size(**big, is_btc=True) == pytest.approx(0.15)
+    assert sizing.position_size(**big)[0] == pytest.approx(0.07)
+    assert sizing.position_size(**big, is_btc=True)[0] == pytest.approx(0.15)
+
+
+def test_unmeasured_expectancy_is_not_zero_expectancy():
+    """None ('never measured') drops the Kelly leg; 0.0 ('measured, no edge')
+    still zeroes the size. Conflating them would either refuse to size every
+    forward-test pick, or let one claim a validated edge it never earned."""
+    args = dict(asset_vol_annual=0.60, n_concurrent=4)
+    measured_no_edge, basis = sizing.position_size(**args, expectancy=0.0,
+                                                   variance=0.04)
+    assert measured_no_edge == 0.0 and basis == "kelly_vol_cap"
+
+    unmeasured, basis = sizing.position_size(**args, expectancy=None, variance=None)
+    # parity leg is 0.125, but the unvalidated cap binds at 2%
+    assert unmeasured == pytest.approx(sizing.NAV_CAP_UNVALIDATED)
+    assert basis == "vol_parity_only"
+    # and it is capped strictly below a validated position's cap
+    assert sizing.NAV_CAP_UNVALIDATED < sizing.NAV_CAP_EQUITY
+
+
+def test_unvalidated_still_respects_vol_parity():
+    """The unvalidated path is a CAP, not a flat size — a wilder name gets less."""
+    calm, _ = sizing.position_size(asset_vol_annual=0.20, n_concurrent=1,
+                                   expectancy=None, variance=None)
+    wild, _ = sizing.position_size(asset_vol_annual=20.0, n_concurrent=1,
+                                   expectancy=None, variance=None)
+    assert calm == pytest.approx(sizing.NAV_CAP_UNVALIDATED)   # cap binds
+    # 15% vol target / 2000% asset vol = 0.75% — parity binds well under the cap
+    assert wild == pytest.approx(0.0075)
+    assert wild < calm
 
 
 # --- limits ---------------------------------------------------------------------

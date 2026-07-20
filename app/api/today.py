@@ -181,7 +181,14 @@ def aggregate_today(conn, cfg: Config | None = None) -> dict:
                                     "ORDER BY registered_at")]
 
     # --- paper book ------------------------------------------------------------
-    nav = _rows(conn, "SELECT * FROM paper_nav ORDER BY date DESC LIMIT 1")
+    # Pin the roll-up explicitly. paper_nav holds one series per namespace PLUS
+    # the two synthetic roll-ups, all sharing the same dates, so an unqualified
+    # "latest row" would return whichever namespace SQLite happened to reach
+    # first. Today's headline is the whole portfolio ('@combined'); '@lab' is
+    # the fallback for a book that only ever had lab positions.
+    nav = _rows(conn, "SELECT * FROM paper_nav WHERE study IN ('@combined', '@lab') "
+                      "ORDER BY date DESC, CASE study WHEN '@combined' THEN 0 "
+                      "ELSE 1 END LIMIT 1")
     counts = {r["status"]: r["n"] for r in _rows(
         conn, "SELECT status, count(*) n FROM paper_positions GROUP BY status")}
     n0 = nav[0] if nav else {}

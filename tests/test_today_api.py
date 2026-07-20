@@ -211,7 +211,7 @@ def test_aggregate_trend_flip_inside_window(conn):
 
 def test_aggregate_paper_and_sync_blocks(conn):
     conn.execute("INSERT INTO paper_nav (study, date, nav, bench, n_open) "
-                 "VALUES ('insider_cluster', '2026-07-02', 1.0132, 1.0050, 2)")
+                 "VALUES ('@combined', '2026-07-02', 1.0132, 1.0050, 2)")
     conn.execute("INSERT INTO paper_positions (study, ticker, event_ts, status) "
                  "VALUES ('insider_cluster','A',1,'OPEN'), "
                  "('insider_cluster','B',2,'PENDING'), "
@@ -224,6 +224,28 @@ def test_aggregate_paper_and_sync_blocks(conn):
                             "date": "2026-07-02",
                             "open": 1, "pending": 1, "closed": 1}
     assert out["lab_sync"]["overdue"] is False
+
+
+def test_paper_headline_pins_the_rollup_not_an_arbitrary_namespace(conn):
+    """paper_nav holds a series per namespace PLUS two roll-ups, all on the same
+    dates. An unqualified 'latest row' would return whichever one SQLite reached
+    first — so Today's headline could silently become one swing archetype's
+    curve. It must be the '@combined' portfolio."""
+    for study, nav in (("insider_cluster", 1.50), ("swing:pead_drift", 0.80),
+                       ("@lab", 1.50), ("@combined", 1.10)):
+        conn.execute("INSERT INTO paper_nav (study, date, nav, bench, n_open) "
+                     "VALUES (?, '2026-07-02', ?, 1.0, 1)", (study, nav))
+    conn.commit()
+    assert aggregate_today(conn)["paper"]["nav"] == 1.10
+
+
+def test_paper_headline_falls_back_to_lab_only(conn):
+    """A book that only ever held lab positions has no '@combined' worth
+    distinguishing — the lab roll-up is the portfolio."""
+    conn.execute("INSERT INTO paper_nav (study, date, nav, bench, n_open) "
+                 "VALUES ('@lab', '2026-07-02', 1.07, 1.0, 1)")
+    conn.commit()
+    assert aggregate_today(conn)["paper"]["nav"] == 1.07
 
 
 def test_aggregate_empty_db_shape(conn):

@@ -4,10 +4,17 @@ BTC paper fills price at OKX mid ± max(measured half-spread, 5 bps) against the
 order side — the taker always crosses the spread, never earns it. Slippage is
 recorded per fill so the nightly cost-curve refresh has real data.
 
-Equities paper routes through Alpaca's paper API when keys exist; WITHOUT keys
-this module refuses (raises) rather than fabricating equity fills — working
-agreement #3: never fabricate market data. (The internal ledger is only valid
-for BTC because OKX mid is an observable, keyless price.)
+**Scope: BTC only.** The internal ledger is valid for BTC because OKX mid is an
+observable, keyless price. There is deliberately no equity function here.
+
+Equity paper fills are NOT routed through a broker API. They are replayed by
+``portfolio.book`` off the lake's Sharadar adjusted bars — a fill is the next
+session's open ± the tier's half round-trip cost, so no equity price is ever
+invented (working agreement #3: never fabricate market data). EDGE_LAB_PLAN_v2
+§7 specifies Alpaca paper for equities and this module's docstring used to
+claim it was implemented; it never was, and the plan's ADV cap and +10bps limit
+cap are likewise unimplemented. Bar replay satisfies the honesty invariant but
+NOT the plan's execution realism — treat that as an open gap, not a done item.
 """
 from __future__ import annotations
 
