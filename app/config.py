@@ -336,6 +336,20 @@ class Config:
     # .env: QUIET_HOURS_UTC (default "03-11").
     quiet_hours_utc: str = "03-11"
 
+    # --- Live paper broker (dual-track §7) --------------------------------
+    # The live Alpaca PAPER account track (real async fills), parallel to the
+    # deterministic replay book. OFF by default: the whole track no-ops until
+    # the owner sets BROKER_PAPER_ENABLED=true AND supplies the Alpaca keys
+    # (reused from the equity price layer). ADV participation + limit-order caps
+    # are the pre-registered §7 execution constants. broker_assumed_nav is the
+    # notional the replay ADV cap uses for NEW studies (live orders size off the
+    # real account equity, not this).
+    broker_paper_enabled: bool = False
+    broker_base_url: str = "https://paper-api.alpaca.markets"
+    broker_adv_participation: float = 0.01   # <=1% of ADV
+    broker_limit_bps: float = 10.0           # marketable limit at ref +/- 10bps
+    broker_assumed_nav: float = 100_000.0
+
     # --- Namespaced views (§0.5) -----------------------------------------
     # Typed groupings built from the flat fields above. Pure views (no state of
     # their own), so they can never drift from the source config.
@@ -454,6 +468,14 @@ class Config:
     @property
     def alpaca_active(self) -> bool:
         return bool(self.alpaca_api_key and self.alpaca_secret_key)
+
+    @property
+    def broker_active(self) -> bool:
+        """The live Alpaca paper-broker track. Needs the master switch AND the
+        Alpaca keys (reused from the equity price layer). Off => the track no-ops
+        and the app behaves exactly as before (replay-only)."""
+        return bool(self.broker_paper_enabled and self.alpaca_api_key
+                    and self.alpaca_secret_key)
 
     @property
     def massive_active(self) -> bool:
@@ -593,4 +615,9 @@ def load_config() -> Config:
         public_base_url=_get("PUBLIC_BASE_URL", "https://btc.riverviewweb.com").rstrip("/"),
         watchdog_stale_hours=_get_float("WATCHDOG_STALE_HOURS", 3),
         quiet_hours_utc=_get("QUIET_HOURS_UTC", "03-11"),
+        broker_paper_enabled=_get_bool("BROKER_PAPER_ENABLED", False),
+        broker_base_url=_get("BROKER_BASE_URL", "https://paper-api.alpaca.markets").rstrip("/"),
+        broker_adv_participation=_get_float("BROKER_ADV_PARTICIPATION", 0.01),
+        broker_limit_bps=_get_float("BROKER_LIMIT_BPS", 10.0),
+        broker_assumed_nav=_get_float("BROKER_ASSUMED_NAV", 100_000.0),
     )

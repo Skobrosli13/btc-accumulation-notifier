@@ -221,9 +221,21 @@ def test_aggregate_paper_and_sync_blocks(conn):
     conn.commit()
     out = aggregate_today(conn)
     assert out["paper"] == {"nav": 1.0132, "bench": 1.0050, "nav_after_tax": None,
-                            "date": "2026-07-02",
+                            "date": "2026-07-02", "live": False,
                             "open": 1, "pending": 1, "closed": 1}
     assert out["lab_sync"]["overdue"] is False
+
+
+def test_paper_headline_prefers_live_broker_when_present(conn):
+    """Once the live Alpaca paper account exists, its curve ('@broker') is the
+    headline — the deterministic replay ('@combined') is the fallback. The switch
+    must be honest: 'live' flags which curve the number came from."""
+    for study, nav in (("@combined", 1.03), ("@lab", 1.01), ("@broker", 1.048)):
+        conn.execute("INSERT INTO paper_nav (study, date, nav, bench, n_open) "
+                     "VALUES (?, '2026-07-20', ?, 1.005, 1)", (study, nav))
+    conn.commit()
+    paper = aggregate_today(conn)["paper"]
+    assert paper["nav"] == 1.048 and paper["live"] is True
 
 
 def test_paper_headline_pins_the_rollup_not_an_arbitrary_namespace(conn):

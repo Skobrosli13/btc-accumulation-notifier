@@ -60,7 +60,7 @@ def sync_lab_to_box() -> None:
     now_iso = datetime.now(timezone.utc).isoformat()
     src = sqlite3.connect(cfg.db_path)
     tables = ("studies", "study_results", "events", "fills", "decisions",
-              "paper_positions", "paper_nav")
+              "paper_positions", "paper_nav", "broker_orders", "broker_positions")
     from app.harness import schema as _schema
     with tempfile.NamedTemporaryFile("w", suffix=".sql", delete=False,
                                      encoding="utf-8") as f:
@@ -223,6 +223,25 @@ def paper_book_step() -> None:
 
         rolled = book.mark_rollups(conn, all_bars, spy)
         log.info("paper book roll-ups: %s", rolled)
+
+        # --- live paper-broker track (flag-gated; parallel to the replay) ------
+        # Submit real Alpaca PAPER orders for the upcoming session's PENDING
+        # intents, sized off the real account equity with the ADV + 10bps caps.
+        # The intraday scripts.broker_sync poller reconciles the async fills and
+        # marks the @broker NAV; here we only submit. Non-fatal on any error and
+        # writes to its OWN tables — the live track must never touch or break the
+        # deterministic replay curves (@lab is meta-gate evidence).
+        if cfg.broker_active:
+            try:
+                from app.portfolio import broker
+                api = broker.AlpacaPaper(cfg.alpaca_api_key, cfg.alpaca_secret_key,
+                                         base=cfg.broker_base_url)
+                ref_px = {t: bl[-1]["close"] for t, bl in all_bars.items() if bl}
+                sub = broker.submit_pending(conn, cfg, api, ref_px=ref_px,
+                                            adv_bars=all_bars)
+                log.info("paper broker submit: %s", sub)
+            except Exception as exc:  # noqa: BLE001 - live track never breaks the replay
+                log.warning("paper broker submit skipped (%s)", exc)
     finally:
         conn.close()
 

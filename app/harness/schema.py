@@ -130,10 +130,13 @@ CREATE TABLE IF NOT EXISTS paper_positions (
   UNIQUE(study, ticker, event_ts)
 );
 
--- NAV series. `study` is a real study/namespace name, or one of the two
--- synthetic roll-ups (the '@' prefix cannot collide with a registered name):
---   '@lab'      — lab-source positions only. THIS is the meta-gate curve.
---   '@combined' — the whole book, every source. The portfolio view.
+-- NAV series. `study` is a real study/namespace name, or one of the synthetic
+-- roll-ups (the '@' prefix cannot collide with a registered name):
+--   '@lab'      — lab-source positions only. THIS is the meta-gate curve
+--                 (deterministic replay; must stay byte-for-byte reproducible).
+--   '@combined' — the whole replay book, every source. The replay portfolio view.
+--   '@broker'   — the LIVE Alpaca paper account (real async fills). NOT meta-gate
+--                 evidence; the @broker-vs-@combined gap is real execution cost.
 CREATE TABLE IF NOT EXISTS paper_nav (
   study TEXT,
   date TEXT,                             -- ISO session date
@@ -142,6 +145,45 @@ CREATE TABLE IF NOT EXISTS paper_nav (
   bench REAL,                            -- benchmark TR normalized to book start
   n_open INTEGER,
   PRIMARY KEY (study, date)
+);
+
+-- ── Live paper-broker track (dual-track §7) ──────────────────────────────────
+-- A SECOND, parallel execution track: real Alpaca paper orders/fills, written by
+-- scripts/broker_sync.py. Deliberately its OWN tables so the deterministic replay
+-- (@lab/@combined, above) is never touched — adding the live broker must not
+-- change which lab fills happened. broker_orders reads the SAME signal intents
+-- (paper_positions PENDING rows) but never writes back to them.
+CREATE TABLE IF NOT EXISTS broker_orders (
+  client_order_id TEXT PRIMARY KEY,      -- deterministic dedup key (sha1 of intent)
+  broker_order_id TEXT,                  -- Alpaca order id (NULL until accepted)
+  intent_id INTEGER,                     -- -> paper_positions.id (the originating signal)
+  namespace TEXT,                        -- book namespace (e.g. 'swing:pead_drift')
+  source TEXT,                           -- lab | swing | longterm
+  ticker TEXT,
+  asset TEXT,                            -- 'EQ' | 'CRYPTO'
+  side TEXT,                             -- BUY | SELL
+  target_qty REAL,                       -- shares/units after ADV cap
+  limit_px REAL,
+  tif TEXT,                              -- 'day' (auto-expire; no zombie orders)
+  adv_cap_shares REAL,                   -- ADV participation ceiling at submit time
+  sizing_fraction REAL,                  -- NAV fraction from sizing.position_size
+  sizing_basis TEXT,                     -- 'kelly_vol_cap' | 'vol_parity_only'
+  status TEXT,                           -- new|submitted|accepted|partially_filled|
+                                         --   filled|canceled|expired|rejected|no_fill
+  reject_reason TEXT,
+  submitted_ts INTEGER,
+  updated_ts INTEGER
+);
+
+-- Snapshot mirror of GET /v2/positions (refreshed each reconcile).
+CREATE TABLE IF NOT EXISTS broker_positions (
+  symbol TEXT PRIMARY KEY,
+  asset TEXT,                            -- 'EQ' | 'CRYPTO'
+  qty REAL,
+  avg_entry_px REAL,
+  market_px REAL,
+  unrealized_pnl REAL,
+  updated_ts INTEGER
 );
 
 -- Small key/value meta (lab sync marker etc.).
@@ -179,6 +221,12 @@ def init_harness_db(conn: sqlite3.Connection) -> None:
     _add_column_if_missing(conn, "paper_positions", "target_frac", "REAL")
     _add_column_if_missing(conn, "paper_positions", "stop_px", "REAL")
     _add_column_if_missing(conn, "paper_positions", "target_px", "REAL")
+    # Live paper-broker track: reuse `fills` for both the BTC replay pricer
+    # (venue='paper-okx-mid') and the live Alpaca fills (venue='alpaca-paper'),
+    # so the nightly cost-curve refresh keeps reading one table.
+    _add_column_if_missing(conn, "fills", "client_order_id", "TEXT")
+    _add_column_if_missing(conn, "fills", "broker_fill_id", "TEXT")
+    _add_column_if_missing(conn, "fills", "namespace", "TEXT")
     conn.commit()
 
 

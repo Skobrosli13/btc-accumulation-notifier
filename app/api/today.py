@@ -182,18 +182,22 @@ def aggregate_today(conn, cfg: Config | None = None) -> dict:
 
     # --- paper book ------------------------------------------------------------
     # Pin the roll-up explicitly. paper_nav holds one series per namespace PLUS
-    # the two synthetic roll-ups, all sharing the same dates, so an unqualified
-    # "latest row" would return whichever namespace SQLite happened to reach
-    # first. Today's headline is the whole portfolio ('@combined'); '@lab' is
-    # the fallback for a book that only ever had lab positions.
-    nav = _rows(conn, "SELECT * FROM paper_nav WHERE study IN ('@combined', '@lab') "
-                      "ORDER BY date DESC, CASE study WHEN '@combined' THEN 0 "
-                      "ELSE 1 END LIMIT 1")
+    # the synthetic roll-ups, so an unqualified "latest row" would return
+    # whichever namespace SQLite happened to reach first. Prefer the LIVE paper
+    # account ('@broker') as the headline when it exists; otherwise fall back to
+    # the replay portfolio ('@combined'), then '@lab' for a lab-only book.
+    nav = _rows(conn, "SELECT * FROM paper_nav WHERE study='@broker' "
+                      "ORDER BY date DESC LIMIT 1")
+    if not nav:
+        nav = _rows(conn, "SELECT * FROM paper_nav WHERE study IN ('@combined', '@lab') "
+                          "ORDER BY date DESC, CASE study WHEN '@combined' THEN 0 "
+                          "ELSE 1 END LIMIT 1")
     counts = {r["status"]: r["n"] for r in _rows(
         conn, "SELECT status, count(*) n FROM paper_positions GROUP BY status")}
     n0 = nav[0] if nav else {}
     paper = {"nav": n0.get("nav"), "bench": n0.get("bench"),
              "nav_after_tax": n0.get("nav_after_tax"), "date": n0.get("date"),
+             "live": n0.get("study") == "@broker",
              "open": counts.get("OPEN", 0), "pending": counts.get("PENDING", 0),
              "closed": counts.get("CLOSED", 0)}
 
